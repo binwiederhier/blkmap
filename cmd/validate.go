@@ -47,6 +47,9 @@ func execValidate(c *cli.Context) error {
 			fmt.Fprintf(w, "  %s\t%s\tgap (zeros)\n", util.FormatSize(pos), util.FormatSize(s.Offset-pos))
 		}
 		fmt.Fprintf(w, "  %s\t%s\t%s\n", util.FormatSize(s.Offset), util.FormatSize(s.Source.Size()), describe(conf.Segments[i]))
+		for j, m := range conf.Segments[i].Members {
+			fmt.Fprintf(w, "  \tmember %d\t%s\n", j, describeMember(m))
+		}
 		pos = s.Offset + s.Source.Size()
 	}
 	if pos < src.Size() {
@@ -57,15 +60,30 @@ func execValidate(c *cli.Context) error {
 
 // describe renders a config segment's source for the layout table.
 func describe(s *config.Segment) string {
-	out := string(s.Type)
-	switch s.Type {
-	case config.SourceFile, config.SourceDevice:
-		out += " " + s.Path
-	case config.SourceHTTP:
-		out += " " + s.URL
+	if s.Type == config.SourceRAID5 {
+		return fmt.Sprintf("raid5 (%d members, %s stripes, %s)", len(s.Members), util.FormatSize(s.StripeSize), s.Layout)
 	}
-	if s.SourceOffset > 0 {
-		out += fmt.Sprintf(" (offset %s)", util.FormatSize(s.SourceOffset))
+	return describeSource(s.Type, s.Path, s.URL, s.SourceOffset)
+}
+
+// describeMember renders one raid5 member for the layout table.
+func describeMember(m *config.Member) string {
+	if m.Missing {
+		return "missing (reconstructed from parity)"
+	}
+	return describeSource(m.Type, m.Path, m.URL, m.SourceOffset)
+}
+
+func describeSource(typ config.SourceType, path, url string, sourceOffset int64) string {
+	out := string(typ)
+	switch typ {
+	case config.SourceFile, config.SourceDevice:
+		out += " " + path
+	case config.SourceHTTP:
+		out += " " + url
+	}
+	if sourceOffset > 0 {
+		out += fmt.Sprintf(" (offset %s)", util.FormatSize(sourceOffset))
 	}
 	return out
 }

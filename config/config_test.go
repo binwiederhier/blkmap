@@ -135,3 +135,86 @@ func TestParseRejectsBadID(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid device id")
 }
+
+func TestParseRAID5(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("r", []byte(`
+segments:
+  - type: raid5
+    stripe-size: 128K
+    layout: left-asymmetric
+    size: 1G
+    members:
+      - type: device
+        path: /dev/sdb
+        source-offset: 1M
+      - type: file
+        path: /srv/d2.img
+        source-offset: 1M
+        size: 600M
+      - missing: true
+      - type: http
+        url: http://x/d4.img
+`))
+	require.NoError(t, err)
+	require.Len(t, c.Segments, 1)
+	s := c.Segments[0]
+	assert.Equal(t, SourceRAID5, s.Type)
+	assert.Equal(t, int64(128<<10), s.StripeSize)
+	assert.Equal(t, LayoutLeftAsymmetric, s.Layout)
+	assert.Equal(t, int64(1<<30), s.Size)
+	require.Len(t, s.Members, 4)
+	assert.Equal(t, &Member{Type: SourceDevice, Path: "/dev/sdb", SourceOffset: 1 << 20}, s.Members[0])
+	assert.Equal(t, &Member{Type: SourceFile, Path: "/srv/d2.img", SourceOffset: 1 << 20, Size: 600 << 20}, s.Members[1])
+	assert.Equal(t, &Member{Missing: true}, s.Members[2])
+	assert.Equal(t, &Member{Type: SourceHTTP, URL: "http://x/d4.img"}, s.Members[3])
+}
+
+func TestParseRAID5Defaults(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("r", []byte(`
+segments:
+  - type: raid5
+    members:
+      - type: file
+        path: /a
+      - type: file
+        path: /b
+      - type: file
+        path: /c
+`))
+	require.NoError(t, err)
+	s := c.Segments[0]
+	assert.Equal(t, int64(DefaultStripeSize), s.StripeSize)
+	assert.Equal(t, LayoutLeftSymmetric, s.Layout)
+	assert.Equal(t, int64(0), s.Size)
+}
+
+func TestParseRAID5Errors(t *testing.T) {
+	t.Parallel()
+	three := "      - type: file\n        path: /a\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n"
+	tests := []struct {
+		name    string
+		content string
+		errMsg  string
+	}{
+		{"too few members", "segments:\n  - type: raid5\n    members:\n      - type: file\n        path: /a\n      - type: file\n        path: /b\n", "at least 3 members"},
+		{"two missing", "segments:\n  - type: raid5\n    members:\n      - missing: true\n      - missing: true\n      - type: file\n        path: /c\n", "at most one member can be missing"},
+		{"missing with path", "segments:\n  - type: raid5\n    members:\n      - missing: true\n        path: /a\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "missing member"},
+		{"bad layout", "segments:\n  - type: raid5\n    layout: diagonal\n    members:\n" + three, "unknown layout"},
+		{"bad stripe", "segments:\n  - type: raid5\n    stripe-size: 3000\n    members:\n" + three, "power of two"},
+		{"stripe smaller than block", "block-size: 4096\nsegments:\n  - type: raid5\n    stripe-size: 512\n    members:\n" + three, "at least the block size"},
+		{"member bad type", "segments:\n  - type: raid5\n    members:\n      - type: zero\n        size: 1M\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "unknown member type"},
+		{"member file without path", "segments:\n  - type: raid5\n    members:\n      - type: file\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "needs a path"},
+		{"members on non-raid", "segments:\n  - type: zero\n    size: 1M\n    members:\n" + three, "only valid for raid5"},
+		{"raid with path", "segments:\n  - type: raid5\n    path: /x\n    members:\n" + three, "path is only valid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse("r", []byte(tt.content))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errMsg)
+		})
+	}
+}

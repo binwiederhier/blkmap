@@ -61,6 +61,32 @@ systemctl stop blkmap@disk1           # unmount first; stop tears the kernel dev
 The unit is `Type=notify`, so `systemctl start` returns only once the device exists. A mount
 in fstab can depend on it with `x-systemd.requires=blkmap@disk1.service`.
 
+### RAID-5 segments (Windows dynamic disks and others)
+
+A `raid5` segment reassembles a RAID-5 set from its members on the fly, including one
+missing member rebuilt from parity. The geometry is given, not detected; for a Windows
+dynamic-disk (LDM) RAID-5 volume the defaults match (64 KiB stripes, left-symmetric rotation,
+the same `raid5_ls` table libldm builds), so you only need the member order and the offset
+of the LDM data partition on each member. For a Linux md array pass the values from
+`mdadm --examine` (`data_offset` as `source-offset`, chunk size as `stripe-size`, members in
+role order).
+
+```yaml
+segments:
+  - type: raid5
+    stripe-size: 64K            # default
+    layout: left-symmetric      # default; also left-asymmetric, right-symmetric, right-asymmetric
+    size: 100G                  # optional; default (members-1) x smallest member, whole stripes
+    members:                    # in array order; file, device or http, or missing
+      - type: device
+        path: /dev/sdb
+        source-offset: 1M
+      - type: file
+        path: /srv/disk2.img
+        source-offset: 1M
+      - missing: true           # at most one
+```
+
 HTTP sources must support Range requests (checked when the source is opened, so `validate`
 reports a server that cannot do it). Reads fetch 1 MiB aligned blocks through a small
 per-source LRU cache.

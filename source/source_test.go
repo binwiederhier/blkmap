@@ -1,6 +1,7 @@
 package source
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,4 +58,50 @@ func TestFromConfigMissingFile(t *testing.T) {
 	_, err = FromConfig(c)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "segment 0")
+}
+
+func TestFromConfigRAID5(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// A 3-member left-symmetric array of 2 rows with 1 KiB stripes, member 2 missing; the
+	// member files carry 512 bytes of junk before the array data to exercise source-offset
+	image := pattern(2 * 1024 * 2)
+	members := buildArray(t, image, 3, LeftSymmetric)
+	paths := make([]string, 3)
+	for i, m := range members {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("m%d", i))
+		require.NoError(t, os.WriteFile(paths[i], append(make([]byte, 512), m.(*mem).data...), 0600))
+	}
+	c, err := config.Parse("r", []byte(`
+segments:
+  - type: raid5
+    stripe-size: 1K
+    members:
+      - type: file
+        path: `+paths[0]+`
+        source-offset: 512
+      - type: file
+        path: `+paths[1]+`
+        source-offset: 512
+      - missing: true
+`))
+	require.NoError(t, err)
+	src, err := FromConfig(c)
+	require.NoError(t, err)
+	t.Cleanup(func() { src.Close() })
+	assert.Equal(t, int64(len(image)), src.Size())
+	got := make([]byte, len(image))
+	_, err = src.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, image, got)
+}
+
+func TestFromConfigRAID5MissingMemberFile(t *testing.T) {
+	t.Parallel()
+	c, err := config.Parse("r", []byte("segments:\n  - type: raid5\n    members:\n      - type: file\n        path: /nonexistent/a\n      - type: file\n        path: /nonexistent/b\n      - type: file\n        path: /nonexistent/c\n"))
+	require.NoError(t, err)
+	_, err = FromConfig(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "segment 0")
+	assert.Contains(t, err.Error(), "member 0")
 }

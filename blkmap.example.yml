@@ -36,3 +36,18 @@ segments:
     offset: 5G
     url: https://example.com/disk.img
     size: 2G
+  # A RAID-5 set reassembled on the fly. Defaults match Windows dynamic disks (LDM): 64K
+  # stripes, left-symmetric parity rotation. Members are in array order; one may be
+  # missing and is rebuilt from parity. source-offset is where the array data starts on
+  # that member (the LDM data partition, or md's data_offset).
+  - type: raid5
+    stripe-size: 64K
+    layout: left-symmetric
+    members:
+      - type: device
+        path: /dev/sdc
+        source-offset: 1M
+      - type: device
+        path: /dev/sdd
+        source-offset: 1M
+      - missing: true

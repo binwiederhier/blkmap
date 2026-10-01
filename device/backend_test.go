@@ -38,8 +38,9 @@ func (f *failing) Close() error {
 
 func TestBackendLogsErrors(t *testing.T) {
 	var out bytes.Buffer
+	prev := log.Writer()
 	log.SetOutput(&out)
-	t.Cleanup(func() { log.SetOutput(nil) })
+	t.Cleanup(func() { log.SetOutput(prev) })
 	b := &backend{Backend: &failing{size: 1 << 20}, id: "d"}
 	_, err := b.ReadAt(make([]byte, 4096), 8192)
 	require.Error(t, err)

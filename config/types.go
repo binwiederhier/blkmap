@@ -8,6 +8,16 @@ const (
 	SourceFile   SourceType = "file"
 	SourceDevice SourceType = "device"
 	SourceHTTP   SourceType = "http"
+	SourceRAID5  SourceType = "raid5"
+)
+
+// RAID-5 parity rotation layouts, named as Linux md does. Windows dynamic disks (LDM) use
+// left-symmetric, which is also md's default.
+const (
+	LayoutLeftSymmetric   = "left-symmetric"
+	LayoutLeftAsymmetric  = "left-asymmetric"
+	LayoutRightSymmetric  = "right-symmetric"
+	LayoutRightAsymmetric = "right-asymmetric"
 )
 
 // Config is the resolved, validated configuration of one blkmap device.
@@ -36,6 +46,22 @@ type Segment struct {
 	Path         string
 	URL          string
 	SourceOffset int64
+
+	// raid5 only: the array geometry and its members in array order
+	StripeSize int64
+	Layout     string
+	Members    []*Member
+}
+
+// Member is one disk of a raid5 segment: a file, device or http source, or a missing disk
+// that is reconstructed from parity.
+type Member struct {
+	Type         SourceType
+	Path         string
+	URL          string
+	SourceOffset int64
+	Size         int64
+	Missing      bool
 }
 
 // rawConfig mirrors the YAML file; sizes are strings so they can carry K/M/G suffixes.
@@ -54,10 +80,22 @@ type rawCOW struct {
 }
 
 type rawSegment struct {
+	Type         string       `yaml:"type"`
+	Offset       string       `yaml:"offset"`
+	Size         string       `yaml:"size"`
+	Path         string       `yaml:"path"`
+	URL          string       `yaml:"url"`
+	SourceOffset string       `yaml:"source-offset"`
+	StripeSize   string       `yaml:"stripe-size"`
+	Layout       string       `yaml:"layout"`
+	Members      []*rawMember `yaml:"members"`
+}
+
+type rawMember struct {
 	Type         string `yaml:"type"`
-	Offset       string `yaml:"offset"`
-	Size         string `yaml:"size"`
 	Path         string `yaml:"path"`
 	URL          string `yaml:"url"`
 	SourceOffset string `yaml:"source-offset"`
+	Size         string `yaml:"size"`
+	Missing      bool   `yaml:"missing"`
 }

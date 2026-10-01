@@ -15,6 +15,15 @@ const (
 	httpTimeout = 60 * time.Second
 )
 
+var (
+	layoutNames = map[string]Layout{
+		config.LayoutLeftSymmetric:   LeftSymmetric,
+		config.LayoutLeftAsymmetric:  LeftAsymmetric,
+		config.LayoutRightSymmetric:  RightSymmetric,
+		config.LayoutRightAsymmetric: RightAsymmetric,
+	}
+)
+
 // Source is a fixed-size, read-only byte range. ReadAt follows io.ReaderAt semantics; a read
 // past Size returns a short count and io.EOF.
 type Source interface {
@@ -69,7 +78,43 @@ func open(s *config.Segment) (Source, error) {
 		return OpenFile(s.Path, s.SourceOffset, s.Size)
 	case config.SourceHTTP:
 		return NewHTTP(&http.Client{Timeout: httpTimeout}, s.URL, s.SourceOffset, s.Size)
+	case config.SourceRAID5:
+		return openRAID5(s)
 	default:
 		return nil, fmt.Errorf("unknown segment type %q", s.Type)
 	}
+}
+
+// openRAID5 opens every present member of a raid5 segment and assembles the array.
+func openRAID5(s *config.Segment) (Source, error) {
+	members := make([]Source, len(s.Members))
+	closeAll := func() {
+		for _, m := range members {
+			if m != nil {
+				m.Close()
+			}
+		}
+	}
+	for i, m := range s.Members {
+		if m.Missing {
+			continue
+		}
+		src, err := open(&config.Segment{Type: m.Type, Path: m.Path, URL: m.URL, SourceOffset: m.SourceOffset, Size: m.Size})
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("member %d: %w", i, err)
+		}
+		members[i] = src
+	}
+	layout, ok := layoutNames[s.Layout]
+	if !ok {
+		closeAll()
+		return nil, fmt.Errorf("unknown raid5 layout %q", s.Layout)
+	}
+	r, err := NewRAID5(members, s.StripeSize, layout, s.Size)
+	if err != nil {
+		closeAll()
+		return nil, err
+	}
+	return r, nil
 }

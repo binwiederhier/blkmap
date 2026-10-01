@@ -67,3 +67,30 @@ func TestValidateNoArgs(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ID or FILE")
 }
+
+func TestValidateRAID5(t *testing.T) {
+	dir := t.TempDir()
+	for _, m := range []string{"m0", "m1"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, m), make([]byte, 64<<10), 0600))
+	}
+	path := filepath.Join(dir, "r.yml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+segments:
+  - type: raid5
+    stripe-size: 4K
+    members:
+      - type: file
+        path: `+dir+`/m0
+      - type: file
+        path: `+dir+`/m1
+        source-offset: 4K
+      - missing: true
+`), 0600))
+	app, stdout, _ := newTestApp()
+	require.NoError(t, app.Run([]string{"blkmap", "validate", path}))
+	out := stdout.String()
+	assert.Regexp(t, `0\s+120K\s+raid5 \(3 members, 4K stripes, left-symmetric\)`, out)
+	assert.Regexp(t, `member 0\s+file `+dir+`/m0\n`, out)
+	assert.Regexp(t, `member 1\s+file `+dir+`/m1 \(offset 4K\)\n`, out)
+	assert.Regexp(t, `member 2\s+missing \(reconstructed from parity\)\n`, out)
+}

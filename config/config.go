@@ -36,6 +36,12 @@ var (
 	// idRegex keeps ids usable as file names, systemd instance names, and /dev/blkmap entries.
 	idRegex   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 	errConfig = errors.New("invalid config")
+	layouts   = map[string]bool{
+		LayoutLeftSymmetric:   true,
+		LayoutLeftAsymmetric:  true,
+		LayoutRightSymmetric:  true,
+		LayoutRightAsymmetric: true,
+	}
 )
 
 // Path returns the config file path for a device id in dir.
@@ -82,7 +88,7 @@ func Parse(id string, content []byte) (*Config, error) {
 		return nil, fmt.Errorf("%w: at least one segment is required", errConfig)
 	}
 	for i, rs := range raw.Segments {
-		s, err := parseSegment(i, rs)
+		s, err := parseSegment(i, rs, c.BlockSize)
 		if err != nil {
 			return nil, err
 		}
@@ -157,8 +163,8 @@ func parseCOW(id string, raw *rawCOW, blockSize int) (*COW, error) {
 	return cow, nil
 }
 
-func parseSegment(i int, raw *rawSegment) (*Segment, error) {
-	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL}
+func parseSegment(i int, raw *rawSegment, blockSize int) (*Segment, error) {
+	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL, Layout: raw.Layout}
 	var err error
 	if raw.Offset != "" {
 		if s.Offset, err = parseSize(fmt.Sprintf("segment %d offset", i), raw.Offset, 0); err != nil {
@@ -171,6 +177,15 @@ func parseSegment(i int, raw *rawSegment) (*Segment, error) {
 	if s.SourceOffset, err = parseSize(fmt.Sprintf("segment %d source-offset", i), raw.SourceOffset, 0); err != nil {
 		return nil, err
 	}
+	if s.Type != SourceRAID5 && (len(raw.Members) > 0 || raw.StripeSize != "" || raw.Layout != "") {
+		return nil, fmt.Errorf("%w: segment %d: members, stripe-size and layout are only valid for raid5 segments", errConfig, i)
+	}
+	if s.Type != SourceFile && s.Type != SourceDevice && s.Path != "" {
+		return nil, fmt.Errorf("%w: segment %d: path is only valid for file and device segments", errConfig, i)
+	}
+	if s.Type != SourceHTTP && s.URL != "" {
+		return nil, fmt.Errorf("%w: segment %d: url is only valid for http segments", errConfig, i)
+	}
 	switch s.Type {
 	case SourceZero:
 		if s.Size == 0 {
@@ -180,20 +195,86 @@ func parseSegment(i int, raw *rawSegment) (*Segment, error) {
 		if s.Path == "" {
 			return nil, fmt.Errorf("%w: segment %d: %s segment needs a path", errConfig, i, s.Type)
 		}
-		if s.URL != "" {
-			return nil, fmt.Errorf("%w: segment %d: url is only valid for http segments", errConfig, i)
-		}
 	case SourceHTTP:
 		if s.URL == "" {
 			return nil, fmt.Errorf("%w: segment %d: http segment needs a url", errConfig, i)
 		}
-		if s.Path != "" {
-			return nil, fmt.Errorf("%w: segment %d: path is only valid for file and device segments", errConfig, i)
+	case SourceRAID5:
+		if err := parseRAID5(i, raw, s, blockSize); err != nil {
+			return nil, err
 		}
 	default:
 		return nil, fmt.Errorf("%w: segment %d: unknown segment type %q", errConfig, i, raw.Type)
 	}
 	return s, nil
+}
+
+// parseRAID5 fills in the array geometry and members of a raid5 segment.
+func parseRAID5(i int, raw *rawSegment, s *Segment, blockSize int) error {
+	var err error
+	if s.StripeSize, err = parseSize(fmt.Sprintf("segment %d stripe-size", i), raw.StripeSize, DefaultStripeSize); err != nil {
+		return err
+	}
+	if s.StripeSize&(s.StripeSize-1) != 0 {
+		return fmt.Errorf("%w: segment %d: stripe-size must be a power of two", errConfig, i)
+	}
+	if s.StripeSize < int64(blockSize) {
+		return fmt.Errorf("%w: segment %d: stripe-size must be at least the block size (%d)", errConfig, i, blockSize)
+	}
+	if s.Layout == "" {
+		s.Layout = LayoutLeftSymmetric
+	}
+	if !layouts[s.Layout] {
+		return fmt.Errorf("%w: segment %d: unknown layout %q", errConfig, i, s.Layout)
+	}
+	if len(raw.Members) < 3 {
+		return fmt.Errorf("%w: segment %d: raid5 needs at least 3 members", errConfig, i)
+	}
+	missing := 0
+	for j, rm := range raw.Members {
+		m, err := parseMember(i, j, rm)
+		if err != nil {
+			return err
+		}
+		if m.Missing {
+			missing++
+		}
+		s.Members = append(s.Members, m)
+	}
+	if missing > 1 {
+		return fmt.Errorf("%w: segment %d: at most one member can be missing", errConfig, i)
+	}
+	return nil
+}
+
+func parseMember(i, j int, raw *rawMember) (*Member, error) {
+	m := &Member{Type: SourceType(raw.Type), Path: raw.Path, URL: raw.URL, Missing: raw.Missing}
+	var err error
+	if m.SourceOffset, err = parseSize(fmt.Sprintf("segment %d member %d source-offset", i, j), raw.SourceOffset, 0); err != nil {
+		return nil, err
+	}
+	if m.Size, err = parseSize(fmt.Sprintf("segment %d member %d size", i, j), raw.Size, 0); err != nil {
+		return nil, err
+	}
+	if m.Missing {
+		if raw.Type != "" || m.Path != "" || m.URL != "" {
+			return nil, fmt.Errorf("%w: segment %d member %d: a missing member has no type, path or url", errConfig, i, j)
+		}
+		return m, nil
+	}
+	switch m.Type {
+	case SourceFile, SourceDevice:
+		if m.Path == "" {
+			return nil, fmt.Errorf("%w: segment %d member %d: %s member needs a path", errConfig, i, j, m.Type)
+		}
+	case SourceHTTP:
+		if m.URL == "" {
+			return nil, fmt.Errorf("%w: segment %d member %d: http member needs a url", errConfig, i, j)
+		}
+	default:
+		return nil, fmt.Errorf("%w: segment %d member %d: unknown member type %q", errConfig, i, j, raw.Type)
+	}
+	return m, nil
 }
 
 // parseSize parses an optional size field, falling back to def when the field is empty.
@@ -207,3 +288,8 @@ func parseSize(field, value string, def int64) (int64, error) {
 	}
 	return n, nil
 }
+
+const (
+	// DefaultStripeSize is the stripe unit of a raid5 segment; 64 KiB is the Windows default.
+	DefaultStripeSize = 64 << 10
+)
