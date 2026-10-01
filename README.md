@@ -146,12 +146,17 @@ bigger bitmap.
 make test        # unit tests (no root)
 make test-root   # ublk and device integration tests; needs root and ublk_drv loaded
 make stress      # e2e + fio verify workloads, ext4/xfs/btrfs, fstrim, SIGKILL under load, restarts
+make test-remote HOST=ip STRESS=stress   # the same on a throwaway VM (recommended, see below)
 make vet
 ```
 
 Layout follows the ntfy conventions: `cmd/` (CLI), `config/` (YAML), `source/` (zero, file,
 http, raid5, concat), `cow/` (bitmap + COW store, discard and write-zeroes aware), `device/`
 (COW over source over ublk, symlink, crash cleanup), `ublk/` (kernel transport), `util/`.
+
+Run the root suites on a throwaway VM rather than your workstation: a transport bug can wedge
+the kernel for good, and a scratch VM is rebooted in seconds. `scripts/remote-test.sh` builds
+here and runs there; verified on Ubuntu 24.04 (kernel 6.8) and 26.04 (kernel 7.0).
 
 A crashed server leaves its kernel device behind (only DEL_DEV removes one); `serve` records
 the ublk id in `/run/blkmap/<id>` and deletes the dead predecessor on the next start. Two
