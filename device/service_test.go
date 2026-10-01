@@ -3,8 +3,12 @@ package device
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"heckel.io/blkmap/config"
+	"heckel.io/blkmap/ublk"
 )
 
 const (
@@ -146,4 +151,159 @@ func TestStartStaleSymlink(t *testing.T) {
 	target, err := os.Readlink(d.Path)
 	require.NoError(t, err)
 	assert.Equal(t, d.BlockPath, target)
+}
+
+// computed is a Source that synthesizes its content: block i is filled with byte i. It is
+// what a program using blkmap as a library would plug in.
+type computed struct {
+	size int64
+}
+
+func (c *computed) ReadAt(p []byte, off int64) (int, error) {
+	for i := range p {
+		p[i] = byte((off + int64(i)) / 4096)
+	}
+	return len(p), nil
+}
+
+func (c *computed) Size() int64 {
+	return c.size
+}
+
+func (c *computed) Close() error {
+	return nil
+}
+
+func TestServeLibrarySource(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	d, err := Serve(context.Background(), &Options{
+		ID:      "lib",
+		Base:    &computed{size: 8 << 20},
+		COWFile: filepath.Join(dir, "lib.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	f, err := os.OpenFile(d.Path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Close() })
+	// Reads come from the synthetic source, with 1 MiB requests now that the ublk layer
+	// sizes its buffers to the maximum request
+	buf := make([]byte, 1<<20)
+	_, err = f.ReadAt(buf, 3<<20)
+	require.NoError(t, err)
+	for i := 0; i < len(buf); i += 4096 {
+		require.Equal(t, byte((3<<20+i)/4096), buf[i], "block at %d", 3<<20+i)
+	}
+	// Writes go to the overlay and read back
+	_, err = f.WriteAt(bytes.Repeat([]byte{0xee}, 8192), 5<<20)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	got := make([]byte, 8192)
+	_, err = f.ReadAt(got, 5<<20)
+	require.NoError(t, err)
+	assert.Equal(t, bytes.Repeat([]byte{0xee}, 8192), got)
+	assert.Equal(t, int64(1), d.Written())
+	// Defaults were applied
+	_, err = os.Stat(filepath.Join(dir, "lib.cow.bitmap"))
+	require.NoError(t, err)
+}
+
+const (
+	helperEnv = "BLKMAP_DEVICE_HELPER"
+)
+
+// TestHelperServe is not a test: as a child process it creates a bare ublk device, prints
+// its id and sleeps until killed, standing in for a blkmap server that crashed.
+func TestHelperServe(t *testing.T) {
+	if os.Getenv(helperEnv) == "" {
+		t.Skip("helper process only")
+	}
+	d, err := ublk.Create(&ublk.Params{Backend: &memBackend{data: make([]byte, 1<<20)}})
+	if err != nil {
+		fmt.Println("ERR", err)
+		os.Exit(1)
+	}
+	fmt.Println("ID", d.ID)
+	select {}
+}
+
+func TestServeCleansUpDeadPredecessor(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	// A device whose server died without deleting it
+	cmd := exec.Command(os.Args[0], "-test.run", "TestHelperServe$")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	out, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	var old uint32
+	_, err = fmt.Fscanf(out, "ID %d\n", &old)
+	require.NoError(t, err)
+	require.NoError(t, cmd.Process.Kill())
+	cmd.Wait()
+	require.NoError(t, os.MkdirAll(runDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "pred"), []byte(fmt.Sprintf("%d\n", old)), 0600))
+	d, err := Serve(context.Background(), &Options{
+		ID:      "pred",
+		Base:    &computed{size: 4 << 20},
+		COWFile: filepath.Join(dir, "pred.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+		RunDir:  runDir,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	// The dead predecessor is gone; the kernel may have handed its id to our new device
+	if info, err := ublk.GetInfo(old); err == nil {
+		assert.Equal(t, os.Getpid(), info.ServerPID, "the old id should now be our new device")
+	} else {
+		assert.ErrorIs(t, err, syscall.ENODEV)
+	}
+	// The state file now names the new device and goes away on Close
+	state, err := os.ReadFile(filepath.Join(runDir, "pred"))
+	require.NoError(t, err)
+	assert.Equal(t, strings.TrimPrefix(d.BlockPath, "/dev/ublkb")+"\n", string(state))
+	require.NoError(t, d.Close())
+	_, err = os.Stat(filepath.Join(runDir, "pred"))
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestServeIgnoresBogusStateFile(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	require.NoError(t, os.MkdirAll(runDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "bogus"), []byte("999999\n"), 0600))
+	d, err := Serve(context.Background(), &Options{
+		ID:      "bogus",
+		Base:    &computed{size: 4 << 20},
+		COWFile: filepath.Join(dir, "bogus.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+		RunDir:  runDir,
+	})
+	require.NoError(t, err)
+	require.NoError(t, d.Close())
+}
+
+// memBackend is a minimal ublk backend for the predecessor device.
+type memBackend struct {
+	data []byte
+}
+
+func (m *memBackend) ReadAt(p []byte, off int64) (int, error) {
+	return copy(p, m.data[off:]), nil
+}
+
+func (m *memBackend) WriteAt(p []byte, off int64) (int, error) {
+	return copy(m.data[off:], p), nil
+}
+
+func (m *memBackend) Size() int64 {
+	return int64(len(m.data))
+}
+
+func (m *memBackend) Flush() error {
+	return nil
 }

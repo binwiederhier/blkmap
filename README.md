@@ -97,23 +97,69 @@ the device to its sources (while the unit is stopped). The bitmap header pins th
 and chunk size, so a config change that alters either is refused rather than silently
 misreading old data.
 
+## Library use
+
+The daemon is a thin layer over three packages, and a Go program that computes or fetches
+blocks can use them directly. Implement `source.Source` (`ReadAt`, `Size`, `Close`) and hand it
+to `device.Serve`; the COW overlay, the kernel device and the `/dev/blkmap/<id>` symlink come
+with it:
+
+```go
+dev, err := device.Serve(ctx, &device.Options{
+    ID:      "synth",
+    Base:    mySource,                      // source.Source, read-only
+    COWFile: "/var/lib/blkmap/synth.cow",   // bitmap and 64K chunks by default
+})
+// ... /dev/blkmap/synth is live until dev.Close()
+```
+
+`source.Concat`, `source.RAID5`, `source.File`, `source.HTTP` and `source.Zero` are ordinary
+Sources and compose. One level down, `ublk.Create` serves any `ublk.Backend` (ReadAt, WriteAt,
+Size, Flush, optionally Discard and WriteZeroes) without the COW layer.
+
+## Performance
+
+The ublk transport lives in-tree (`ublk/`, about 800 lines, derived from go-ublk): an
+ioctl-encoded control plane, a minimal SQE128/CQE32 io_uring per queue, one OS thread per
+queue, and per-tag buffers sized to the 1 MiB maximum request, so large I/O is never split.
+Defaults are 4 queues (fewer on smaller machines) at depth 64, which costs at most 256 MiB of
+request buffers per device, touched lazily.
+
+Measured on a 12 vCPU KVM guest (kernel 6.8) with `scripts/stress.sh`, zero-backed 4 GiB
+device, direct I/O, 4 jobs at queue depth 32:
+
+| workload | result |
+|---|---|
+| 4K random read | 329k IOPS |
+| 1M random read | 21 GB/s |
+| 1M sequential read | 4.1 GB/s (single job) |
+| 4K random write (COW, 64K chunks) | 23k IOPS |
+| 1M random write (COW) | 977 MB/s |
+
+Random 4K writes pay for the copy-on-write chunking: the first write into a 64K chunk copies
+the chunk from the base and writes it whole. A smaller `cow.chunk-size` trades that for a
+bigger bitmap.
+
 ## Development
 
 ```
 make test        # unit tests (no root)
-make test-root   # also the ublk integration tests; needs root and ublk_drv loaded
+make test-root   # ublk and device integration tests; needs root and ublk_drv loaded
+make stress      # e2e + fio verify workloads, ext4/xfs/btrfs, fstrim, SIGKILL under load, restarts
 make vet
 ```
 
 Layout follows the ntfy conventions: `cmd/` (CLI), `config/` (YAML), `source/` (zero, file,
-http, concat), `cow/` (bitmap + COW store, implements the ublk backend), `device/` (ublk glue,
-symlink, lifecycle), `util/`. The ublk transport is
-[github.com/ehrlich-b/go-ublk](https://github.com/ehrlich-b/go-ublk) (MIT, pure Go).
+http, raid5, concat), `cow/` (bitmap + COW store, discard and write-zeroes aware), `device/`
+(COW over source over ublk, symlink, crash cleanup), `ublk/` (kernel transport), `util/`.
 
-Known limit: requests are capped at 64 KiB (`maxIOSize` in `device/service.go`) because
-go-ublk's per-tag buffers are 64 KiB and larger requests return stale data with that library
-version. Throughput is fine for a POC; raising it means fixing or vendoring the library.
+A crashed server leaves its kernel device behind (only DEL_DEV removes one); `serve` records
+the ublk id in `/run/blkmap/<id>` and deletes the dead predecessor on the next start. Two
+kernel 6.8 traps worth knowing: a ublk server that dies while START_DEV is scanning
+partitions wedges that device for good and makes a global `sync` hang (use `sync -f`), and
+only the ioctl-encoded command set is accepted (`CONFIG_BLKDEV_UBLK_LEGACY_OPCODES` is off).
 
 ## License
 
-Apache 2.0. go-ublk is MIT licensed.
+Apache 2.0. The `ublk` package derives from [go-ublk](https://github.com/ehrlich-b/go-ublk)
+(MIT, Benjamin Ehrlich).

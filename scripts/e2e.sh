@@ -46,7 +46,7 @@ mkfs.ext4 -q $dev
 mount $dev $mnt
 echo "hello from blkmap $(date)" > $mnt/hello.txt
 head -c 3000000 /dev/urandom > $mnt/blob; sha=$(sha256sum $mnt/blob | cut -d' ' -f1)
-sync; umount $mnt
+sync -f $mnt; umount $mnt
 echo "== restart"
 systemctl stop blkmap@$id; [ ! -e $dev ] && echo "symlink removed on stop"
 cmp $dir/part.img <(dd if=$dir/part.img status=none) >/dev/null && echo "source image untouched: $(sha256sum $dir/part.img | cut -d' ' -f1)"

@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"heckel.io/blkmap/source"
 )
 
@@ -19,7 +21,7 @@ const (
 )
 
 var (
-	errOutOfRange = errors.New("write beyond device end")
+	errOutOfRange = errors.New("range beyond device end")
 )
 
 // Store is the writable device image: reads come from the COW file for written chunks and
@@ -148,5 +150,77 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 		return err
 	}
 	s.bitmap.Set(chunk)
+	return nil
+}
+
+// Discard drops a range: whole chunks already in the COW file are punched out, so they read
+// as zeros and stop using space. Partial chunks and unwritten chunks are left alone, which
+// discard semantics allow.
+func (s *Store) Discard(off, length int64) error {
+	if err := s.checkRange(off, length); err != nil {
+		return err
+	}
+	first := (off + s.chunkSize - 1) / s.chunkSize
+	end := (off + length) / s.chunkSize
+	for chunk := first; chunk < end; chunk++ {
+		mu := &s.locks[chunk%lockStripes]
+		mu.Lock()
+		var err error
+		if s.bitmap.Test(chunk) {
+			err = s.punch(chunk)
+		}
+		mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WriteZeroes zeroes a range: whole chunks are punched out and marked written (reading as
+// zeros from the sparse COW file); partial chunks go through the normal write path.
+func (s *Store) WriteZeroes(off, length int64) error {
+	if err := s.checkRange(off, length); err != nil {
+		return err
+	}
+	var zeros []byte
+	for end := off + length; off < end; {
+		chunk := off / s.chunkSize
+		chunkStart := chunk * s.chunkSize
+		chunkEnd := min(chunkStart+s.chunkSize, s.size)
+		m := min(end, chunkEnd) - off
+		var err error
+		if off == chunkStart && m == chunkEnd-chunkStart {
+			mu := &s.locks[chunk%lockStripes]
+			mu.Lock()
+			if err = s.punch(chunk); err == nil {
+				s.bitmap.Set(chunk)
+			}
+			mu.Unlock()
+		} else {
+			if int64(len(zeros)) < m {
+				zeros = make([]byte, m)
+			}
+			err = s.writeChunk(chunk, zeros[:m], off)
+		}
+		if err != nil {
+			return err
+		}
+		off += m
+	}
+	return nil
+}
+
+// punch deallocates chunk in the COW file; it reads back as zeros. Callers hold the lock.
+func (s *Store) punch(chunk int64) error {
+	start := chunk * s.chunkSize
+	length := min(s.chunkSize, s.size-start)
+	return unix.Fallocate(int(s.cow.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, start, length)
+}
+
+func (s *Store) checkRange(off, length int64) error {
+	if off < 0 || length < 0 || off+length > s.size {
+		return fmt.Errorf("%w: offset %d, length %d, size %d", errOutOfRange, off, length, s.size)
+	}
 	return nil
 }

@@ -25,9 +25,9 @@ const (
 	DefaultChunkSize = 64 << 10
 	// configExt is the config file extension inside DefaultDir.
 	configExt = ".yml"
-	// cowExt and bitmapExt name the default state files, <id>.cow and <id>.cow.bitmap.
+	// cowExt and BitmapExt name the default state files, <id>.cow and <id>.cow.bitmap.
 	cowExt    = ".cow"
-	bitmapExt = ".bitmap"
+	BitmapExt = ".bitmap"
 	// blockSizeLarge is the only other logical block size the kernel accepts on x86 (page size).
 	blockSizeLarge = 4096
 )
@@ -148,7 +148,7 @@ func parseCOW(id string, raw *rawCOW, blockSize int) (*COW, error) {
 		cow.File = filepath.Join(DefaultStateDir, id+cowExt)
 	}
 	if cow.Bitmap == "" {
-		cow.Bitmap = cow.File + bitmapExt
+		cow.Bitmap = cow.File + BitmapExt
 	}
 	var err error
 	if cow.ChunkSize, err = parseSize("cow.chunk-size", raw.ChunkSize, DefaultChunkSize); err != nil {

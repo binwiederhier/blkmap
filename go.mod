@@ -3,7 +3,6 @@ module heckel.io/blkmap
 go 1.27.1
 
 require (
-	github.com/ehrlich-b/go-ublk v0.0.0-20260823000206-ad0282f25a69
 	github.com/stretchr/testify v1.12.1
 	github.com/urfave/cli/v2 v2.27.7
 	golang.org/x/sys v0.48.0

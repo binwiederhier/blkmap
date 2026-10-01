@@ -4,7 +4,7 @@ import (
 	"log"
 	"sync/atomic"
 
-	"github.com/ehrlich-b/go-ublk"
+	"heckel.io/blkmap/cow"
 )
 
 const (
@@ -12,29 +12,45 @@ const (
 	maxLoggedErrors = 20
 )
 
-// backend wraps the store so I/O failures are visible in the log; go-ublk itself only turns
-// them into EIO for the kernel.
+// backend wraps the store so I/O failures are visible in the log; the ublk layer itself
+// only turns them into EIO for the kernel.
 type backend struct {
-	ublk.Backend
+	store  *cow.Store
 	id     string
 	logged atomic.Int64
 }
 
 func (b *backend) ReadAt(p []byte, off int64) (int, error) {
-	n, err := b.Backend.ReadAt(p, off)
+	n, err := b.store.ReadAt(p, off)
 	b.logError("read", off, len(p), err)
 	return n, err
 }
 
 func (b *backend) WriteAt(p []byte, off int64) (int, error) {
-	n, err := b.Backend.WriteAt(p, off)
+	n, err := b.store.WriteAt(p, off)
 	b.logError("write", off, len(p), err)
 	return n, err
 }
 
+func (b *backend) Size() int64 {
+	return b.store.Size()
+}
+
 func (b *backend) Flush() error {
-	err := b.Backend.Flush()
+	err := b.store.Flush()
 	b.logError("flush", 0, 0, err)
+	return err
+}
+
+func (b *backend) Discard(off, length int64) error {
+	err := b.store.Discard(off, length)
+	b.logError("discard", off, int(length), err)
+	return err
+}
+
+func (b *backend) WriteZeroes(off, length int64) error {
+	err := b.store.WriteZeroes(off, length)
+	b.logError("write zeroes", off, int(length), err)
 	return err
 }
 

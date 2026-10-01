@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -197,4 +198,51 @@ func TestStoreGeometryMismatch(t *testing.T) {
 	_, err := Open(&mem{data: pattern(2 * testSize)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "device size")
+}
+
+func TestStoreDiscard(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(testSize)}
+	dir := t.TempDir()
+	s := newTestStore(t, dir, base)
+	// Write chunks 2..5 fully, then discard a range covering 3 and 4 fully and 2 and 5 partially
+	_, err := s.WriteAt(bytes.Repeat([]byte{'w'}, 4*testChunk), 2*testChunk)
+	require.NoError(t, err)
+	require.NoError(t, s.Discard(2*testChunk+100, 4*testChunk-200))
+	expected := pattern(testSize)
+	copy(expected[2*testChunk:], bytes.Repeat([]byte{'w'}, 4*testChunk))
+	clear(expected[3*testChunk : 5*testChunk])
+	assert.Equal(t, expected, readAll(t, s))
+	assert.Equal(t, int64(4), s.Written()) // discarded chunks stay marked as written
+	// Discarding never-written chunks changes nothing
+	require.NoError(t, s.Discard(8*testChunk, 2*testChunk))
+	assert.Equal(t, expected, readAll(t, s))
+	assert.Equal(t, int64(4), s.Written())
+	// The punched chunks no longer occupy disk blocks
+	st, err := os.Stat(filepath.Join(dir, "d.cow"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(2*testChunk), st.Sys().(*syscall.Stat_t).Blocks*512)
+	// Out of range
+	require.Error(t, s.Discard(testSize-100, 200))
+	require.NoError(t, s.Close())
+}
+
+func TestStoreWriteZeroes(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	// Spans the tail of chunk 1, all of chunks 2 and 3, and the head of chunk 4
+	require.NoError(t, s.WriteZeroes(2*testChunk-100, 2*testChunk+300))
+	expected := pattern(testSize)
+	clear(expected[2*testChunk-100 : 4*testChunk+200])
+	assert.Equal(t, expected, readAll(t, s))
+	assert.Equal(t, int64(4), s.Written())
+	// Zeroing an already-written chunk
+	_, err := s.WriteAt(bytes.Repeat([]byte{'q'}, testChunk), 6*testChunk)
+	require.NoError(t, err)
+	require.NoError(t, s.WriteZeroes(6*testChunk, testChunk))
+	clear(expected[6*testChunk : 7*testChunk])
+	assert.Equal(t, expected, readAll(t, s))
+	require.Error(t, s.WriteZeroes(testSize-100, 200))
+	require.NoError(t, s.Close())
 }
