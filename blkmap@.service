@@ -1,0 +1,19 @@
+[Unit]
+Description=blkmap block device %i
+Documentation=https://heckel.io/blkmap
+After=local-fs-pre.target
+Before=local-fs.target
+DefaultDependencies=no
+
+[Service]
+Type=notify
+ExecStartPre=-/sbin/modprobe ublk_drv
+ExecStart=/usr/bin/blkmap serve %i
+Restart=on-failure
+RestartSec=2
+# Stopping tears down the kernel device; give in-flight I/O time to drain
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

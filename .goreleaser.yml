@@ -1,0 +1,71 @@
+version: 2
+before:
+  hooks:
+    - go mod download
+    - go mod tidy
+builds:
+  - id: blkmap_linux_amd64
+    binary: blkmap
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
+    goos: [ linux ]
+    goarch: [ amd64 ]
+  - id: blkmap_linux_arm64
+    binary: blkmap
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}"
+    goos: [ linux ]
+    goarch: [ arm64 ]
+nfpms:
+  - package_name: blkmap
+    homepage: https://heckel.io/blkmap
+    maintainer: Philipp C. Heckel <philipp.heckel@gmail.com>
+    description: Stitch files, devices and HTTP sources into a copy-on-write block device (ublk)
+    license: Apache 2.0
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: blkmap@.service
+        dst: /lib/systemd/system/blkmap@.service
+      - src: blkmap.conf
+        dst: /usr/lib/modules-load.d/blkmap.conf
+      - src: blkmap.example.yml
+        dst: /usr/share/doc/blkmap/blkmap.example.yml
+      - dst: /etc/blkmap
+        type: dir
+      - dst: /var/lib/blkmap
+        type: dir
+        file_info:
+          mode: 0700
+    scripts:
+      postinstall: "scripts/postinst.sh"
+      preremove: "scripts/prerm.sh"
+      postremove: "scripts/postrm.sh"
+archives:
+  - id: blkmap_linux
+    ids:
+      - blkmap_linux_amd64
+      - blkmap_linux_arm64
+    wrap_in_directory: true
+    files:
+      - LICENSE
+      - README.md
+      - blkmap@.service
+      - blkmap.conf
+      - blkmap.example.yml
+checksum:
+  name_template: 'checksums.txt'
+snapshot:
+  version_template: "{{ .Tag }}-next"
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'

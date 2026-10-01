@@ -1,0 +1,38 @@
+# blkmap device definition. Install as /etc/blkmap/<id>.yml and start it with
+# "systemctl start blkmap@<id>"; the device appears as /dev/blkmap/<id>.
+#
+# Sizes accept K/M/G/T suffixes (binary). JSON is valid YAML, so a JSON file works too.
+
+# Device size. Optional; defaults to the end of the last segment. If larger, the tail
+# reads as zeros.
+size: 10G
+
+# Logical block size the kernel sees: 512 (default) or 4096.
+block-size: 512
+
+# Reject all writes at the kernel level. Default false.
+read-only: false
+
+# Where writes go. Both files are created on first start. The COW file is a sparse raw
+# image of the overlay; the bitmap records which chunks live in it. Defaults shown.
+cow:
+  file: /var/lib/blkmap/example.cow
+  bitmap: /var/lib/blkmap/example.cow.bitmap
+  chunk-size: 64K
+
+# Segments in device order. "offset" is optional and defaults to the end of the previous
+# segment; gaps read as zeros, overlaps are an error. "size" is required for zero segments
+# and otherwise defaults to the rest of the source after "source-offset".
+segments:
+  - type: zero
+    size: 1M
+  - type: file
+    path: /srv/images/part1.img
+    source-offset: 0
+    size: 100M
+  - type: device
+    path: /dev/sdb1
+  - type: http
+    offset: 5G
+    url: https://example.com/disk.img
+    size: 2G
