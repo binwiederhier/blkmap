@@ -154,3 +154,21 @@ func TestRAID5Errors(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "multiple of the stripe size")
 }
+
+func TestRAID5Direct(t *testing.T) {
+	t.Parallel()
+	image := pattern(2 * raidStripe * 2)
+	members := buildArray(t, image, 3, LeftSymmetric)
+	// Wrap member 0 in a cache whose fast tier is wrong, so only direct reads are right
+	wrong := &tier{mem: mem{data: filled(len(members[0].(*mem).data), 'X').data}}
+	members[0] = NewCache(wrong, members[0])
+	r, err := NewRAID5(members, raidStripe, LeftSymmetric, 0)
+	require.NoError(t, err)
+	got := make([]byte, len(image))
+	_, err = ReadDirect(r, got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, image, got)
+	_, err = r.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.NotEqual(t, image, got)
+}

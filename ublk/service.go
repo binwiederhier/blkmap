@@ -123,6 +123,8 @@ func Create(p *Params) (*Device, error) {
 }
 
 // Close stops the device (draining in-flight I/O), joins the queue threads and deletes it.
+// Deletion waits until nothing holds the block device open any more (a mount, a process
+// with the device open), so unmount first.
 func (d *Device) Close() error {
 	if d.closed {
 		return nil

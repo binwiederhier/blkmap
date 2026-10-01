@@ -20,6 +20,19 @@ cow:
   bitmap: /var/lib/blkmap/example.cow.bitmap
   chunk-size: 64K
 
+# Background hydration: copy the base into the COW file so the device eventually needs no
+# source. Optional; the block's presence enables it. Guest I/O always has priority. The
+# prefetch list is a file of "offset length" lines (binary suffixes, # comments), highest
+# priority first; it is read at full speed, then the rest at "rate" (0 = unlimited). Once
+# every chunk is in the COW file the sources are no longer opened on start.
+hydrate:
+  prefetch-list: /etc/blkmap/example.prefetch
+  rest: true            # also hydrate what the list does not cover (default true)
+  rate: 20M             # bytes/s cap for the rest phase
+  use-cache: always     # always | never: whether background reads may use cache tiers
+  concurrency: 4        # parallel background reads
+  report-every: 30s     # progress line in the journal
+
 # Segments in device order. "offset" is optional and defaults to the end of the previous
 # segment; gaps read as zeros, overlaps are an error. "size" is required for zero segments
 # and otherwise defaults to the rest of the source after "source-offset".
@@ -36,6 +49,23 @@ segments:
     offset: 5G
     url: https://example.com/disk.img
     size: 2G
+  # A fast cache in front of a slow origin. Any error from "fast" (a 404 from an HTTP cache,
+  # a missing file) falls through to "slow", without retries; the cache is never written.
+  # Both tiers accept every source type.
+  - type: cache
+    size: 2G
+    fast:
+      type: http
+      url: http://cache.lan/images/disk.img
+    slow:
+      type: http
+      url: https://origin.example.com/images/disk.img
+  # A segment implemented by Go code that embeds blkmap: it registers a constructor under
+  # this name with source.Register before loading the config. params are free-form strings.
+  - type: custom
+    name: synth-partition
+    size: 1G
+    params: {seed: "42"}
   # A RAID-5 set reassembled on the fly. Defaults match Windows dynamic disks (LDM): 64K
   # stripes, left-symmetric parity rotation. Members are in array order; one may be
   # missing and is rebuilt from parity. source-offset is where the array data starts on

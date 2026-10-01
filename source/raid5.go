@@ -65,6 +65,15 @@ func NewRAID5(members []Source, stripeSize int64, layout Layout, size int64) (*R
 }
 
 func (r *RAID5) ReadAt(p []byte, off int64) (int, error) {
+	return r.readAt(p, off, false)
+}
+
+// ReadAtDirect reads every member around its cache tier, if it has one.
+func (r *RAID5) ReadAtDirect(p []byte, off int64) (int, error) {
+	return r.readAt(p, off, true)
+}
+
+func (r *RAID5) readAt(p []byte, off int64, direct bool) (int, error) {
 	n, eof := clampRead(len(p), off, r.size)
 	p = p[:n]
 	for len(p) > 0 {
@@ -75,9 +84,9 @@ func (r *RAID5) ReadAt(p []byte, off int64) (int, error) {
 		memberOff := unit/int64(len(r.members)-1)*r.stripeSize + within
 		var err error
 		if r.members[d] != nil {
-			err = r.readMember(d, p[:m], memberOff)
+			err = r.readMember(d, p[:m], memberOff, direct)
 		} else {
-			err = r.reconstruct(d, p[:m], memberOff)
+			err = r.reconstruct(d, p[:m], memberOff, direct)
 		}
 		if err != nil {
 			return n - len(p), err
@@ -130,8 +139,14 @@ func (r *RAID5) locate(unit int64) (dataMember, parityMember int) {
 }
 
 // readMember reads exactly len(p) bytes from member d.
-func (r *RAID5) readMember(d int, p []byte, off int64) error {
-	read, err := r.members[d].ReadAt(p, off)
+func (r *RAID5) readMember(d int, p []byte, off int64, direct bool) error {
+	var read int
+	var err error
+	if direct {
+		read, err = ReadDirect(r.members[d], p, off)
+	} else {
+		read, err = r.members[d].ReadAt(p, off)
+	}
 	if err != nil && !(errors.Is(err, io.EOF) && read == len(p)) {
 		return fmt.Errorf("raid5 member %d: %w", d, err)
 	}
@@ -142,14 +157,14 @@ func (r *RAID5) readMember(d int, p []byte, off int64) error {
 }
 
 // reconstruct rebuilds the missing member d's bytes at off by XORing every other member.
-func (r *RAID5) reconstruct(d int, p []byte, off int64) error {
+func (r *RAID5) reconstruct(d int, p []byte, off int64, direct bool) error {
 	clear(p)
 	buf := make([]byte, len(p))
 	for i := range r.members {
 		if i == d {
 			continue
 		}
-		if err := r.readMember(i, buf, off); err != nil {
+		if err := r.readMember(i, buf, off, direct); err != nil {
 			return err
 		}
 		for j := range p {

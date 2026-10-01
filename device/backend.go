@@ -3,6 +3,7 @@ package device
 import (
 	"log"
 	"sync/atomic"
+	"time"
 
 	"heckel.io/blkmap/cow"
 )
@@ -12,21 +13,41 @@ const (
 	maxLoggedErrors = 20
 )
 
-// backend wraps the store so I/O failures are visible in the log; the ublk layer itself
-// only turns them into EIO for the kernel.
+// backend wraps the store so I/O failures are visible in the log (the ublk layer itself
+// only turns them into EIO for the kernel) and so hydration can tell when the guest is busy.
 type backend struct {
-	store  *cow.Store
-	id     string
-	logged atomic.Int64
+	store      *cow.Store
+	id         string
+	logged     atomic.Int64
+	inflight   atomic.Int64
+	lastActive atomic.Int64 // unix nanoseconds of the last completed request
+}
+
+// busy reports whether guest I/O is in flight or finished within hydrateBackoff.
+func (b *backend) busy() bool {
+	return b.inflight.Load() > 0 || time.Since(time.Unix(0, b.lastActive.Load())) < hydrateBackoff
+}
+
+func (b *backend) enter() {
+	b.inflight.Add(1)
+}
+
+func (b *backend) leave() {
+	b.lastActive.Store(time.Now().UnixNano())
+	b.inflight.Add(-1)
 }
 
 func (b *backend) ReadAt(p []byte, off int64) (int, error) {
+	b.enter()
+	defer b.leave()
 	n, err := b.store.ReadAt(p, off)
 	b.logError("read", off, len(p), err)
 	return n, err
 }
 
 func (b *backend) WriteAt(p []byte, off int64) (int, error) {
+	b.enter()
+	defer b.leave()
 	n, err := b.store.WriteAt(p, off)
 	b.logError("write", off, len(p), err)
 	return n, err

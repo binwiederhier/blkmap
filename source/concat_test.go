@@ -11,7 +11,8 @@ import (
 
 // mem is an in-memory Source for layout tests.
 type mem struct {
-	data []byte
+	data   []byte
+	closed bool
 }
 
 func (m *mem) ReadAt(p []byte, off int64) (int, error) {
@@ -30,6 +31,7 @@ func (m *mem) Size() int64 {
 }
 
 func (m *mem) Close() error {
+	m.closed = true
 	return nil
 }
 
@@ -103,4 +105,30 @@ func TestConcatErrors(t *testing.T) {
 	_, err = NewConcat([]*Segment{{Offset: 0, Source: filled(0, 'a')}}, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "empty")
+}
+
+func TestConcatZeroRangesAndDirect(t *testing.T) {
+	t.Parallel()
+	fast := &tier{mem: mem{data: filled(100, 'F').data}}
+	slow := &tier{mem: mem{data: filled(100, 'S').data}}
+	c, err := NewConcat([]*Segment{
+		{Offset: 0, Source: NewZero(50)},
+		{Offset: 50, Source: filled(100, 'a')},
+		{Offset: 200, Source: NewCache(fast, slow)}, // gap 150..200
+		{Offset: 300, Source: NewZero(10)},
+	}, 400) // tail 310..400
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{0, 50}, {150, 50}, {300, 10}, {310, 90}}, ZeroRanges(c))
+	assert.Nil(t, ZeroRanges(filled(10, 'x'))) // unknown for plain sources
+	p := make([]byte, 100)
+	_, err = c.ReadAt(p, 200)
+	require.NoError(t, err)
+	assert.Equal(t, filled(100, 'F').data, p)
+	_, err = ReadDirect(c, p, 200)
+	require.NoError(t, err)
+	assert.Equal(t, filled(100, 'S').data, p)
+	// Direct reads of non-cache segments behave like plain reads
+	_, err = ReadDirect(c, p[:50], 50)
+	require.NoError(t, err)
+	assert.Equal(t, filled(50, 'a').data, p[:50])
 }

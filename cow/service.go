@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -223,4 +225,95 @@ func (s *Store) checkRange(off, length int64) error {
 		return fmt.Errorf("%w: offset %d, length %d, size %d", errOutOfRange, off, length, s.size)
 	}
 	return nil
+}
+
+// Chunks returns the number of chunks in the device.
+func (s *Store) Chunks() int64 {
+	return s.bitmap.Chunks()
+}
+
+// ChunkSize returns the COW granularity in bytes.
+func (s *Store) ChunkSize() int64 {
+	return s.chunkSize
+}
+
+// IsWritten reports whether chunk lives in the COW file.
+func (s *Store) IsWritten(chunk int64) bool {
+	return s.bitmap.Test(chunk)
+}
+
+// HydrateChunk copies chunk from the base into the COW file unless it is already there.
+// With direct, the read bypasses cache tiers. It reports whether a copy happened.
+func (s *Store) HydrateChunk(chunk int64, direct bool) (bool, error) {
+	start := chunk * s.chunkSize
+	buf := make([]byte, min(s.chunkSize, s.size-start))
+	mu := &s.locks[chunk%lockStripes]
+	mu.Lock()
+	defer mu.Unlock()
+	if s.bitmap.Test(chunk) {
+		return false, nil
+	}
+	var n int
+	var err error
+	if direct {
+		n, err = source.ReadDirect(s.base, buf, start)
+	} else {
+		n, err = s.base.ReadAt(buf, start)
+	}
+	if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
+		return false, fmt.Errorf("hydrate chunk %d: %w", chunk, err)
+	}
+	if n < len(buf) {
+		return false, fmt.Errorf("hydrate chunk %d: short read (%d of %d bytes)", chunk, n, len(buf))
+	}
+	if _, err := s.cow.WriteAt(buf, start); err != nil {
+		return false, err
+	}
+	s.bitmap.Set(chunk)
+	return true, nil
+}
+
+// MarkZero records chunk as written without copying anything, for chunks known to read as
+// zeros: the sparse COW file reads zeros there. It reports whether the bit was newly set.
+func (s *Store) MarkZero(chunk int64) bool {
+	mu := &s.locks[chunk%lockStripes]
+	mu.Lock()
+	defer mu.Unlock()
+	if s.bitmap.Test(chunk) {
+		return false
+	}
+	s.bitmap.Set(chunk)
+	return true
+}
+
+// Stat returns the COW file's metadata (its allocated blocks show how sparse it is).
+func (s *Store) Stat() (*syscall.Stat_t, error) {
+	fi, err := s.cow.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return fi.Sys().(*syscall.Stat_t), nil
+}
+
+// Complete reports, from the bitmap file alone, whether every chunk has been written, along
+// with the device size and chunk size the bitmap was created for. A missing bitmap is not an
+// error: complete is false.
+func Complete(bitmapPath string) (size, chunkSize int64, complete bool, err error) {
+	data, err := os.ReadFile(bitmapPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, 0, false, nil
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	size, chunkSize, err = parseHeader(data)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("%w %s: %w", errBitmap, bitmapPath, err)
+	}
+	var count int64
+	for _, b := range data[bitmapHeaderSize:] {
+		count += int64(bits.OnesCount8(b))
+	}
+	chunks := (size + chunkSize - 1) / chunkSize
+	return size, chunkSize, count == chunks, nil
 }

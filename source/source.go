@@ -38,6 +38,34 @@ type Segment struct {
 	Source Source
 }
 
+// DirectReader is implemented by sources that can read around a cache tier (Cache itself,
+// and containers that forward to their parts).
+type DirectReader interface {
+	ReadAtDirect(p []byte, off int64) (int, error)
+}
+
+// Zeroer is implemented by sources that know which of their ranges read as zeros, so a
+// hydrator can mark them without copying anything.
+type Zeroer interface {
+	ZeroRanges() []Range
+}
+
+// ReadDirect reads bypassing caches where the source supports it, else like ReadAt.
+func ReadDirect(s Source, p []byte, off int64) (int, error) {
+	if d, ok := s.(DirectReader); ok {
+		return d.ReadAtDirect(p, off)
+	}
+	return s.ReadAt(p, off)
+}
+
+// ZeroRanges returns the ranges of s known to read as zeros, in ascending order.
+func ZeroRanges(s Source) []Range {
+	if z, ok := s.(Zeroer); ok {
+		return z.ZeroRanges()
+	}
+	return nil
+}
+
 // FromConfig opens every configured segment, resolves implicit offsets and sizes, and
 // returns the stitched device-sized Concat.
 func FromConfig(c *config.Config) (*Concat, error) {
@@ -80,6 +108,19 @@ func open(s *config.Segment) (Source, error) {
 		return NewHTTP(&http.Client{Timeout: httpTimeout}, s.URL, s.SourceOffset, s.Size)
 	case config.SourceRAID5:
 		return openRAID5(s)
+	case config.SourceCache:
+		fast, err := open(s.Fast)
+		if err != nil {
+			return nil, fmt.Errorf("fast: %w", err)
+		}
+		slow, err := open(s.Slow)
+		if err != nil {
+			fast.Close()
+			return nil, fmt.Errorf("slow: %w", err)
+		}
+		return NewCache(fast, slow), nil
+	case config.SourceCustom:
+		return NewCustom(s.Name, s.Size, s.Params)
 	default:
 		return nil, fmt.Errorf("unknown segment type %q", s.Type)
 	}
@@ -99,7 +140,7 @@ func openRAID5(s *config.Segment) (Source, error) {
 		if m.Missing {
 			continue
 		}
-		src, err := open(&config.Segment{Type: m.Type, Path: m.Path, URL: m.URL, SourceOffset: m.SourceOffset, Size: m.Size})
+		src, err := open(m)
 		if err != nil {
 			closeAll()
 			return nil, fmt.Errorf("member %d: %w", i, err)

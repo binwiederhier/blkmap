@@ -35,8 +35,8 @@ func execServe(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("serving %s (%s): %s, %d segments, %d chunks in cow file %s",
-		d.Path, d.BlockPath, util.FormatSize(d.Size()), len(conf.Segments), d.Written(), conf.COW.File)
+	log.Printf("serving %s (%s): %s, %d segments, %d/%d chunks in cow file %s",
+		d.Path, d.BlockPath, util.FormatSize(d.Size()), len(conf.Segments), d.Written(), d.Chunks(), conf.COW.File)
 	if _, err := util.SdNotify(util.NotifyReady); err != nil {
 		log.Printf("sd_notify failed: %s", err.Error())
 	}

@@ -1,0 +1,214 @@
+package device
+
+import (
+	"bytes"
+	"context"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"heckel.io/blkmap/config"
+	"heckel.io/blkmap/cow"
+	"heckel.io/blkmap/source"
+)
+
+const (
+	hChunk = 4096
+	hSize  = 64 * hChunk
+)
+
+// recorder is a base that records the order of its reads and distinguishes direct reads.
+type recorder struct {
+	data   []byte
+	reads  []int64 // offsets in order
+	direct int
+	mu     sync.Mutex
+}
+
+func (r *recorder) ReadAt(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	r.reads = append(r.reads, off)
+	r.mu.Unlock()
+	return copy(p, r.data[off:]), nil
+}
+
+func (r *recorder) ReadAtDirect(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	r.direct++
+	r.mu.Unlock()
+	return r.ReadAt(p, off)
+}
+
+func (r *recorder) Size() int64 {
+	return int64(len(r.data))
+}
+
+func (r *recorder) Close() error {
+	return nil
+}
+
+func (r *recorder) offsets() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.reads...)
+}
+
+func pat(n int) []byte {
+	p := make([]byte, n)
+	for i := range p {
+		p[i] = byte(i*7 + i/256)
+	}
+	return p
+}
+
+func newHydrateStore(t *testing.T, base source.Source) *cow.Store {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := cow.Open(base, filepath.Join(dir, "h.cow"), filepath.Join(dir, "h.cow.bitmap"), hChunk)
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func idle() bool {
+	return false
+}
+
+func TestHydratorListThenRest(t *testing.T) {
+	t.Parallel()
+	base := &recorder{data: pat(hSize)}
+	s := newHydrateStore(t, base)
+	// Chunk 10 was written by the guest and must be left alone
+	_, err := s.WriteAt(bytes.Repeat([]byte{'g'}, hChunk), 10*hChunk)
+	require.NoError(t, err)
+	var reports []Progress
+	h := newHydrator("h", s, base, &Hydrate{
+		Prefetch:    []source.Range{{Offset: 20 * hChunk, Length: 2 * hChunk}, {Offset: 5*hChunk + 100, Length: 100}, {Offset: 20 * hChunk, Length: hChunk}},
+		Rest:        true,
+		Concurrency: 1,
+		Report:      10 * time.Millisecond,
+		OnProgress:  func(p Progress) { reports = append(reports, p) },
+	}, idle)
+	h.run(context.Background())
+	assert.Equal(t, s.Chunks(), s.Written())
+	// Listed chunks first (20, 21, 5; the duplicate 20 skipped), then the rest ascending,
+	// skipping what was listed or already written
+	offs := base.offsets()
+	require.GreaterOrEqual(t, len(offs), 63)
+	assert.Equal(t, []int64{20 * hChunk, 21 * hChunk, 5 * hChunk, 0, hChunk}, offs[:5])
+	assert.NotContains(t, offs, int64(10*hChunk))
+	assert.Len(t, offs, 63)
+	assert.Equal(t, 0, base.direct)
+	// Content: base everywhere except the guest write
+	expected := pat(hSize)
+	copy(expected[10*hChunk:], bytes.Repeat([]byte{'g'}, hChunk))
+	got := make([]byte, hSize)
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, expected, got)
+	require.NotEmpty(t, reports)
+	last := reports[len(reports)-1]
+	assert.True(t, last.Done)
+	assert.Equal(t, "done", last.Phase)
+	assert.Equal(t, int64(64), last.Hydrated)
+	assert.Equal(t, int64(64), last.Total)
+	assert.Equal(t, int64(63*hChunk), last.Copied)
+}
+
+func TestHydratorListOnlyDirect(t *testing.T) {
+	t.Parallel()
+	base := &recorder{data: pat(hSize)}
+	s := newHydrateStore(t, base)
+	h := newHydrator("h", s, base, &Hydrate{
+		Prefetch: []source.Range{{Offset: 0, Length: 3 * hChunk}},
+		Rest:     false,
+		UseCache: config.CacheNever,
+	}, idle)
+	h.run(context.Background())
+	assert.Equal(t, int64(3), s.Written())
+	assert.Equal(t, 3, base.direct)
+}
+
+func TestHydratorZeroRangesAndConcurrency(t *testing.T) {
+	t.Parallel()
+	file := &recorder{data: pat(16 * hChunk)}
+	base, err := source.NewConcat([]*source.Segment{
+		{Offset: 0, Source: source.NewZero(8 * hChunk)},
+		{Offset: 8 * hChunk, Source: file},
+		{Offset: 32 * hChunk, Source: source.NewZero(hChunk / 2)}, // gap 24..32, partial zero chunk 32
+	}, hSize)
+	require.NoError(t, err)
+	s := newHydrateStore(t, base)
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Concurrency: 4}, idle)
+	h.run(context.Background())
+	assert.Equal(t, s.Chunks(), s.Written())
+	// Only the file chunks and the half-zero chunk were read; zero chunks were marked
+	assert.Len(t, file.offsets(), 16)
+	got := make([]byte, hSize)
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	expected := make([]byte, hSize)
+	copy(expected[8*hChunk:], pat(16*hChunk))
+	assert.Equal(t, expected, got)
+	// The COW file stayed sparse for the zero chunks: fewer blocks than a full copy
+	st, err := s.Stat()
+	require.NoError(t, err)
+	assert.Less(t, st.Blocks*512, int64(32*hChunk))
+}
+
+func TestHydratorRateAndBusy(t *testing.T) {
+	t.Parallel()
+	base := &recorder{data: pat(hSize)}
+	s := newHydrateStore(t, base)
+	// 64 chunks of 4K at 128K/s should take about 2s; check it is clearly paced
+	start := time.Now()
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Rate: 128 * hChunk / 4}, idle)
+	h.run(context.Background())
+	assert.Greater(t, time.Since(start), 1500*time.Millisecond)
+	assert.Equal(t, s.Chunks(), s.Written())
+	// Busy guest: nothing happens until it goes idle
+	base2 := &recorder{data: pat(hSize)}
+	s2 := newHydrateStore(t, base2)
+	var busy atomic.Bool
+	busy.Store(true)
+	done := make(chan struct{})
+	go func() {
+		newHydrator("h", s2, base2, &Hydrate{Rest: true}, busy.Load).run(context.Background())
+		close(done)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, int64(0), s2.Written())
+	busy.Store(false)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hydration did not resume after the guest went idle")
+	}
+	assert.Equal(t, s2.Chunks(), s2.Written())
+}
+
+func TestHydratorCancel(t *testing.T) {
+	t.Parallel()
+	base := &recorder{data: pat(hSize)}
+	s := newHydrateStore(t, base)
+	ctx, cancel := context.WithCancel(context.Background())
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Rate: hChunk}, idle) // 1 chunk/s
+	done := make(chan struct{})
+	go func() {
+		h.run(ctx)
+		close(done)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hydrator did not stop on cancel")
+	}
+	assert.Less(t, s.Written(), int64(5))
+}

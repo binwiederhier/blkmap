@@ -94,3 +94,29 @@ segments:
 	assert.Regexp(t, `member 1\s+file `+dir+`/m1 \(offset 4K\)\n`, out)
 	assert.Regexp(t, `member 2\s+missing \(reconstructed from parity\)\n`, out)
 }
+
+func TestValidateCacheAndHydrate(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"fast", "slow"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, f), make([]byte, 8192), 0600))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "list"), []byte("0 4K\n"), 0600))
+	path := filepath.Join(dir, "c.yml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+segments:
+  - type: cache
+    fast: {type: file, path: `+dir+`/fast, source-offset: 1K}
+    slow: {type: file, path: `+dir+`/slow}
+hydrate:
+  prefetch-list: `+dir+`/list
+  rate: 20M
+  use-cache: never
+`), 0600))
+	app, stdout, _ := newTestApp()
+	require.NoError(t, app.Run([]string{"blkmap", "validate", path}))
+	out := stdout.String()
+	assert.Regexp(t, `0\s+8K\s+cache\n`, out)
+	assert.Regexp(t, `fast\s+file `+dir+`/fast \(offset 1K\)\n`, out)
+	assert.Regexp(t, `slow\s+file `+dir+`/slow\n`, out)
+	assert.Contains(t, out, "Hydrate: 1 prefetch ranges from "+dir+"/list, then the rest at 20M/s, cache never")
+}

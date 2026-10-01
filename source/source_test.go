@@ -105,3 +105,36 @@ func TestFromConfigRAID5MissingMemberFile(t *testing.T) {
 	assert.Contains(t, err.Error(), "segment 0")
 	assert.Contains(t, err.Error(), "member 0")
 }
+
+func TestFromConfigCache(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fast, slow := filepath.Join(dir, "fast"), filepath.Join(dir, "slow")
+	require.NoError(t, os.WriteFile(fast, pattern(4096), 0600))
+	require.NoError(t, os.WriteFile(slow, pattern(8192), 0600))
+	c, err := config.Parse("c", []byte(`
+segments:
+  - type: cache
+    fast:
+      type: file
+      path: `+fast+`
+    slow:
+      type: file
+      path: `+slow+`
+`))
+	require.NoError(t, err)
+	src, err := FromConfig(c)
+	require.NoError(t, err)
+	t.Cleanup(func() { src.Close() })
+	assert.Equal(t, int64(8192), src.Size())
+	p := make([]byte, 8192)
+	_, err = src.ReadAt(p, 0)
+	require.NoError(t, err)
+	assert.Equal(t, pattern(8192), p)
+	// A missing tier file is reported with its place
+	c, err = config.Parse("c", []byte("segments:\n  - type: cache\n    fast: {type: file, path: /nonexistent}\n    slow: {type: file, path: "+slow+"}\n"))
+	require.NoError(t, err)
+	_, err = FromConfig(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "segment 0: fast:")
+}

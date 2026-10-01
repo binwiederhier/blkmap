@@ -55,7 +55,7 @@ Then:
 blkmap validate disk1                 # parse, open the sources, print the resolved layout
 systemctl enable --now blkmap@disk1   # /dev/blkmap/disk1 appears when the unit is active
 mkfs.ext4 /dev/blkmap/disk1 ; mount /dev/blkmap/disk1 /mnt
-systemctl stop blkmap@disk1           # unmount first; stop tears the kernel device down
+systemctl stop blkmap@disk1           # unmount first: deletion waits for openers of the device
 ```
 
 The unit is `Type=notify`, so `systemctl start` returns only once the device exists. A mount
@@ -87,6 +87,39 @@ segments:
       - missing: true           # at most one
 ```
 
+### Cache tiers
+
+A `cache` segment reads from a fast source and falls back to a slow one on any error, with
+no retries: an HTTP cache answering 404 for a block it does not have, a local copy that is
+incomplete, a tier that is down. The fast tier is never written; something else fills it.
+Both tiers take any source type, so cache tiers can sit inside raid5 members and vice versa.
+
+```yaml
+segments:
+  - type: cache
+    fast: {type: http, url: http://cache.lan/img.raw}
+    slow: {type: http, url: https://origin.example.com/img.raw}
+```
+
+### Background hydration
+
+With a `hydrate` block, blkmap copies the base into the COW file in the background, so the
+device eventually serves everything locally and, once every chunk is there, no longer opens
+its sources on start. Guest I/O always has priority: hydration pauses while requests are in
+flight or arrived in the last 100 ms. A prefetch list (`offset length` per line, highest
+priority first) is copied at full speed; the rest follows at the configured rate, or not at
+all with `rest: false`. `use-cache: never` sends background reads straight to the slow tier.
+Ranges known to be zeros (zero segments, gaps) are marked without being copied. Progress
+goes to the journal every 30 seconds by default.
+
+```yaml
+hydrate:
+  prefetch-list: /etc/blkmap/img1.prefetch
+  rest: true
+  rate: 20M
+  use-cache: never
+```
+
 HTTP sources must support Range requests (checked when the source is opened, so `validate`
 reports a server that cannot do it). Reads fetch 1 MiB aligned blocks through a small
 per-source LRU cache.
@@ -113,9 +146,15 @@ dev, err := device.Serve(ctx, &device.Options{
 // ... /dev/blkmap/synth is live until dev.Close()
 ```
 
-`source.Concat`, `source.RAID5`, `source.File`, `source.HTTP` and `source.Zero` are ordinary
-Sources and compose. One level down, `ublk.Create` serves any `ublk.Backend` (ReadAt, WriteAt,
-Size, Flush, optionally Discard and WriteZeroes) without the COW layer.
+`source.Concat`, `source.RAID5`, `source.Cache`, `source.File`, `source.HTTP` and
+`source.Zero` are ordinary Sources and compose, so one segment of an otherwise ordinary
+layout can come from your code. `source.NewSwappable` wraps a Source whose target can be
+replaced while the device is live. A config-driven program can supply one segment as
+`type: custom` after `source.Register("name", constructor)`. A fast tier of your own signals a
+miss with `source.ErrNotFound`. Hydration from code takes `device.Hydrate` with ranges, a
+rate, the cache policy and an optional progress callback. One level down, `ublk.Create`
+serves any `ublk.Backend` (ReadAt, WriteAt, Size, Flush, optionally Discard and WriteZeroes)
+without the COW layer.
 
 ## Performance
 

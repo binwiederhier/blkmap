@@ -129,17 +129,26 @@ func checkHeader(f *os.File, size, chunkSize int64) error {
 	if _, err := f.ReadAt(header, 0); err != nil {
 		return fmt.Errorf("not a blkmap bitmap: %w", err)
 	}
-	if string(header[:len(bitmapMagic)]) != bitmapMagic {
-		return fmt.Errorf("not a blkmap bitmap (bad magic)")
+	s, c, err := parseHeader(header)
+	if err != nil {
+		return err
 	}
-	if v := binary.LittleEndian.Uint32(header[bitmapOffVersion:]); v != bitmapVersion {
-		return fmt.Errorf("unsupported version %d", v)
-	}
-	if s := int64(binary.LittleEndian.Uint64(header[bitmapOffSize:])); s != size {
+	if s != size {
 		return fmt.Errorf("device size mismatch: bitmap was created for %d bytes, device is %d", s, size)
 	}
-	if c := int64(binary.LittleEndian.Uint64(header[bitmapOffChunk:])); c != chunkSize {
+	if c != chunkSize {
 		return fmt.Errorf("chunk size mismatch: bitmap was created with %d, config says %d", c, chunkSize)
 	}
 	return nil
+}
+
+// parseHeader validates the magic and version and returns the recorded geometry.
+func parseHeader(header []byte) (size, chunkSize int64, err error) {
+	if len(header) < bitmapHeaderSize || string(header[:len(bitmapMagic)]) != bitmapMagic {
+		return 0, 0, fmt.Errorf("not a blkmap bitmap (bad magic)")
+	}
+	if v := binary.LittleEndian.Uint32(header[bitmapOffVersion:]); v != bitmapVersion {
+		return 0, 0, fmt.Errorf("unsupported version %d", v)
+	}
+	return int64(binary.LittleEndian.Uint64(header[bitmapOffSize:])), int64(binary.LittleEndian.Uint64(header[bitmapOffChunk:])), nil
 }

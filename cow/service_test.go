@@ -11,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"heckel.io/blkmap/source"
 )
 
 const (
@@ -57,7 +59,7 @@ func pattern(n int) []byte {
 	return p
 }
 
-func newTestStore(t *testing.T, dir string, base *mem) *Store {
+func newTestStore(t *testing.T, dir string, base source.Source) *Store {
 	t.Helper()
 	s, err := Open(base, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
 	require.NoError(t, err)
@@ -245,4 +247,100 @@ func TestStoreWriteZeroes(t *testing.T) {
 	assert.Equal(t, expected, readAll(t, s))
 	require.Error(t, s.WriteZeroes(testSize-100, 200))
 	require.NoError(t, s.Close())
+}
+
+// cached is a base whose plain reads return garbage and direct reads the real data, to
+// tell the two hydration read paths apart.
+type cached struct {
+	mem
+}
+
+func (c *cached) ReadAt(p []byte, off int64) (int, error) {
+	for i := range p {
+		p[i] = 0xee
+	}
+	return len(p), nil
+}
+
+func (c *cached) ReadAtDirect(p []byte, off int64) (int, error) {
+	return c.mem.ReadAt(p, off)
+}
+
+func TestStoreHydrateChunk(t *testing.T) {
+	t.Parallel()
+	base := &cached{mem: mem{data: pattern(testSize)}}
+	dir := t.TempDir()
+	s := newTestStore(t, dir, base)
+	assert.Equal(t, int64(16), s.Chunks())
+	assert.Equal(t, int64(testChunk), s.ChunkSize())
+	// Through the cache path (plain reads)
+	copied, err := s.HydrateChunk(3, false)
+	require.NoError(t, err)
+	assert.True(t, copied)
+	assert.True(t, s.IsWritten(3))
+	// Direct path
+	copied, err = s.HydrateChunk(4, true)
+	require.NoError(t, err)
+	assert.True(t, copied)
+	// Already written: no copy, content untouched
+	_, err = s.WriteAt([]byte("guest"), 5*testChunk)
+	require.NoError(t, err)
+	copied, err = s.HydrateChunk(5, true)
+	require.NoError(t, err)
+	assert.False(t, copied)
+	copied, err = s.HydrateChunk(3, true)
+	require.NoError(t, err)
+	assert.False(t, copied)
+	// Plain reads (unwritten chunks, the chunk hydrated through the cache path, and the
+	// read-modify-write around the guest write) all see the fake cache's fill byte; only
+	// the directly hydrated chunk holds the real base data
+	expected := bytes.Repeat([]byte{0xee}, testSize)
+	copy(expected[4*testChunk:], pattern(testSize)[4*testChunk:5*testChunk])
+	copy(expected[5*testChunk:], "guest")
+	assert.Equal(t, expected, readAll(t, s))
+	assert.Equal(t, int64(3), s.Written())
+	// The last chunk may be partial
+	short := &cached{mem: mem{data: pattern(testSize + 100)}}
+	s2, err := Open(short, filepath.Join(dir, "p.cow"), filepath.Join(dir, "p.cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, int64(17), s2.Chunks())
+	copied, err = s2.HydrateChunk(16, true)
+	require.NoError(t, err)
+	assert.True(t, copied)
+	got := make([]byte, 100)
+	_, err = s2.ReadAt(got, testSize)
+	require.NoError(t, err)
+	assert.Equal(t, pattern(testSize + 100)[testSize:], got)
+	require.NoError(t, s2.Close())
+	require.NoError(t, s.Close())
+}
+
+func TestStoreMarkZeroAndComplete(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	bitmap := filepath.Join(dir, "d.cow.bitmap")
+	_, _, complete, err := Complete(bitmap)
+	require.NoError(t, err)
+	assert.False(t, complete)
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	assert.True(t, s.MarkZero(2))
+	assert.False(t, s.MarkZero(2))
+	assert.True(t, s.IsWritten(2))
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, 2*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, make([]byte, testChunk), got)
+	for c := int64(0); c < s.Chunks(); c++ {
+		s.MarkZero(c)
+	}
+	require.NoError(t, s.Close())
+	size, chunkSize, complete, err := Complete(bitmap)
+	require.NoError(t, err)
+	assert.True(t, complete)
+	assert.Equal(t, int64(testSize), size)
+	assert.Equal(t, int64(testChunk), chunkSize)
+	// Garbage is an error
+	require.NoError(t, os.WriteFile(bitmap, []byte("junk"), 0600))
+	_, _, _, err = Complete(bitmap)
+	require.Error(t, err)
 }

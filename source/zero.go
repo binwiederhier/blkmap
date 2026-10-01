@@ -20,6 +20,11 @@ func (z *Zero) Size() int64 {
 	return z.size
 }
 
+// ZeroRanges reports the whole source.
+func (z *Zero) ZeroRanges() []Range {
+	return []Range{{Offset: 0, Length: z.size}}
+}
+
 func (z *Zero) Close() error {
 	return nil
 }

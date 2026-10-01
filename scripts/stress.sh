@@ -10,7 +10,7 @@ OUT=${OUT:-$dir/results.txt}
 me="$(cd "$(dirname "$0")" && pwd)"
 cleanup() {
   umount $mnt 2>/dev/null || true
-  for id in s-mix s-raid s-big s-4k; do systemctl stop blkmap@$id 2>/dev/null || true; done
+  for id in s-mix s-raid s-big s-4k s-hyd; do systemctl stop blkmap@$id 2>/dev/null || true; done
   systemctl reset-failed 'blkmap@*' 2>/dev/null || true
   [ -n "${httpd:-}" ] && kill $httpd 2>/dev/null || true
 }
@@ -148,6 +148,36 @@ fsck.ext4 -f -y /dev/blkmap/s-big >/dev/null 2>&1 && fsckrc=0 || fsckrc=$?
 mount /dev/blkmap/s-big $mnt && ls $mnt >/dev/null && umount $mnt
 echo "  daemon SIGKILLed mid-write: restarted, fsck exit $fsckrc (0/1 = clean or repaired), mounts" | tee -a $OUT
 [ "$(ls /sys/class/ublk-char | wc -l)" = "$ndev" ] && echo "  dead kernel device from the crash was cleaned up on restart" | tee -a $OUT
+
+# --- cache tier, hydration with a prefetch list, restart without sources (s-hyd) ---
+echo "== cache + hydration (s-hyd)" | tee -a $OUT
+head -c $((32<<20)) /dev/urandom > $dir/origin.img
+head -c $((8<<20)) $dir/origin.img > $dir/partial.img   # the fast tier only has the first 8 MiB
+printf '24M 4M\n0 1M\n' > $dir/hyd.prefetch
+cat > /etc/blkmap/s-hyd.yml <<YML
+segments:
+  - type: zero
+    size: 4M
+  - type: cache
+    fast: {type: file, path: $dir/partial.img}
+    slow: {type: http, url: http://localhost:18099/origin.img}
+hydrate:
+  prefetch-list: $dir/hyd.prefetch
+  rate: 64M
+  use-cache: never
+  report-every: 2s
+YML
+blkmap validate s-hyd | grep -E 'Hydrate|cache' | sed 's/^/  /' | tee -a $OUT
+systemctl start blkmap@s-hyd
+cmp <(dd if=/dev/blkmap/s-hyd bs=1M skip=4 status=none) $dir/origin.img && echo "  cache fall-through content OK" | tee -a $OUT
+for i in $(seq 1 90); do journalctl -u blkmap@s-hyd --no-pager -o cat | grep -q 'hydration done' && break; sleep 1; done
+journalctl -u blkmap@s-hyd --no-pager -o cat | grep -E 'hydration (list|rest|done)' | tail -2 | sed 's/^/  /' | tee -a $OUT
+systemctl stop blkmap@s-hyd
+mv $dir/origin.img $dir/origin.gone; rm $dir/partial.img
+systemctl start blkmap@s-hyd
+journalctl -u blkmap@s-hyd --no-pager -o cat | grep -q 'fully hydrated' && echo "  restarted without its sources (fully hydrated)" | tee -a $OUT
+cmp <(dd if=/dev/blkmap/s-hyd bs=1M skip=4 status=none) $dir/origin.gone && echo "  detached content OK" | tee -a $OUT
+systemctl stop blkmap@s-hyd
 
 # --- many restarts and concurrent devices ---
 echo "== churn" | tee -a $OUT

@@ -10,12 +10,14 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
 	"heckel.io/blkmap/config"
+	"heckel.io/blkmap/source"
 	"heckel.io/blkmap/ublk"
 )
 
@@ -306,4 +308,81 @@ func (m *memBackend) Size() int64 {
 
 func (m *memBackend) Flush() error {
 	return nil
+}
+
+func TestServeHydrates(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	var final Progress
+	done := make(chan struct{})
+	d, err := Serve(context.Background(), &Options{
+		ID:      "hyd",
+		Base:    &computed{size: 8 << 20},
+		COWFile: filepath.Join(dir, "hyd.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+		RunDir:  filepath.Join(dir, "run"),
+		Hydrate: &Hydrate{
+			Prefetch: []source.Range{{Offset: 4 << 20, Length: 1 << 20}},
+			Rest:     true,
+			Report:   50 * time.Millisecond,
+			OnProgress: func(p Progress) {
+				if p.Done {
+					final = p
+					close(done)
+				}
+			},
+		},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("hydration did not finish")
+	}
+	assert.Equal(t, int64(128), final.Hydrated) // 8 MiB / 64 KiB
+	assert.Equal(t, int64(128), final.Total)
+	assert.Equal(t, int64(128), d.Written())
+	// Everything reads through the kernel as the synthetic source would have produced it
+	f, err := os.Open(d.Path)
+	require.NoError(t, err)
+	defer f.Close()
+	buf := make([]byte, 8<<20)
+	_, err = f.ReadAt(buf, 0)
+	require.NoError(t, err)
+	for i := 0; i < len(buf); i += 4096 {
+		require.Equal(t, byte(i/4096), buf[i], "block at %d", i)
+	}
+}
+
+func TestStartDetachedWhenFullyHydrated(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	img := filepath.Join(dir, "img")
+	require.NoError(t, os.WriteFile(img, pattern(1<<20), 0600))
+	yml := "cow:\n  file: " + dir + "/det.cow\nsegments:\n  - type: file\n    path: " + img + "\n"
+	c, err := config.Parse("det", []byte(yml))
+	require.NoError(t, err)
+	// Fully hydrate, then remove the source image
+	d, err := startWithHydrate(context.Background(), c, filepath.Join(dir, "dev"), filepath.Join(dir, "run"), &Hydrate{Rest: true})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return d.Written() == 16 }, 30*time.Second, 50*time.Millisecond)
+	require.NoError(t, d.Close())
+	require.NoError(t, os.Remove(img))
+	// A fresh start no longer needs the source
+	d, err = Start(context.Background(), c, filepath.Join(dir, "dev"))
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	f, err := os.Open(d.Path)
+	require.NoError(t, err)
+	got := make([]byte, 1<<20)
+	_, err = f.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, pattern(1<<20), got)
+	require.NoError(t, f.Close()) // DEL_DEV waits for openers of the block device
+	// Without the bitmap the missing image is an error again
+	require.NoError(t, d.Close())
+	require.NoError(t, os.Remove(filepath.Join(dir, "det.cow.bitmap")))
+	_, err = Start(context.Background(), c, filepath.Join(dir, "dev"))
+	require.Error(t, err)
 }

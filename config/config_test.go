@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -164,10 +165,10 @@ segments:
 	assert.Equal(t, LayoutLeftAsymmetric, s.Layout)
 	assert.Equal(t, int64(1<<30), s.Size)
 	require.Len(t, s.Members, 4)
-	assert.Equal(t, &Member{Type: SourceDevice, Path: "/dev/sdb", SourceOffset: 1 << 20}, s.Members[0])
-	assert.Equal(t, &Member{Type: SourceFile, Path: "/srv/d2.img", SourceOffset: 1 << 20, Size: 600 << 20}, s.Members[1])
-	assert.Equal(t, &Member{Missing: true}, s.Members[2])
-	assert.Equal(t, &Member{Type: SourceHTTP, URL: "http://x/d4.img"}, s.Members[3])
+	assert.Equal(t, &Segment{Type: SourceDevice, Offset: -1, Path: "/dev/sdb", SourceOffset: 1 << 20}, s.Members[0])
+	assert.Equal(t, &Segment{Type: SourceFile, Offset: -1, Path: "/srv/d2.img", SourceOffset: 1 << 20, Size: 600 << 20}, s.Members[1])
+	assert.Equal(t, &Segment{Offset: -1, Missing: true}, s.Members[2])
+	assert.Equal(t, &Segment{Type: SourceHTTP, Offset: -1, URL: "http://x/d4.img"}, s.Members[3])
 }
 
 func TestParseRAID5Defaults(t *testing.T) {
@@ -204,9 +205,10 @@ func TestParseRAID5Errors(t *testing.T) {
 		{"bad layout", "segments:\n  - type: raid5\n    layout: diagonal\n    members:\n" + three, "unknown layout"},
 		{"bad stripe", "segments:\n  - type: raid5\n    stripe-size: 3000\n    members:\n" + three, "power of two"},
 		{"stripe smaller than block", "block-size: 4096\nsegments:\n  - type: raid5\n    stripe-size: 512\n    members:\n" + three, "at least the block size"},
-		{"member bad type", "segments:\n  - type: raid5\n    members:\n      - type: zero\n        size: 1M\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "unknown member type"},
 		{"member file without path", "segments:\n  - type: raid5\n    members:\n      - type: file\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "needs a path"},
 		{"members on non-raid", "segments:\n  - type: zero\n    size: 1M\n    members:\n" + three, "only valid for raid5"},
+		{"member with offset", "segments:\n  - type: raid5\n    members:\n      - type: file\n        path: /a\n        offset: 1M\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "offset is only valid"},
+		{"member of unknown type", "segments:\n  - type: raid5\n    members:\n      - type: nope\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n", "unknown segment type"},
 		{"raid with path", "segments:\n  - type: raid5\n    path: /x\n    members:\n" + three, "path is only valid"},
 	}
 	for _, tt := range tests {
@@ -216,5 +218,115 @@ func TestParseRAID5Errors(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.errMsg)
 		})
+	}
+}
+
+func TestParseCache(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("c", []byte(`
+segments:
+  - type: zero
+    size: 1M
+  - type: cache
+    size: 30G
+    fast:
+      type: file
+      path: /mnt/nvme/img.raw
+      source-offset: 512
+    slow:
+      type: http
+      url: https://origin/img.raw
+  - type: raid5
+    members:
+      - type: cache
+        source-offset: 1M
+        fast: {type: file, path: /a}
+        slow: {type: http, url: http://x/a}
+      - type: cache
+        fast: {type: file, path: /b}
+        slow: {type: http, url: http://x/b}
+      - missing: true
+`))
+	require.NoError(t, err)
+	require.Len(t, c.Segments, 3)
+	s := c.Segments[1]
+	assert.Equal(t, SourceCache, s.Type)
+	assert.Equal(t, int64(30<<30), s.Size)
+	assert.Equal(t, &Segment{Type: SourceFile, Offset: -1, Path: "/mnt/nvme/img.raw", SourceOffset: 512}, s.Fast)
+	assert.Equal(t, &Segment{Type: SourceHTTP, Offset: -1, URL: "https://origin/img.raw"}, s.Slow)
+	m := c.Segments[2].Members[0]
+	assert.Equal(t, SourceCache, m.Type)
+	assert.Equal(t, int64(1<<20), m.SourceOffset)
+	assert.Equal(t, "/a", m.Fast.Path)
+	assert.Equal(t, "http://x/a", m.Slow.URL)
+}
+
+func TestParseCustom(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("c", []byte("segments:\n  - type: custom\n    name: synth\n    size: 10G\n    params:\n      seed: \"42\"\n      mode: fast\n"))
+	require.NoError(t, err)
+	s := c.Segments[0]
+	assert.Equal(t, SourceCustom, s.Type)
+	assert.Equal(t, "synth", s.Name)
+	assert.Equal(t, int64(10<<30), s.Size)
+	assert.Equal(t, map[string]string{"seed": "42", "mode": "fast"}, s.Params)
+	c, err = Parse("c", []byte("segments:\n  - type: custom\n    name: synth\n"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), c.Segments[0].Size)
+}
+
+func TestParseCacheAndCustomErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		errMsg  string
+	}{
+		{"cache without fast", "segments:\n  - type: cache\n    slow: {type: file, path: /a}\n", "needs fast and slow"},
+		{"cache without slow", "segments:\n  - type: cache\n    fast: {type: file, path: /a}\n", "needs fast and slow"},
+		{"cache with path", "segments:\n  - type: cache\n    path: /x\n    fast: {type: file, path: /a}\n    slow: {type: file, path: /b}\n", "path is only valid"},
+		{"fast on non-cache", "segments:\n  - type: zero\n    size: 1M\n    fast: {type: file, path: /a}\n", "only valid for cache"},
+		{"bad nested", "segments:\n  - type: cache\n    fast: {type: file}\n    slow: {type: file, path: /b}\n", "fast: file segment needs a path"},
+		{"nested offset", "segments:\n  - type: cache\n    fast: {type: file, path: /a, offset: 1M}\n    slow: {type: file, path: /b}\n", "offset is only valid"},
+		{"custom without name", "segments:\n  - type: custom\n", "needs a name"},
+		{"name on non-custom", "segments:\n  - type: zero\n    size: 1M\n    name: x\n", "only valid for custom"},
+		{"params on non-custom", "segments:\n  - type: zero\n    size: 1M\n    params: {a: b}\n", "only valid for custom"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse("c", []byte(tt.content))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errMsg)
+		})
+	}
+}
+
+func TestParseHydrate(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("h", []byte("segments:\n  - type: zero\n    size: 1M\n"))
+	require.NoError(t, err)
+	assert.Nil(t, c.Hydrate)
+	c, err = Parse("h", []byte("segments:\n  - type: zero\n    size: 1M\nhydrate: {}\n"))
+	require.NoError(t, err)
+	assert.Equal(t, &Hydrate{Rest: true, UseCache: CacheAlways, Concurrency: DefaultHydrateConcurrency, ReportEvery: DefaultHydrateReport}, c.Hydrate)
+	c, err = Parse("h", []byte(`
+segments:
+  - type: zero
+    size: 1M
+hydrate:
+  prefetch-list: /etc/blkmap/h.prefetch
+  rest: false
+  rate: 20M
+  use-cache: never
+  concurrency: 8
+  report-every: 1m
+`))
+	require.NoError(t, err)
+	assert.Equal(t, &Hydrate{PrefetchList: "/etc/blkmap/h.prefetch", Rest: false, Rate: 20 << 20, UseCache: CacheNever, Concurrency: 8, ReportEvery: time.Minute}, c.Hydrate)
+	for _, bad := range []string{"use-cache: sometimes", "rate: x", "concurrency: -1", "report-every: soon", "report-every: 0s"} {
+		_, err := Parse("h", []byte("segments:\n  - type: zero\n    size: 1M\nhydrate:\n  "+bad+"\n"))
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "hydrate")
 	}
 }

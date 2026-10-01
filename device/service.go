@@ -17,6 +17,7 @@ import (
 	"heckel.io/blkmap/cow"
 	"heckel.io/blkmap/source"
 	"heckel.io/blkmap/ublk"
+	"heckel.io/blkmap/util"
 )
 
 const (
@@ -40,8 +41,9 @@ type Options struct {
 	ChunkSize int64         // COW granularity; defaults to config.DefaultChunkSize
 	BlockSize int           // 512 (default) or 4096
 	ReadOnly  bool
-	DevDir    string // defaults to DevDir
-	RunDir    string // where the ublk id is recorded; defaults to RunDir
+	DevDir    string   // defaults to DevDir
+	RunDir    string   // where the ublk id is recorded; defaults to RunDir
+	Hydrate   *Hydrate // background copy of the base into the COW file; nil = off
 }
 
 // Device is a running blkmap block device.
@@ -51,13 +53,33 @@ type Device struct {
 	statePath string // RunDir/<id>, holding the ublk id
 	store     *cow.Store
 	ublk      *ublk.Device
+	stop      context.CancelFunc // ends background hydration
+	hydrated  chan struct{}      // closed when the hydrator has exited
 }
 
 // Start opens the sources and COW store for c and serves them as a block device, publishing
-// the symlink in devDir. It returns once the kernel device is live.
+// the symlink in devDir. It returns once the kernel device is live. A device whose bitmap
+// says every chunk is already in the COW file is served without opening its sources.
 func Start(ctx context.Context, c *config.Config, devDir string) (*Device, error) {
-	base, err := source.FromConfig(c)
+	hydrate, err := hydrateFromConfig(c.Hydrate)
 	if err != nil {
+		return nil, err
+	}
+	return startWithHydrate(ctx, c, devDir, RunDir, hydrate)
+}
+
+// startWithHydrate is Start with an explicit run directory and hydration plan.
+func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir string, hydrate *Hydrate) (*Device, error) {
+	var base source.Source
+	size, chunkSize, complete, err := cow.Complete(c.COW.Bitmap)
+	if err != nil {
+		return nil, err
+	}
+	if complete && chunkSize == c.COW.ChunkSize && (c.Size == 0 || c.Size == size) {
+		log.Printf("%s: fully hydrated (%s in %s), not opening the sources", c.ID, util.FormatSize(size), c.COW.File)
+		base = source.NewZero(size)
+		hydrate = nil
+	} else if base, err = source.FromConfig(c); err != nil {
 		return nil, err
 	}
 	return Serve(ctx, &Options{
@@ -69,6 +91,8 @@ func Start(ctx context.Context, c *config.Config, devDir string) (*Device, error
 		BlockSize: c.BlockSize,
 		ReadOnly:  c.ReadOnly,
 		DevDir:    devDir,
+		RunDir:    runDir,
+		Hydrate:   hydrate,
 	})
 }
 
@@ -114,7 +138,8 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 		o.Base.Close()
 		return nil, err
 	}
-	dev, err := ublk.Create(&ublk.Params{Backend: &backend{store: store, id: o.ID}, BlockSize: blockSize, ReadOnly: o.ReadOnly})
+	b := &backend{store: store, id: o.ID}
+	dev, err := ublk.Create(&ublk.Params{Backend: b, BlockSize: blockSize, ReadOnly: o.ReadOnly})
 	if err != nil {
 		store.Close()
 		return nil, fmt.Errorf("ublk: %w", err)
@@ -124,7 +149,31 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 		d.Close()
 		return nil, err
 	}
+	if o.Hydrate != nil {
+		hctx, cancel := context.WithCancel(context.Background())
+		d.stop, d.hydrated = cancel, make(chan struct{})
+		h := newHydrator(o.ID, store, o.Base, o.Hydrate, b.busy)
+		go func() {
+			defer close(d.hydrated)
+			h.run(hctx)
+		}()
+	}
 	return d, nil
+}
+
+// hydrateFromConfig turns the config block into a plan, reading the prefetch list.
+func hydrateFromConfig(h *config.Hydrate) (*Hydrate, error) {
+	if h == nil {
+		return nil, nil
+	}
+	plan := &Hydrate{Rest: h.Rest, Rate: h.Rate, UseCache: h.UseCache, Concurrency: h.Concurrency, Report: h.ReportEvery}
+	if h.PrefetchList != "" {
+		var err error
+		if plan.Prefetch, err = source.ParsePrefetchFile(h.PrefetchList); err != nil {
+			return nil, err
+		}
+	}
+	return plan, nil
 }
 
 // deleteDeadPredecessor removes the kernel device a previous server of this id left behind
@@ -159,14 +208,24 @@ func (d *Device) Size() int64 {
 	return d.store.Size()
 }
 
+// Chunks returns the number of COW chunks in the device.
+func (d *Device) Chunks() int64 {
+	return d.store.Chunks()
+}
+
 // Written returns the number of COW chunks written so far.
 func (d *Device) Written() int64 {
 	return d.store.Written()
 }
 
-// Close stops the device, removes the symlink and state file, and closes the store and
-// sources.
+// Close stops hydration and the device, removes the symlink and state file, and closes the
+// store and sources.
 func (d *Device) Close() error {
+	if d.stop != nil {
+		d.stop()
+		<-d.hydrated
+		d.stop = nil
+	}
 	var errs []error
 	for _, path := range []string{d.Path, d.statePath} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {

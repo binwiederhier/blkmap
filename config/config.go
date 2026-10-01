@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -88,13 +89,16 @@ func Parse(id string, content []byte) (*Config, error) {
 		return nil, fmt.Errorf("%w: at least one segment is required", errConfig)
 	}
 	for i, rs := range raw.Segments {
-		s, err := parseSegment(i, rs, c.BlockSize)
+		s, err := parseSegment(fmt.Sprintf("segment %d", i), rs, c.BlockSize, false)
 		if err != nil {
 			return nil, err
 		}
 		c.Segments = append(c.Segments, s)
 	}
 	if err := c.checkAlignment(); err != nil {
+		return nil, err
+	}
+	if c.Hydrate, err = parseHydrate(raw.Hydrate); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -163,76 +167,111 @@ func parseCOW(id string, raw *rawCOW, blockSize int) (*COW, error) {
 	return cow, nil
 }
 
-func parseSegment(i int, raw *rawSegment, blockSize int) (*Segment, error) {
-	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL, Layout: raw.Layout}
+// parseSegment parses a top-level segment, or a nested source (raid5 member, cache tier) when
+// nested is set; where is the position used in error messages.
+func parseSegment(where string, raw *rawSegment, blockSize int, nested bool) (*Segment, error) {
+	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL, Layout: raw.Layout, Missing: raw.Missing, Name: raw.Name, Params: raw.Params}
 	var err error
 	if raw.Offset != "" {
-		if s.Offset, err = parseSize(fmt.Sprintf("segment %d offset", i), raw.Offset, 0); err != nil {
+		if nested {
+			return nil, fmt.Errorf("%w: %s: offset is only valid for top-level segments", errConfig, where)
+		}
+		if s.Offset, err = parseSize(where+" offset", raw.Offset, 0); err != nil {
 			return nil, err
 		}
 	}
-	if s.Size, err = parseSize(fmt.Sprintf("segment %d size", i), raw.Size, 0); err != nil {
+	if s.Size, err = parseSize(where+" size", raw.Size, 0); err != nil {
 		return nil, err
 	}
-	if s.SourceOffset, err = parseSize(fmt.Sprintf("segment %d source-offset", i), raw.SourceOffset, 0); err != nil {
+	if s.SourceOffset, err = parseSize(where+" source-offset", raw.SourceOffset, 0); err != nil {
 		return nil, err
 	}
+	if s.Missing {
+		if !nested {
+			return nil, fmt.Errorf("%w: %s: missing is only valid for raid5 members", errConfig, where)
+		}
+		if raw.Type != "" || s.Path != "" || s.URL != "" {
+			return nil, fmt.Errorf("%w: %s: a missing member has no type, path or url", errConfig, where)
+		}
+		return s, nil
+	}
+	// Fields that belong to one type only
 	if s.Type != SourceRAID5 && (len(raw.Members) > 0 || raw.StripeSize != "" || raw.Layout != "") {
-		return nil, fmt.Errorf("%w: segment %d: members, stripe-size and layout are only valid for raid5 segments", errConfig, i)
+		return nil, fmt.Errorf("%w: %s: members, stripe-size and layout are only valid for raid5 segments", errConfig, where)
+	}
+	if s.Type != SourceCache && (raw.Fast != nil || raw.Slow != nil) {
+		return nil, fmt.Errorf("%w: %s: fast and slow are only valid for cache segments", errConfig, where)
+	}
+	if s.Type != SourceCustom && (raw.Name != "" || len(raw.Params) > 0) {
+		return nil, fmt.Errorf("%w: %s: name and params are only valid for custom segments", errConfig, where)
 	}
 	if s.Type != SourceFile && s.Type != SourceDevice && s.Path != "" {
-		return nil, fmt.Errorf("%w: segment %d: path is only valid for file and device segments", errConfig, i)
+		return nil, fmt.Errorf("%w: %s: path is only valid for file and device segments", errConfig, where)
 	}
 	if s.Type != SourceHTTP && s.URL != "" {
-		return nil, fmt.Errorf("%w: segment %d: url is only valid for http segments", errConfig, i)
+		return nil, fmt.Errorf("%w: %s: url is only valid for http segments", errConfig, where)
 	}
 	switch s.Type {
 	case SourceZero:
 		if s.Size == 0 {
-			return nil, fmt.Errorf("%w: segment %d: zero segment needs a size", errConfig, i)
+			return nil, fmt.Errorf("%w: %s: zero segment needs a size", errConfig, where)
 		}
 	case SourceFile, SourceDevice:
 		if s.Path == "" {
-			return nil, fmt.Errorf("%w: segment %d: %s segment needs a path", errConfig, i, s.Type)
+			return nil, fmt.Errorf("%w: %s: %s segment needs a path", errConfig, where, s.Type)
 		}
 	case SourceHTTP:
 		if s.URL == "" {
-			return nil, fmt.Errorf("%w: segment %d: http segment needs a url", errConfig, i)
+			return nil, fmt.Errorf("%w: %s: http segment needs a url", errConfig, where)
 		}
 	case SourceRAID5:
-		if err := parseRAID5(i, raw, s, blockSize); err != nil {
+		if err := parseRAID5(where, raw, s, blockSize); err != nil {
 			return nil, err
 		}
+	case SourceCache:
+		if raw.Fast == nil || raw.Slow == nil {
+			return nil, fmt.Errorf("%w: %s: cache segment needs fast and slow sources", errConfig, where)
+		}
+		if s.Fast, err = parseSegment(where+": fast", raw.Fast, blockSize, true); err != nil {
+			return nil, err
+		}
+		if s.Slow, err = parseSegment(where+": slow", raw.Slow, blockSize, true); err != nil {
+			return nil, err
+		}
+	case SourceCustom:
+		if s.Name == "" {
+			return nil, fmt.Errorf("%w: %s: custom segment needs a name", errConfig, where)
+		}
 	default:
-		return nil, fmt.Errorf("%w: segment %d: unknown segment type %q", errConfig, i, raw.Type)
+		return nil, fmt.Errorf("%w: %s: unknown segment type %q", errConfig, where, raw.Type)
 	}
 	return s, nil
 }
 
 // parseRAID5 fills in the array geometry and members of a raid5 segment.
-func parseRAID5(i int, raw *rawSegment, s *Segment, blockSize int) error {
+func parseRAID5(where string, raw *rawSegment, s *Segment, blockSize int) error {
 	var err error
-	if s.StripeSize, err = parseSize(fmt.Sprintf("segment %d stripe-size", i), raw.StripeSize, DefaultStripeSize); err != nil {
+	if s.StripeSize, err = parseSize(where+" stripe-size", raw.StripeSize, DefaultStripeSize); err != nil {
 		return err
 	}
 	if s.StripeSize&(s.StripeSize-1) != 0 {
-		return fmt.Errorf("%w: segment %d: stripe-size must be a power of two", errConfig, i)
+		return fmt.Errorf("%w: %s: stripe-size must be a power of two", errConfig, where)
 	}
 	if s.StripeSize < int64(blockSize) {
-		return fmt.Errorf("%w: segment %d: stripe-size must be at least the block size (%d)", errConfig, i, blockSize)
+		return fmt.Errorf("%w: %s: stripe-size must be at least the block size (%d)", errConfig, where, blockSize)
 	}
 	if s.Layout == "" {
 		s.Layout = LayoutLeftSymmetric
 	}
 	if !layouts[s.Layout] {
-		return fmt.Errorf("%w: segment %d: unknown layout %q", errConfig, i, s.Layout)
+		return fmt.Errorf("%w: %s: unknown layout %q", errConfig, where, s.Layout)
 	}
 	if len(raw.Members) < 3 {
-		return fmt.Errorf("%w: segment %d: raid5 needs at least 3 members", errConfig, i)
+		return fmt.Errorf("%w: %s: raid5 needs at least 3 members", errConfig, where)
 	}
 	missing := 0
 	for j, rm := range raw.Members {
-		m, err := parseMember(i, j, rm)
+		m, err := parseSegment(fmt.Sprintf("%s member %d", where, j), rm, blockSize, true)
 		if err != nil {
 			return err
 		}
@@ -242,39 +281,45 @@ func parseRAID5(i int, raw *rawSegment, s *Segment, blockSize int) error {
 		s.Members = append(s.Members, m)
 	}
 	if missing > 1 {
-		return fmt.Errorf("%w: segment %d: at most one member can be missing", errConfig, i)
+		return fmt.Errorf("%w: %s: at most one member can be missing", errConfig, where)
 	}
 	return nil
 }
 
-func parseMember(i, j int, raw *rawMember) (*Member, error) {
-	m := &Member{Type: SourceType(raw.Type), Path: raw.Path, URL: raw.URL, Missing: raw.Missing}
+// parseHydrate applies the defaults and validates the hydrate block; nil means off.
+func parseHydrate(raw *rawHydrate) (*Hydrate, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	h := &Hydrate{PrefetchList: raw.PrefetchList, Rest: true, UseCache: CacheAlways, Concurrency: DefaultHydrateConcurrency, ReportEvery: DefaultHydrateReport}
+	if raw.Rest != nil {
+		h.Rest = *raw.Rest
+	}
 	var err error
-	if m.SourceOffset, err = parseSize(fmt.Sprintf("segment %d member %d source-offset", i, j), raw.SourceOffset, 0); err != nil {
+	if h.Rate, err = parseSize("hydrate.rate", raw.Rate, 0); err != nil {
 		return nil, err
 	}
-	if m.Size, err = parseSize(fmt.Sprintf("segment %d member %d size", i, j), raw.Size, 0); err != nil {
-		return nil, err
+	if raw.UseCache != "" {
+		h.UseCache = raw.UseCache
 	}
-	if m.Missing {
-		if raw.Type != "" || m.Path != "" || m.URL != "" {
-			return nil, fmt.Errorf("%w: segment %d member %d: a missing member has no type, path or url", errConfig, i, j)
-		}
-		return m, nil
+	if h.UseCache != CacheAlways && h.UseCache != CacheNever {
+		return nil, fmt.Errorf("%w: hydrate.use-cache must be %s or %s", errConfig, CacheAlways, CacheNever)
 	}
-	switch m.Type {
-	case SourceFile, SourceDevice:
-		if m.Path == "" {
-			return nil, fmt.Errorf("%w: segment %d member %d: %s member needs a path", errConfig, i, j, m.Type)
-		}
-	case SourceHTTP:
-		if m.URL == "" {
-			return nil, fmt.Errorf("%w: segment %d member %d: http member needs a url", errConfig, i, j)
-		}
-	default:
-		return nil, fmt.Errorf("%w: segment %d member %d: unknown member type %q", errConfig, i, j, raw.Type)
+	if raw.Concurrency != 0 {
+		h.Concurrency = raw.Concurrency
 	}
-	return m, nil
+	if h.Concurrency < 1 {
+		return nil, fmt.Errorf("%w: hydrate.concurrency must be at least 1", errConfig)
+	}
+	if raw.ReportEvery != "" {
+		if h.ReportEvery, err = time.ParseDuration(raw.ReportEvery); err != nil {
+			return nil, fmt.Errorf("%w: hydrate.report-every: %w", errConfig, err)
+		}
+	}
+	if h.ReportEvery <= 0 {
+		return nil, fmt.Errorf("%w: hydrate.report-every must be positive", errConfig)
+	}
+	return h, nil
 }
 
 // parseSize parses an optional size field, falling back to def when the field is empty.
@@ -292,4 +337,8 @@ func parseSize(field, value string, def int64) (int64, error) {
 const (
 	// DefaultStripeSize is the stripe unit of a raid5 segment; 64 KiB is the Windows default.
 	DefaultStripeSize = 64 << 10
+	// DefaultHydrateConcurrency is the number of parallel background hydration reads.
+	DefaultHydrateConcurrency = 4
+	// DefaultHydrateReport is how often hydration progress is logged.
+	DefaultHydrateReport = 30 * time.Second
 )

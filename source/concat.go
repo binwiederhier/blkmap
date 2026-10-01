@@ -43,6 +43,34 @@ func (c *Concat) Segments() []*Segment {
 }
 
 func (c *Concat) ReadAt(p []byte, off int64) (int, error) {
+	return c.readAt(p, off, false)
+}
+
+// ReadAtDirect reads every segment around its cache tier, if it has one.
+func (c *Concat) ReadAtDirect(p []byte, off int64) (int, error) {
+	return c.readAt(p, off, true)
+}
+
+// ZeroRanges reports the gaps, the tail, and whatever the segments report, in order.
+func (c *Concat) ZeroRanges() []Range {
+	var ranges []Range
+	var pos int64
+	for _, s := range c.segments {
+		if s.Offset > pos {
+			ranges = append(ranges, Range{Offset: pos, Length: s.Offset - pos})
+		}
+		for _, r := range ZeroRanges(s.Source) {
+			ranges = append(ranges, Range{Offset: s.Offset + r.Offset, Length: r.Length})
+		}
+		pos = s.Offset + s.Source.Size()
+	}
+	if pos < c.size {
+		ranges = append(ranges, Range{Offset: pos, Length: c.size - pos})
+	}
+	return ranges
+}
+
+func (c *Concat) readAt(p []byte, off int64, direct bool) (int, error) {
 	n, eof := clampRead(len(p), off, c.size)
 	p = p[:n]
 	for len(p) > 0 {
@@ -54,7 +82,13 @@ func (c *Concat) ReadAt(p []byte, off int64) (int, error) {
 			clear(p[:m])
 		} else {
 			m = int(min(int64(len(p)), s.Offset+s.Source.Size()-off))
-			read, err := s.Source.ReadAt(p[:m], off-s.Offset)
+			var read int
+			var err error
+			if direct {
+				read, err = ReadDirect(s.Source, p[:m], off-s.Offset)
+			} else {
+				read, err = s.Source.ReadAt(p[:m], off-s.Offset)
+			}
 			if read < m {
 				if err == nil {
 					err = fmt.Errorf("short read")
