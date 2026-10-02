@@ -265,7 +265,14 @@ func (d *Device) Close() error {
 	if at := mountPoint(d.BlockPath); at != "" {
 		log.Printf("%s: still mounted at %s; unmount it, deletion waits for it", filepath.Base(d.Path), at)
 	}
-	errs := []error{d.ublk.Stop(), d.store.Close(), d.ublk.Delete()}
+	errs := []error{d.ublk.Stop(), d.store.Close()}
+	if err := d.ublk.Delete(); errors.Is(err, ublk.ErrReowned) {
+		// A restarted server already owns this id, its symlink and its state file
+		log.Printf("%s: kernel device id reused by a successor, leaving its files in place", filepath.Base(d.Path))
+		return errors.Join(errs...)
+	} else if err != nil {
+		errs = append(errs, err)
+	}
 	for _, path := range []string{d.Path, d.statePath} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)

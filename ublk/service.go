@@ -147,7 +147,10 @@ func (d *Device) Stop() error {
 }
 
 // Delete removes the kernel device (DEL_DEV). It blocks while anything still holds the
-// block device open, which is why it is separate from Stop. Idempotent.
+// block device open, which is why it is separate from Stop. Idempotent. If the id has
+// meanwhile been handed to a successor (the kernel reuses the lowest free id, so a
+// restarting server can own "our" number before our shutdown finishes), Delete leaves it
+// alone and returns ErrReowned.
 func (d *Device) Delete() error {
 	ctl, err := openControl()
 	if err != nil {
@@ -197,6 +200,10 @@ func (d *Device) delete(ctl *control) error {
 		}
 	}
 	d.deleted = true
+	// Our device is dead after stop; a live one under this id belongs to a successor
+	if info, err := ctl.deviceInfo(d.ID); err == nil && (info.State == stateLive || (info.UblksrvPID > 0 && int(info.UblksrvPID) != os.Getpid())) {
+		return ErrReowned
+	}
 	if err := ctl.deleteDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
 		return err
 	}
@@ -293,6 +300,11 @@ func openCharDevice(path string) (int, error) {
 		time.Sleep(charDevicePoll)
 	}
 }
+
+var (
+	// ErrReowned means the device id now belongs to another server, so nothing was deleted.
+	ErrReowned = errors.New("ublk device id reused by another server")
+)
 
 // Info is the kernel's view of a device.
 type Info struct {

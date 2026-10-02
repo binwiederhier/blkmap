@@ -30,3 +30,25 @@ the block device on a second machine:
 - `grpc-remote`: a 2 GiB sparse export with 16 MiB of data at offset 1 GiB mounted on the
   other host; the data region matched, the hole region read zeros without requests,
   hydration copied 16 MiB and the COW file is 16 MiB.
+
+### grpc-remote at scale (2026-10-02)
+
+Export: a 1 TiB sparse file on the scratch VM (2 vCPU) holding 4 GiB of random data in eight
+512 MiB regions. Client: codebox (12 vCPU KVM guest) over a 1 GbE LAN with a NAT hop in
+between. Device chunk size 64 KiB, so the bitmap has 16,777,216 bits.
+
+| step | result |
+|---|---|
+| Open RPC (size + 8-extent map) to live device | 0.11 s |
+| 512 MiB of data, one `dd bs=1M iflag=direct` stream over gRPC | 22.6 MiB/s (one 1 MiB RPC in flight at a time) |
+| 4K direct reads of data over gRPC | 2,892 IOPS |
+| 4 GiB of hole region, before hydration | 10.9 GB/s, no requests (zero-filled from the map) |
+| full hydration of the 4 GiB, 4 workers | 42 s, 98 MiB/s; 4,122 MiB received for a 1 TiB device |
+| client during hydration | 46 MiB peak RSS, 26 s CPU, 22 threads |
+| COW file after hydration | 4.1 GiB allocated of 1 TiB; bitmap 2.0 MiB |
+| 512 MiB of data after hydration (local COW file) | 3.8 GB/s |
+| 4 GiB of hole region after hydration | 884 MiB/s (now read from the sparse COW file instead of the map) |
+
+Reading the same region on both sides gave the same SHA-256. The single-stream figure is
+latency bound (one RPC per request as the kernel issues them); hydration's four parallel
+workers approach the link's practical limit.

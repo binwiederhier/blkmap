@@ -453,3 +453,28 @@ func TestPeriodicFlush(t *testing.T) {
 		return err == nil && info.Written == 1
 	}, 3*flushInterval, 200*time.Millisecond, "the bit should reach disk without a guest flush")
 }
+
+func TestCloseLeavesSuccessorAlone(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	opts := func() *Options {
+		return &Options{ID: "succ", Base: &computed{size: 4 << 20}, COWFile: filepath.Join(dir, "succ.cow"), DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run")}
+	}
+	old, err := Serve(context.Background(), opts())
+	require.NoError(t, err)
+	// A restart races the old server's Close: the new server has already published its
+	// symlink and state file under the same id when the old one gets to its cleanup
+	require.NoError(t, old.ublk.Stop())
+	o := opts()
+	o.COWFile = filepath.Join(dir, "succ2.cow")
+	next, err := Serve(context.Background(), o)
+	require.NoError(t, err)
+	t.Cleanup(func() { next.Close() })
+	require.NoError(t, old.Close())
+	target, err := os.Readlink(next.Path)
+	require.NoError(t, err, "the successor's symlink must survive the predecessor's Close")
+	assert.Equal(t, next.BlockPath, target)
+	state, err := os.ReadFile(filepath.Join(dir, "run", "succ"))
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
+}
