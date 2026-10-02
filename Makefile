@@ -26,6 +26,7 @@ test-root:
 	go test -c -o /tmp/blkmap-device.test ./device/ && sudo /tmp/blkmap-device.test -test.v
 
 stress:
+	go build -o dist/rangehttpd ./scripts/rangehttpd
 	sudo scripts/e2e.sh && sudo scripts/stress.sh
 
 # Build and test every example (the gRPC one is its own module)

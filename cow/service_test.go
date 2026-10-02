@@ -381,16 +381,18 @@ func TestStoreNoAlloc(t *testing.T) {
 	assert.Zero(t, testing.AllocsPerRun(100, func() { s.WriteAt(p, 2*testChunk+100) }), "write into a written chunk")
 	full := make([]byte, testChunk)
 	assert.Zero(t, testing.AllocsPerRun(100, func() { s.WriteAt(full, 7*testChunk) }), "whole-chunk write")
+	require.NoError(t, s.Close())
 	// The first partial write into a fresh chunk needs a chunk buffer: pooled, not allocated
-	// per call once the pool is warm
-	chunk := int64(8)
+	// per call once the pool is warm (a GC empties sync.Pool, so amortize over many chunks)
+	big := newTestStore(t, t.TempDir(), &mem{data: pattern(128 * testChunk)})
+	chunk := int64(0)
 	warm := func() {
-		s.WriteAt(p, chunk*testChunk+100)
+		big.WriteAt(p, chunk*testChunk+100)
 		chunk++
 	}
 	warm()
-	assert.LessOrEqual(t, testing.AllocsPerRun(5, warm), 0.0, "partial write into a fresh chunk")
-	require.NoError(t, s.Close())
+	assert.Less(t, testing.AllocsPerRun(100, warm), 0.1, "partial write into a fresh chunk")
+	require.NoError(t, big.Close())
 }
 
 func BenchmarkStore(b *testing.B) {
@@ -445,4 +447,85 @@ func BenchmarkStorePartialWriteRMW(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		s.WriteAt(p, int64(i)*(64<<10)+8192)
 	}
+}
+
+// sizedBase records the length of every read, to show how requests reach the source.
+type sizedBase struct {
+	mem
+	reads []int
+	mu    sync.Mutex
+}
+
+func (b *sizedBase) ReadAt(p []byte, off int64) (int, error) {
+	b.mu.Lock()
+	b.reads = append(b.reads, len(p))
+	b.mu.Unlock()
+	return b.mem.ReadAt(p, off)
+}
+
+func TestStoreReadCoalescesChunks(t *testing.T) {
+	t.Parallel()
+	base := &sizedBase{mem: mem{data: pattern(testSize)}}
+	s := newTestStore(t, t.TempDir(), base)
+	// A read spanning 16 unwritten chunks is one base read, not 16
+	p := make([]byte, testSize)
+	_, err := s.ReadAt(p, 0)
+	require.NoError(t, err)
+	assert.Equal(t, pattern(testSize), p)
+	assert.Equal(t, []int{testSize}, base.reads)
+	// With chunk 5 written, the runs are chunks 0..4 (base), 5 (cow), 6..15 (base)
+	_, err = s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 5*testChunk)
+	require.NoError(t, err)
+	base.reads = nil
+	_, err = s.ReadAt(p, 0)
+	require.NoError(t, err)
+	expected := pattern(testSize)
+	copy(expected[5*testChunk:], bytes.Repeat([]byte{'w'}, testChunk))
+	assert.Equal(t, expected, p)
+	assert.Equal(t, []int{5 * testChunk, 10 * testChunk}, base.reads)
+	// Unaligned, inside one run
+	base.reads = nil
+	_, err = s.ReadAt(p[:3000], 7*testChunk+100)
+	require.NoError(t, err)
+	assert.Equal(t, expected[7*testChunk+100:7*testChunk+3100], p[:3000])
+	assert.Equal(t, []int{3000}, base.reads)
+	require.NoError(t, s.Close())
+}
+
+func TestStoreHydrateRun(t *testing.T) {
+	t.Parallel()
+	base := &sizedBase{mem: mem{data: pattern(testSize + 100)}}
+	dir := t.TempDir()
+	s, err := Open(base, filepath.Join(dir, "r.cow"), filepath.Join(dir, "r.cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+	// Chunk 3 holds a guest write; a run over chunks 1..6 copies the other five with one read
+	_, err = s.WriteAt([]byte("guest"), 3*testChunk)
+	require.NoError(t, err)
+	base.reads = nil
+	copied, err := s.HydrateRun(1, 6, false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5*testChunk), copied)
+	assert.Equal(t, []int{6 * testChunk}, base.reads)
+	for c := int64(1); c < 7; c++ {
+		assert.True(t, s.IsWritten(c), "chunk %d", c)
+	}
+	assert.False(t, s.IsWritten(0))
+	assert.False(t, s.IsWritten(7))
+	got := make([]byte, 7*testChunk)
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	expected := pattern(testSize)[:7*testChunk]
+	copy(expected[3*testChunk:], "guest")
+	assert.Equal(t, expected, got)
+	// The last, partial chunk; a run clipped to the device; an already-written run is free
+	copied, err = s.HydrateRun(16, 5, true)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), copied)
+	assert.True(t, s.IsWritten(16))
+	copied, err = s.HydrateRun(1, 6, false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), copied)
+	_, err = s.HydrateRun(17, 1, false)
+	require.Error(t, err)
 }

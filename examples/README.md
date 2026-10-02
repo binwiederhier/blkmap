@@ -40,15 +40,16 @@ between. Device chunk size 64 KiB, so the bitmap has 16,777,216 bits.
 | step | result |
 |---|---|
 | Open RPC (size + 8-extent map) to live device | 0.11 s |
-| 512 MiB of data, one `dd bs=1M iflag=direct` stream over gRPC | 22.6 MiB/s (one 1 MiB RPC in flight at a time) |
-| 4K direct reads of data over gRPC | 2,892 IOPS |
+| 512 MiB of data, one `dd bs=1M iflag=direct` stream over gRPC | 94 MiB/s (was 22.6 before read-ahead and parallel dispatch) |
+| sequential 4K direct reads of data over gRPC | 16,885 IOPS (was 2,892) |
 | 4 GiB of hole region, before hydration | 10.9 GB/s, no requests (zero-filled from the map) |
-| full hydration of the 4 GiB, 4 workers | 42 s, 98 MiB/s; 4,122 MiB received for a 1 TiB device |
-| client during hydration | 46 MiB peak RSS, 26 s CPU, 22 threads |
+| full hydration of the 4 GiB, 4 workers | 47 s, 87 MiB/s; 4,106 MiB received for a 1 TiB device |
+| client during hydration | 236 MiB peak RSS (request buffers of up to 256 in-flight reads plus the 64 MiB block cache), 28 s CPU |
 | COW file after hydration | 4.1 GiB allocated of 1 TiB; bitmap 2.0 MiB |
 | 512 MiB of data after hydration (local COW file) | 3.8 GB/s |
 | 4 GiB of hole region after hydration | 884 MiB/s (now read from the sparse COW file instead of the map) |
 
-Reading the same region on both sides gave the same SHA-256. The single-stream figure is
-latency bound (one RPC per request as the kernel issues them); hydration's four parallel
-workers approach the link's practical limit.
+Reading the same region on both sides gave the same SHA-256. The single-stream figure was
+latency bound before the source-side read-ahead and parallel dispatch (one RPC per request as
+the kernel issued them); now a single reader runs within about 10% of what hydration's four
+workers get, which is the link's practical limit.

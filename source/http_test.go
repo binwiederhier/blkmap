@@ -2,6 +2,7 @@ package source
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,7 +39,7 @@ func TestHTTP(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, data[1000:1100], p)
 	assert.Equal(t, int32(2), requests.Load())
-	// A read spanning four blocks, three of them new
+	// A read spanning four blocks, three of them new (non-sequential: no read-ahead)
 	p = make([]byte, 2*httpBlockSize+10)
 	n, err = h.ReadAt(p, httpBlockSize-5)
 	require.NoError(t, err)
@@ -195,4 +196,76 @@ func TestHTTPWithoutHead(t *testing.T) {
 	_, err = h.ReadAt(p, 0)
 	require.NoError(t, err)
 	assert.Equal(t, data[1000:1010], p)
+}
+
+func TestHTTPReadAheadHonorsMap(t *testing.T) {
+	t.Parallel()
+	data := pattern(32 * httpBlockSize)
+	var fetched []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") != httpProbeRange {
+			mu.Lock()
+			fetched = append(fetched, r.Header.Get("Range"))
+			mu.Unlock()
+		}
+		http.ServeContent(w, r, "disk.img", time.Time{}, bytes.NewReader(data))
+	}))
+	t.Cleanup(srv.Close)
+	h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+	require.NoError(t, err)
+	// Data only in blocks 0..1 and 20..21; everything else is a hole the map describes
+	m, err := NewMap([]Range{{0, 2 * httpBlockSize}, {20 * httpBlockSize, 2 * httpBlockSize}})
+	require.NoError(t, err)
+	src := WithMap(h, m, 0)
+	p := make([]byte, 64<<10)
+	for off := int64(0); off < 2*httpBlockSize; off += int64(len(p)) { // sequential through the data
+		_, err := src.ReadAt(p, off)
+		require.NoError(t, err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, r := range fetched {
+		var start, end int64
+		fmt.Sscanf(r, "bytes=%d-%d", &start, &end)
+		assert.True(t, end < 2*httpBlockSize || start >= 20*httpBlockSize, "range %s lies in a hole and was fetched by read-ahead", r)
+	}
+	assert.GreaterOrEqual(t, len(fetched), 2)
+}
+
+func TestHTTPSequentialReadAheadThroughput(t *testing.T) {
+	t.Parallel()
+	data := pattern(64 * httpBlockSize)
+	var inflight, peak atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != httpProbeRange {
+			n := inflight.Add(1)
+			for {
+				m := peak.Load()
+				if n <= m || peak.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			inflight.Add(-1)
+		}
+		http.ServeContent(w, r, "disk.img", time.Time{}, bytes.NewReader(data))
+	}))
+	t.Cleanup(srv.Close)
+	h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+	require.NoError(t, err)
+	// One synchronous reader, 1 MiB at a time: read-ahead must keep several fetches in
+	// flight, so 32 reads take far less than 32 x 20 ms
+	p := make([]byte, httpBlockSize)
+	start := time.Now()
+	for i := 0; i < 32; i++ {
+		_, err := h.ReadAt(p, int64(i)*httpBlockSize)
+		require.NoError(t, err)
+		require.True(t, bytes.Equal(data[int64(i)*httpBlockSize:int64(i+1)*httpBlockSize], p), "block %d", i)
+	}
+	elapsed := time.Since(start)
+	t.Logf("32 sequential 1 MiB reads over a 20 ms server: %s, peak %d in flight", elapsed, peak.Load())
+	assert.Less(t, elapsed, 300*time.Millisecond)
+	assert.GreaterOrEqual(t, peak.Load(), int32(4))
 }

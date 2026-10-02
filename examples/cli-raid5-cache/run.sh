@@ -6,6 +6,10 @@
 # Needs root, the blkmap deb, python3.
 set -euo pipefail
 me="$(cd "$(dirname "$0")" && pwd)"
+# The HTTP origin: the Go test server from scripts/rangehttpd (built into dist/ locally,
+# shipped as bin/ on a test VM)
+rangehttpd=""; for c in "$me/../../dist/rangehttpd" "$me/../../bin/rangehttpd"; do [ -x "$c" ] && rangehttpd=$c && break; done
+[ -x "$rangehttpd" ] || { echo "rangehttpd not found: go build -o dist/rangehttpd ./scripts/rangehttpd" >&2; exit 1; }
 dir=/var/tmp/blkmap-example-raid5
 cleanup() {
   systemctl stop blkmap@raid5 2>/dev/null || true
@@ -17,7 +21,7 @@ head -c $((24<<20)) /dev/urandom > $dir/image
 python3 "$me/../../scripts/mkraid5.py" $dir/image 65536 $dir/slow 4
 for m in member0 member2 member3; do head -c $((4<<20)) $dir/slow/$m > $dir/fast/$m; done
 cp "$me/prefetch" $dir/prefetch
-python3 "$me/../../scripts/rangehttpd.py" $dir/slow 18101 & httpd=$!
+"$rangehttpd" $dir/slow 127.0.0.1:18101 & httpd=$!
 sleep 1
 cp "$me/device.yml" /etc/blkmap/raid5.yml
 

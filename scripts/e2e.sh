@@ -4,6 +4,11 @@
 # systemd, verifies the stitched content, formats and mounts it, writes a file, restarts the
 # unit, and verifies the file survived in the COW overlay. Leaves nothing running.
 set -euo pipefail
+me="$(cd "$(dirname "$0")" && pwd)"
+# The HTTP origin: the Go test server from scripts/rangehttpd (built into dist/ locally,
+# shipped as bin/ on a test VM)
+rangehttpd=""; for c in "$me/../dist/rangehttpd" "$me/../bin/rangehttpd"; do [ -x "$c" ] && rangehttpd=$c && break; done
+[ -x "$rangehttpd" ] || { echo "rangehttpd not found: go build -o dist/rangehttpd ./scripts/rangehttpd" >&2; exit 1; }
 id=e2e
 dir=/var/tmp/blkmap-$id
 mnt=/mnt/blkmap-$id
@@ -19,7 +24,7 @@ rm -rf $dir /var/lib/blkmap/$id.cow /var/lib/blkmap/$id.cow.bitmap
 mkdir -p $dir $mnt
 head -c 8388608 /dev/urandom > $dir/part.img
 fuser -k 18099/tcp >/dev/null 2>&1 || true
-python3 "$(dirname "$0")/rangehttpd.py" $dir 18099 & httpd=$!
+"$rangehttpd" $dir 127.0.0.1:18099 & httpd=$!
 sleep 1
 cat > /etc/blkmap/$id.yml <<YML
 size: 64M

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -155,13 +156,23 @@ func TestExtents(t *testing.T) {
 	assert.Empty(t, ext)
 }
 
-// recordingSource records the ranges read from it.
+// recordingSource records the ranges read from it (read-ahead reads concurrently).
 type recordingSource struct {
 	mem
 	reads []Range
+	mu    sync.Mutex
 }
 
 func (r *recordingSource) ReadAt(p []byte, off int64) (int, error) {
+	r.mu.Lock()
 	r.reads = append(r.reads, Range{off, int64(len(p))})
+	r.mu.Unlock()
 	return r.mem.ReadAt(p, off)
+}
+
+// recorded returns a snapshot of the reads so far.
+func (r *recordingSource) recorded() []Range {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Range(nil), r.reads...)
 }

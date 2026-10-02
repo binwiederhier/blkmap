@@ -81,11 +81,18 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 		p, eof = p[:s.size-off], io.EOF
 	}
 	n := len(p)
+	// Serve runs of chunks with the same state in one call each, so a request that spans
+	// many unwritten chunks reaches the base source once (one round trip for a remote one)
 	for len(p) > 0 {
 		chunk := off / s.chunkSize
-		m := int(min(int64(len(p)), (chunk+1)*s.chunkSize-off))
+		written := s.bitmap.Test(chunk)
+		end := (chunk + 1) * s.chunkSize
+		for end < off+int64(len(p)) && s.bitmap.Test(end/s.chunkSize) == written {
+			end += s.chunkSize
+		}
+		m := int(min(int64(len(p)), end-off))
 		var err error
-		if s.bitmap.Test(chunk) {
+		if written {
 			_, err = s.cow.ReadAt(p[:m], off)
 		} else {
 			_, err = s.base.ReadAt(p[:m], off)
@@ -361,4 +368,48 @@ func Inspect(bitmapPath string) (*Info, error) {
 // Dirty reports whether anything changed since the last Flush.
 func (s *Store) Dirty() bool {
 	return s.dirty.Load()
+}
+
+// HydrateRun copies the unwritten chunks among [first, first+count) from the base with one
+// read, so a remote source sees one request per run instead of one per chunk. It reports the
+// bytes copied; chunks the guest wrote meanwhile keep the guest's data.
+func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
+	chunks := s.bitmap.Chunks()
+	if first < 0 || first >= chunks || count <= 0 {
+		return 0, fmt.Errorf("%w: chunks %d..%d of %d", errOutOfRange, first, first+count, chunks)
+	}
+	last := min(first+count, chunks)
+	start := first * s.chunkSize
+	buf := make([]byte, min(last*s.chunkSize, s.size)-start)
+	var n int
+	var err error
+	if direct {
+		n, err = source.ReadDirect(s.base, buf, start)
+	} else {
+		n, err = s.base.ReadAt(buf, start)
+	}
+	if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
+		return 0, fmt.Errorf("hydrate chunks %d..%d: %w", first, last, err)
+	}
+	if n < len(buf) {
+		return 0, fmt.Errorf("hydrate chunks %d..%d: short read (%d of %d bytes)", first, last, n, len(buf))
+	}
+	var copied int64
+	for chunk := first; chunk < last; chunk++ {
+		off := (chunk - first) * s.chunkSize
+		data := buf[off:min(off+s.chunkSize, int64(len(buf)))]
+		mu := &s.locks[chunk%lockStripes]
+		mu.Lock()
+		if !s.bitmap.Test(chunk) {
+			if _, err := s.cow.WriteAt(data, start+off); err != nil {
+				mu.Unlock()
+				return copied, err
+			}
+			s.bitmap.Set(chunk)
+			s.dirty.Store(true)
+			copied += int64(len(data))
+		}
+		mu.Unlock()
+	}
+	return copied, nil
 }

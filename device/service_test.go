@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -477,4 +479,114 @@ func TestCloseLeavesSuccessorAlone(t *testing.T) {
 	state, err := os.ReadFile(filepath.Join(dir, "run", "succ"))
 	require.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
+}
+
+// laggy is a source whose every read costs a fixed latency, standing in for a remote one.
+// It records request sizes and peak concurrency to show what the kernel actually issues.
+type laggy struct {
+	computed
+	delay    time.Duration
+	inflight atomic.Int32
+	peak     atomic.Int32
+	sizes    sync.Map // request length -> count
+}
+
+func (l *laggy) ReadAt(p []byte, off int64) (int, error) {
+	n := l.inflight.Add(1)
+	for {
+		m := l.peak.Load()
+		if n <= m || l.peak.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	c, _ := l.sizes.LoadOrStore(len(p), new(atomic.Int64))
+	c.(*atomic.Int64).Add(1)
+	time.Sleep(l.delay)
+	l.inflight.Add(-1)
+	return l.computed.ReadAt(p, off)
+}
+
+func (l *laggy) summary() string {
+	var parts []string
+	l.sizes.Range(func(k, v any) bool {
+		parts = append(parts, fmt.Sprintf("%dx%dK", v.(*atomic.Int64).Load(), k.(int)/1024))
+		return true
+	})
+	return fmt.Sprintf("peak concurrency %d, requests %s", l.peak.Load(), strings.Join(parts, " "))
+}
+
+func TestServeReadAheadAndParallelism(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	lag := &laggy{computed: computed{size: 256 << 20}, delay: 20 * time.Millisecond}
+	d, err := Serve(context.Background(), &Options{
+		ID:      "lag",
+		Base:    lag,
+		COWFile: filepath.Join(dir, "lag.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+		RunDir:  filepath.Join(dir, "run"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	// The device advertises a large read-ahead window to the kernel
+	ra, err := os.ReadFile("/sys/block/" + filepath.Base(d.BlockPath) + "/queue/read_ahead_kb")
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("%d\n", readAheadKB), string(ra))
+	// A single buffered sequential reader: the kernel's read-ahead issues several 1 MiB
+	// requests at once and the queue serves them in parallel, so 64 MiB take far less than
+	// the 64 x 20 ms = 1.3 s one request at a time would
+	f, err := os.Open(d.Path)
+	require.NoError(t, err)
+	defer f.Close()
+	buf := make([]byte, 1<<20)
+	start := time.Now()
+	for off := int64(0); off < 64<<20; off += int64(len(buf)) {
+		_, err := f.ReadAt(buf, off)
+		require.NoError(t, err)
+		require.Equal(t, byte(off/4096), buf[0])
+	}
+	elapsed := time.Since(start)
+	limits, _ := os.ReadFile("/sys/block/" + filepath.Base(d.BlockPath) + "/queue/max_sectors_kb")
+	segs, _ := os.ReadFile("/sys/block/" + filepath.Base(d.BlockPath) + "/queue/max_segments")
+	t.Logf("64 MiB buffered sequential read over a 20 ms source: %s; %s; max_sectors_kb %s max_segments %s", elapsed, lag.summary(), strings.TrimSpace(string(limits)), strings.TrimSpace(string(segs)))
+	assert.Less(t, elapsed, 700*time.Millisecond)
+	// Direct 1 MiB reads, one at a time: no kernel read-ahead applies, so this is what the
+	// source sees from a single synchronous reader
+	df, err := os.OpenFile(d.Path, os.O_RDONLY|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	defer df.Close()
+	raw := make([]byte, 2<<20)
+	direct := raw[4096-int(uintptr(unsafe.Pointer(&raw[0]))%4096):][:1<<20]
+	lag.sizes = sync.Map{}
+	start = time.Now()
+	for off := int64(64 << 20); off < 96<<20; off += int64(len(direct)) {
+		_, err := df.ReadAt(direct, off)
+		require.NoError(t, err)
+	}
+	t.Logf("32 MiB direct 1M sequential read: %s; %s", time.Since(start), lag.summary())
+}
+
+func TestCloseLeavesDifferentIDSuccessorAlone(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	opts := func(cow string) *Options {
+		return &Options{ID: "succ2", Base: &computed{size: 4 << 20}, COWFile: filepath.Join(dir, cow), DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run")}
+	}
+	old, err := Serve(context.Background(), opts("a.cow"))
+	require.NoError(t, err)
+	// The successor starts while the old device still exists, so it gets a different ublk
+	// id but the same symlink path and state file
+	next, err := Serve(context.Background(), opts("b.cow"))
+	require.NoError(t, err)
+	t.Cleanup(func() { next.Close() })
+	require.NotEqual(t, old.BlockPath, next.BlockPath)
+	require.NoError(t, old.Close())
+	target, err := os.Readlink(next.Path)
+	require.NoError(t, err, "the successor's symlink must survive the predecessor's Close")
+	assert.Equal(t, next.BlockPath, target)
+	state, err := os.ReadFile(filepath.Join(dir, "run", "succ2"))
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
+	_, err = os.Stat(old.BlockPath)
+	assert.True(t, os.IsNotExist(err), "the old kernel device itself is gone")
 }

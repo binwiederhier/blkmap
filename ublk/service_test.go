@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -442,4 +443,98 @@ func TestDeviceStopThenDelete(t *testing.T) {
 	assert.ErrorIs(t, err, syscall.ENODEV)
 	require.NoError(t, d.Delete())
 	require.NoError(t, d.Close())
+}
+
+// slowMem is a mem backend with per-read latency that records its peak concurrency.
+type slowMem struct {
+	*mem
+	delay       time.Duration
+	inflight    atomic.Int32
+	maxInflight atomic.Int32
+}
+
+func (s *slowMem) ReadAt(p []byte, off int64) (int, error) {
+	n := s.inflight.Add(1)
+	for {
+		m := s.maxInflight.Load()
+		if n <= m || s.maxInflight.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	time.Sleep(s.delay)
+	s.inflight.Add(-1)
+	return s.mem.ReadAt(p, off)
+}
+
+func TestDeviceParallelBackend(t *testing.T) {
+	requireUblk(t)
+	m := &slowMem{mem: newMem(64 << 20), delay: 20 * time.Millisecond}
+	copy(m.data, pattern(64<<20, 3))
+	d := createTestDevice(t, &Params{Backend: m, NumQueues: 2, QueueDepth: 32})
+	// 64 readers x 8 direct 4K reads: 512 reads of 20 ms each would take 10 s serially and
+	// 5 s with one request per queue; with real parallelism it is well under a second
+	start := time.Now()
+	var wg sync.WaitGroup
+	for r := 0; r < 64; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			f, err := os.OpenFile(d.BlockPath, os.O_RDONLY|syscall.O_DIRECT, 0)
+			if !assert.NoError(t, err) {
+				return
+			}
+			defer f.Close()
+			buf := alignedBuf(4096)
+			for i := 0; i < 8; i++ {
+				off := int64(r*8+i) * 65536
+				_, err := f.ReadAt(buf, off)
+				assert.NoError(t, err)
+				assert.True(t, bytes.Equal(m.data[off:off+4096], buf), "reader %d read %d", r, i)
+			}
+		}(r)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	t.Logf("512 reads of 20 ms latency took %s, peak backend concurrency %d", elapsed, m.maxInflight.Load())
+	assert.Less(t, elapsed, 2*time.Second)
+	assert.GreaterOrEqual(t, m.maxInflight.Load(), int32(16))
+}
+
+func TestDeviceCloseDrainsInflight(t *testing.T) {
+	requireUblk(t)
+	m := &slowMem{mem: newMem(16 << 20), delay: 300 * time.Millisecond}
+	d := createTestDevice(t, &Params{Backend: m})
+	var wg sync.WaitGroup
+	results := make(chan error, 16)
+	for r := 0; r < 16; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			f, err := os.OpenFile(d.BlockPath, os.O_RDONLY|syscall.O_DIRECT, 0)
+			if err != nil {
+				results <- err
+				return
+			}
+			defer f.Close()
+			_, err = f.ReadAt(alignedBuf(4096), int64(r)*1<<20)
+			results <- err
+		}(r)
+	}
+	time.Sleep(100 * time.Millisecond) // reads are now in flight inside the backend
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	wg.Wait()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung with requests in flight")
+	}
+	close(results)
+	for err := range results {
+		// A read that raced the stop may fail (EIO, or ENODEV/ENXIO once the device is
+		// gone, depending on the kernel), but it must not hang and it must not corrupt
+		_ = err
+	}
+	assert.Equal(t, int32(0), m.inflight.Load(), "no backend call may be running after Close")
 }

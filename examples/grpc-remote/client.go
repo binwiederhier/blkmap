@@ -21,7 +21,9 @@ const (
 )
 
 // remoteFile is a read-only source.Source for one exported file. Holes come from the map the
-// server sent at Open, applied by source.WithMap, so this type only ever reads data.
+// server sent at Open, applied by source.WithMap, so this type only ever reads data; the
+// read-ahead wrapper in between turns a sequential reader's requests into 1 MiB fetches and
+// keeps several in flight.
 type remoteFile struct {
 	client remotepb.RemoteClient
 	name   string
@@ -45,7 +47,7 @@ func openRemote(ctx context.Context, conn *grpc.ClientConn, name string) (source
 	if err != nil {
 		return nil, err
 	}
-	return source.WithMap(&remoteFile{client: client, name: name, size: resp.Size}, m, 0), nil
+	return source.WithMap(source.NewReadAhead(&remoteFile{client: client, name: name, size: resp.Size}), m, 0), nil
 }
 
 func (r *remoteFile) ReadAt(p []byte, off int64) (int, error) {

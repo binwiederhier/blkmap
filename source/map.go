@@ -141,7 +141,15 @@ type Mapped struct {
 	base int64
 }
 
+// mapAware is implemented by sources with a read-ahead cache that can skip hole blocks.
+type mapAware interface {
+	setMap(m *Map)
+}
+
 func WithMap(src Source, m *Map, base int64) *Mapped {
+	if aware, ok := src.(mapAware); ok && base == 0 {
+		aware.setMap(m)
+	}
 	return &Mapped{src: src, m: m, base: base}
 }
 

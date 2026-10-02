@@ -33,6 +33,10 @@ const (
 	// flushInterval bounds how long a completed write can sit without reaching disk when
 	// the guest never issues a flush (raw dd, no filesystem).
 	flushInterval = 5 * time.Second
+	// readAheadKB is the kernel read-ahead window set on the block device. The default
+	// (128 KiB) is tuned for disks; for a source that is a network round trip per request,
+	// a window of several requests lets a sequential reader keep many in flight.
+	readAheadKB = 4096
 )
 
 // Options describes a device to serve from an arbitrary read-only base. This is the library
@@ -151,6 +155,9 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
 	d := &Device{Path: filepath.Join(devDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev}
+	if err := os.WriteFile(filepath.Join("/sys/block", filepath.Base(dev.BlockPath), "queue", "read_ahead_kb"), []byte(strconv.Itoa(readAheadKB)), 0); err != nil {
+		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
+	}
 	if err := d.publish(devDir); err != nil {
 		d.Close()
 		return nil, err
@@ -273,8 +280,15 @@ func (d *Device) Close() error {
 	} else if err != nil {
 		errs = append(errs, err)
 	}
-	for _, path := range []string{d.Path, d.statePath} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// Only unpublish what is still ours: a successor started under the same name may
+	// already have replaced the symlink and the state file
+	if target, err := os.Readlink(d.Path); err == nil && target == d.BlockPath {
+		if err := os.Remove(d.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	if content, err := os.ReadFile(d.statePath); err == nil && strings.TrimSpace(string(content)) == strconv.FormatUint(uint64(d.ublk.ID), 10) {
+		if err := os.Remove(d.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}

@@ -20,6 +20,9 @@ const (
 	// holeWindow bounds one Holes query, so a huge sparse device does not produce one giant
 	// range list up front.
 	holeWindow = 4 << 30
+	// hydrateRunBytes is how much consecutive unwritten data one background read covers, so a
+	// remote source sees requests of this size rather than one per chunk.
+	hydrateRunBytes = 1 << 20
 	// hydrateMaxLoggedErrors caps per-chunk error lines; the total is logged at the end.
 	hydrateMaxLoggedErrors = 20
 	phaseList              = "list"
@@ -91,7 +94,7 @@ func newHydrator(id string, store *cow.Store, base source.Source, opts *Hydrate,
 		}
 	}
 	if o.Rate > 0 {
-		h.limiter = newBucket(o.Rate, chunkSize)
+		h.limiter = newBucket(o.Rate, max(hydrateRunBytes, chunkSize))
 	}
 	return h
 }
@@ -144,57 +147,84 @@ func (h *hydrator) run(ctx context.Context) {
 	}
 }
 
+// run is a batch of consecutive chunks handed to a worker: a run of zero chunks is marked,
+// a run of unwritten chunks is copied with one base read.
+type run struct {
+	first, count int64
+	zero         bool
+}
+
 // process hydrates the chunks produced by next, in order, with the configured concurrency,
 // yielding to the guest and to the rate limiter. next is an iterator so the rest phase of a
-// huge device never materializes a list of every chunk.
+// huge device never materializes a list of every chunk. Consecutive chunks of the same kind
+// are batched into runs of up to hydrateRunBytes.
 func (h *hydrator) process(ctx context.Context, phase string, next func(yield func(int64) bool), limiter *bucket) {
 	h.setPhase(phase)
-	work := make(chan int64)
+	work := make(chan run)
 	var wg sync.WaitGroup
 	for i := 0; i < h.opts.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for c := range work {
-				h.chunk(ctx, c, limiter)
+			for r := range work {
+				h.handleRun(ctx, r, limiter)
 			}
 		}()
+	}
+	maxRun := max(hydrateRunBytes/h.store.ChunkSize(), 1)
+	var pending run
+	flush := func() bool {
+		if pending.count == 0 {
+			return true
+		}
+		select {
+		case work <- pending:
+			pending = run{}
+			return true
+		case <-ctx.Done():
+			return false
+		}
 	}
 	next(func(c int64) bool {
 		if h.store.IsWritten(c) {
 			return true
 		}
-		select {
-		case work <- c:
-			return true
-		case <-ctx.Done():
-			return false
+		zero := h.zero.Test(c)
+		if pending.count > 0 && (c != pending.first+pending.count || zero != pending.zero || pending.count == maxRun) {
+			if !flush() {
+				return false
+			}
 		}
+		if pending.count == 0 {
+			pending = run{first: c, zero: zero}
+		}
+		pending.count++
+		return true
 	})
+	flush()
 	close(work)
 	wg.Wait()
 }
 
-func (h *hydrator) chunk(ctx context.Context, c int64, limiter *bucket) {
+func (h *hydrator) handleRun(ctx context.Context, r run, limiter *bucket) {
 	if !h.waitIdle(ctx) {
 		return
 	}
-	if h.zero.Test(c) {
-		h.store.MarkZero(c)
+	if r.zero {
+		for c := r.first; c < r.first+r.count; c++ {
+			h.store.MarkZero(c)
+		}
 		return
 	}
-	if limiter != nil && !limiter.wait(ctx, h.store.ChunkSize()) {
+	if limiter != nil && !limiter.wait(ctx, r.count*h.store.ChunkSize()) {
 		return
 	}
-	copied, err := h.store.HydrateChunk(c, h.opts.UseCache == config.CacheNever)
+	copied, err := h.store.HydrateRun(r.first, r.count, h.opts.UseCache == config.CacheNever)
+	h.copied.Add(copied)
 	if err != nil {
 		if n := h.errors.Add(1); n <= hydrateMaxLoggedErrors {
 			log.Printf("%s: %s", h.id, err.Error())
 		}
-		return
-	}
-	if copied {
-		h.copied.Add(h.store.ChunkSize())
 	}
 }
 

@@ -91,6 +91,23 @@ func (r *ring) prepare(cmdOp uint32, userData uint64, cmd unsafe.Pointer, cmdLen
 	return nil
 }
 
+// prepareRead writes an IORING_OP_READ SQE for fd at offset 0 (used for the eventfd that
+// wakes a queue thread when a worker finished a request).
+func (r *ring) prepareRead(fd int, buf unsafe.Pointer, n uint32, userData uint64) error {
+	if r.local-atomic.LoadUint32(r.sqHead) >= r.entries {
+		return errRingFull
+	}
+	sqe := unsafe.Add(r.sqes, uintptr(r.local&r.sqMask)*sqeSize)
+	clear(unsafe.Slice((*byte)(sqe), sqeSize))
+	*(*uint8)(sqe) = ringOpRead
+	*(*int32)(unsafe.Add(sqe, 4)) = int32(fd)
+	*(*uint64)(unsafe.Add(sqe, 16)) = uint64(uintptr(buf)) // addr
+	*(*uint32)(unsafe.Add(sqe, 24)) = n                    // len
+	*(*uint64)(unsafe.Add(sqe, 32)) = userData
+	r.local++
+	return nil
+}
+
 // flush publishes the prepared SQEs and submits them with one io_uring_enter.
 func (r *ring) flush() error {
 	pending := r.local - atomic.LoadUint32(r.sqTail)

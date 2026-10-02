@@ -96,13 +96,11 @@ func TestHydratorListThenRest(t *testing.T) {
 	}, idle)
 	h.run(context.Background())
 	assert.Equal(t, s.Chunks(), s.Written())
-	// Listed chunks first (20, 21, 5; the duplicate 20 skipped), then the rest ascending,
-	// skipping what was listed or already written
+	// Listed chunks first (20+21 as one run, then 5; the duplicate 20 skipped), then the
+	// rest ascending in runs that stop at listed or written chunks: 0..4, 6..9, 11..19, 22..
 	offs := base.offsets()
-	require.GreaterOrEqual(t, len(offs), 63)
-	assert.Equal(t, []int64{20 * hChunk, 21 * hChunk, 5 * hChunk, 0, hChunk}, offs[:5])
+	assert.Equal(t, []int64{20 * hChunk, 5 * hChunk, 0, 6 * hChunk, 11 * hChunk, 22 * hChunk}, offs[:6])
 	assert.NotContains(t, offs, int64(10*hChunk))
-	assert.Len(t, offs, 63)
 	assert.Equal(t, 0, base.direct)
 	// Content: base everywhere except the guest write
 	expected := pat(hSize)
@@ -131,7 +129,7 @@ func TestHydratorListOnlyDirect(t *testing.T) {
 	}, idle)
 	h.run(context.Background())
 	assert.Equal(t, int64(3), s.Written())
-	assert.Equal(t, 3, base.direct)
+	assert.Equal(t, 1, base.direct) // one read for the whole run
 }
 
 func TestHydratorZeroRangesAndConcurrency(t *testing.T) {
@@ -147,8 +145,9 @@ func TestHydratorZeroRangesAndConcurrency(t *testing.T) {
 	h := newHydrator("h", s, base, &Hydrate{Rest: true, Concurrency: 4}, idle)
 	h.run(context.Background())
 	assert.Equal(t, s.Chunks(), s.Written())
-	// Only the file chunks and the half-zero chunk were read; zero chunks were marked
-	assert.Len(t, file.offsets(), 16)
+	// Only the file chunks and the half-zero chunk were read; zero chunks were marked. The
+	// 16 file chunks arrive as runs, never one read per chunk
+	assert.Less(t, len(file.offsets()), 16)
 	got := make([]byte, hSize)
 	_, err = s.ReadAt(got, 0)
 	require.NoError(t, err)
@@ -163,13 +162,15 @@ func TestHydratorZeroRangesAndConcurrency(t *testing.T) {
 
 func TestHydratorRateAndBusy(t *testing.T) {
 	t.Parallel()
-	base := &recorder{data: pat(hSize)}
+	// Reads come in 1 MiB runs and the limiter allows one run up front, so a 4 MiB device at
+	// 2 MiB/s should take about 1.5 s; check it is clearly paced
+	base := &recorder{data: pat(4 << 20)}
 	s := newHydrateStore(t, base)
-	// 64 chunks of 4K at 128K/s should take about 2s; check it is clearly paced
 	start := time.Now()
-	h := newHydrator("h", s, base, &Hydrate{Rest: true, Rate: 128 * hChunk / 4}, idle)
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Rate: 2 << 20}, idle)
 	h.run(context.Background())
-	assert.Greater(t, time.Since(start), 1500*time.Millisecond)
+	assert.Greater(t, time.Since(start), 1200*time.Millisecond)
+	assert.Less(t, time.Since(start), 3*time.Second)
 	assert.Equal(t, s.Chunks(), s.Written())
 	// Busy guest: nothing happens until it goes idle
 	base2 := &recorder{data: pat(hSize)}
@@ -194,10 +195,10 @@ func TestHydratorRateAndBusy(t *testing.T) {
 
 func TestHydratorCancel(t *testing.T) {
 	t.Parallel()
-	base := &recorder{data: pat(hSize)}
+	base := &recorder{data: pat(8 << 20)}
 	s := newHydrateStore(t, base)
 	ctx, cancel := context.WithCancel(context.Background())
-	h := newHydrator("h", s, base, &Hydrate{Rest: true, Rate: hChunk}, idle) // 1 chunk/s
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Rate: hChunk}, idle) // one 1 MiB run, then a crawl
 	done := make(chan struct{})
 	go func() {
 		h.run(ctx)
@@ -210,5 +211,5 @@ func TestHydratorCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("hydrator did not stop on cancel")
 	}
-	assert.Less(t, s.Written(), int64(5))
+	assert.Less(t, s.Written(), int64(300)) // the first run (256 chunks) plus little else
 }

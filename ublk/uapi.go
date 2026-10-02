@@ -63,6 +63,7 @@ const (
 	ringOffCQRing      = 0x8000000
 	ringOffSQEs        = 0x10000000
 	ringOpURingCmd     = 46
+	ringOpRead         = 22
 	ringEnterGetEvents = 1 << 0
 	ringEnterExtArg    = 1 << 3
 	sqeSize            = 128

@@ -180,6 +180,22 @@ without the COW layer.
 
 ## Performance
 
+Requests from the kernel are served by one thread per ublk queue. While the backend answers
+in microseconds (a local file) that thread serves reads itself, because a handoff would cost
+more than the work; once the smoothed read service time passes 250 µs (a network source) it
+hands reads to a worker pool, one backend call per queue slot, so up to the full queue depth
+of reads runs concurrently against the source. Writes, flushes and discards always run
+inline: they target the local COW file, where parallel read-modify-writes only contend. The
+store coalesces consecutive chunks in the same state, so a 1 MiB request over unwritten
+chunks is one base read, not sixteen, and hydration copies in 1 MiB runs. Each device gets a
+4 MiB kernel read-ahead window, and the HTTP source (and `source.NewReadAhead` for others)
+fetches the next 8 MiB in the background when it sees a sequential reader, so one `dd` keeps
+a slow source busy. Against a 20 ms source (`scripts/rangehttpd -delay 20ms`) a single `dd`,
+buffered or direct, goes from the one-at-a-time 50 MiB/s to about 260 MiB/s, and 32 random
+1 MiB reads in flight reach about 1,300 IOPS where one-at-a-time is 50. Across two hosts
+(the gRPC example, 1 TiB sparse export) a single direct 1 MiB stream went from 23 to 94 MiB/s,
+within 10% of what four parallel hydration workers get out of the link.
+
 The hot paths allocate nothing per request (tests pin this with `testing.AllocsPerRun`):
 store reads and writes, concat lookups (binary search over segments), cache hits and misses,
 RAID-5 reads including parity reconstruction (pooled stripe buffers), and the COW
@@ -194,16 +210,16 @@ queue, and per-tag buffers sized to the 1 MiB maximum request, so large I/O is n
 Defaults are 4 queues (fewer on smaller machines) at depth 64, which costs at most 256 MiB of
 request buffers per device, touched lazily.
 
-Measured on a 12 vCPU KVM guest (kernel 6.8) with `scripts/stress.sh`, zero-backed 4 GiB
-device, direct I/O, 4 jobs at queue depth 32:
+Measured on a 12 vCPU KVM guest (kernel 6.8), zero-backed 4 GiB device, direct I/O with
+fio's io_uring engine (the psync engine ignores iodepth and understates everything), 4 jobs
+at queue depth 32:
 
 | workload | result |
 |---|---|
-| 4K random read | 329k IOPS |
-| 1M random read | 21 GB/s |
-| 1M sequential read | 4.1 GB/s (single job) |
-| 4K random write (COW, 64K chunks) | 23k IOPS |
-| 1M random write (COW) | 977 MB/s |
+| 4K random read | 1.2M IOPS |
+| 64K random read | 370k IOPS, 23 GB/s |
+| 1M sequential read, one job at depth 16 | 5.3 GB/s |
+| 4K random write (COW, 64K chunks) | 86k IOPS |
 
 Random 4K writes pay for the copy-on-write chunking: the first write into a 64K chunk copies
 the chunk from the base and writes it whole. A smaller `cow.chunk-size` trades that for a

@@ -4,6 +4,10 @@
 # COW overlay. Needs root, the blkmap deb, and python3.
 set -euo pipefail
 me="$(cd "$(dirname "$0")" && pwd)"
+# The HTTP origin: the Go test server from scripts/rangehttpd (built into dist/ locally,
+# shipped as bin/ on a test VM)
+rangehttpd=""; for c in "$me/../../dist/rangehttpd" "$me/../../bin/rangehttpd"; do [ -x "$c" ] && rangehttpd=$c && break; done
+[ -x "$rangehttpd" ] || { echo "rangehttpd not found: go build -o dist/rangehttpd ./scripts/rangehttpd" >&2; exit 1; }
 dir=/var/tmp/blkmap-example-stitch
 mnt=$dir/mnt
 cleanup() {
@@ -14,7 +18,7 @@ cleanup() {
 trap cleanup EXIT
 rm -rf $dir; mkdir -p $dir $mnt
 head -c $((8<<20)) /dev/urandom > $dir/part.img
-python3 "$me/../../scripts/rangehttpd.py" $dir 18100 & httpd=$!   # python's stock http.server has no Range support
+"$rangehttpd" $dir 127.0.0.1:18100 & httpd=$!
 sleep 1
 
 echo "== validate (opens every source, prints the layout)"

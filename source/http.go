@@ -1,21 +1,17 @@
 package source
 
 import (
-	"container/list"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 const (
 	// httpBlockSize is the aligned fetch unit; every Range request is one whole block.
-	httpBlockSize = 1 << 20
-	// httpCacheBlocks bounds the LRU block cache (64 MiB per HTTP source).
-	httpCacheBlocks = 64
+	httpBlockSize = cacheBlockSize
 	// httpAttempts bounds retries of one block fetch on transient failures (network errors,
 	// 5xx, truncated bodies); the delay doubles from httpRetryDelay between attempts.
 	httpAttempts   = 3
@@ -26,31 +22,15 @@ const (
 	httpRangeUnit    = "bytes "
 )
 
-// HTTP reads a window of a URL via Range requests, through a small LRU block cache.
+// HTTP reads a window of a URL via Range requests, through the block cache (single-flight
+// fetches, sequential read-ahead).
 type HTTP struct {
 	client *http.Client
 	url    string
 	offset int64
 	size   int64
 	total  int64 // length of the whole resource
-
-	blocks  map[int64]*list.Element // block index -> lru element holding *httpBlock
-	lru     *list.List
-	pending map[int64]*httpFetch // blocks being fetched, so concurrent readers share one request
-	mu      sync.Mutex           // Protects blocks, lru and pending
-}
-
-// httpBlock is one cached, resource-aligned block.
-type httpBlock struct {
-	index int64
-	data  []byte
-}
-
-// httpFetch is an in-flight block fetch other readers can wait for.
-type httpFetch struct {
-	done  chan struct{}
-	block *httpBlock
-	err   error
+	cache  *blockCache
 }
 
 // NewHTTP opens a window of size bytes starting at offset within the resource at url. A size
@@ -65,30 +45,24 @@ func NewHTTP(client *http.Client, url string, offset, size int64) (*HTTP, error)
 	if size, err = window(offset, size, total); err != nil {
 		return nil, fmt.Errorf("%s: %w", url, err)
 	}
-	return &HTTP{
-		client:  client,
-		url:     url,
-		offset:  offset,
-		size:    size,
-		total:   total,
-		blocks:  make(map[int64]*list.Element),
-		lru:     list.New(),
-		pending: make(map[int64]*httpFetch),
-	}, nil
+	h := &HTTP{client: client, url: url, offset: offset, size: size, total: total}
+	h.cache = newBlockCache(total, h.fetch)
+	return h, nil
+}
+
+// setMap lets the read-ahead skip blocks that the map says are holes; the Mapped wrapper
+// around this source already never asks for them on demand.
+func (h *HTTP) setMap(m *Map) {
+	h.cache.skip = func(index int64) bool {
+		start := index * httpBlockSize
+		return len(m.Data(start, min(httpBlockSize, h.total-start))) == 0
+	}
 }
 
 func (h *HTTP) ReadAt(p []byte, off int64) (int, error) {
 	n, eof := clampRead(len(p), off, h.size)
-	p = p[:n]
-	// Walk the resource-aligned blocks the window read touches
-	for pos := h.offset + off; len(p) > 0; {
-		block, err := h.block(pos / httpBlockSize)
-		if err != nil {
-			return 0, err
-		}
-		copied := copy(p, block.data[pos%httpBlockSize:])
-		p = p[copied:]
-		pos += int64(copied)
+	if err := h.cache.readAt(p[:n], h.offset+off); err != nil {
+		return 0, err
 	}
 	return n, eof
 }
@@ -100,42 +74,6 @@ func (h *HTTP) Size() int64 {
 func (h *HTTP) Close() error {
 	h.client.CloseIdleConnections()
 	return nil
-}
-
-// block returns the cached block at index, fetching it on a miss. Concurrent readers of the
-// same block share one fetch.
-func (h *HTTP) block(index int64) (*httpBlock, error) {
-	h.mu.Lock()
-	if el, ok := h.blocks[index]; ok {
-		h.lru.MoveToFront(el)
-		h.mu.Unlock()
-		return el.Value.(*httpBlock), nil
-	}
-	if f, ok := h.pending[index]; ok {
-		h.mu.Unlock()
-		<-f.done
-		return f.block, f.err
-	}
-	f := &httpFetch{done: make(chan struct{})}
-	h.pending[index] = f
-	h.mu.Unlock()
-	data, err := h.fetch(index)
-	h.mu.Lock()
-	delete(h.pending, index)
-	if err != nil {
-		f.err = err
-	} else {
-		f.block = &httpBlock{index: index, data: data}
-		h.blocks[index] = h.lru.PushFront(f.block)
-		for h.lru.Len() > httpCacheBlocks {
-			oldest := h.lru.Back()
-			delete(h.blocks, oldest.Value.(*httpBlock).index)
-			h.lru.Remove(oldest)
-		}
-	}
-	h.mu.Unlock()
-	close(f.done)
-	return f.block, f.err
 }
 
 // probe requests the first byte, insists on a 206 reply, and returns the resource size from

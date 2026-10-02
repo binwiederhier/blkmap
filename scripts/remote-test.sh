@@ -12,10 +12,12 @@ cd "$root"
 goreleaser release --snapshot --clean >/dev/null 2>&1
 go test -c -o dist/ublk.test ./ublk/
 go test -c -o dist/device.test ./device/
+go build -o dist/rangehttpd ./scripts/rangehttpd
 deb=$(ls dist/blkmap_*_linux_amd64.deb)
-$ssh 'mkdir -p /root/blkmap-test/scripts'
+$ssh 'mkdir -p /root/blkmap-test/scripts /root/blkmap-test/bin'
 scp -q "$deb" dist/ublk.test dist/device.test root@$host:/root/blkmap-test/
-scp -q scripts/e2e.sh scripts/stress.sh scripts/rangehttpd.py scripts/mkraid5.py root@$host:/root/blkmap-test/scripts/
+scp -q dist/rangehttpd root@$host:/root/blkmap-test/bin/
+scp -q scripts/e2e.sh scripts/stress.sh scripts/mkraid5.py root@$host:/root/blkmap-test/scripts/
 $ssh "set -e; cd /root/blkmap-test; modprobe ublk_drv; dpkg -i $(basename "$deb") >/dev/null; echo '== ublk tests'; ./ublk.test 2>&1 | tail -3; echo '== device tests'; ./device.test 2>&1 | tail -3; echo '== e2e'; scripts/e2e.sh 2>&1 | grep -E 'OK|FAIL|rror' | tail -4"
 if [ "${2:-}" = "stress" ]; then
   $ssh "cd /root/blkmap-test && scripts/stress.sh >/dev/null 2>&1; cat /var/tmp/blkmap-stress/results.txt"
