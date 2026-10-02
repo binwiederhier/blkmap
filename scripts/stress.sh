@@ -10,7 +10,7 @@ OUT=${OUT:-$dir/results.txt}
 me="$(cd "$(dirname "$0")" && pwd)"
 cleanup() {
   umount $mnt 2>/dev/null || true
-  for id in s-mix s-raid s-big s-4k s-hyd; do systemctl stop blkmap@$id 2>/dev/null || true; done
+  for id in s-mix s-raid s-big s-4k s-hyd s-sparse; do systemctl stop blkmap@$id 2>/dev/null || true; done
   systemctl reset-failed 'blkmap@*' 2>/dev/null || true
   [ -n "${httpd:-}" ] && kill $httpd 2>/dev/null || true
 }
@@ -28,7 +28,7 @@ head -c $((64<<20)) /dev/urandom > $dir/img64.img
 head -c $((24<<20)) /dev/urandom > $dir/raid.img
 python3 $me/mkraid5.py $dir/raid.img 65536 $dir 4
 fuser -k 18099/tcp >/dev/null 2>&1 || true
-python3 $me/rangehttpd.py $dir 18099 & httpd=$!
+python3 $me/rangehttpd.py $dir 18099 $dir/bytes.log & httpd=$!
 sleep 1
 
 cat > /etc/blkmap/s-mix.yml <<YML
@@ -180,6 +180,33 @@ systemctl start blkmap@s-hyd
 journalctl -u blkmap@s-hyd $since --no-pager -o cat | grep -q 'fully hydrated' && echo "  restarted without its sources (fully hydrated)" | tee -a $OUT
 cmp <(dd if=/dev/blkmap/s-hyd bs=1M skip=4 status=none) $dir/origin.gone && echo "  detached content OK" | tee -a $OUT
 systemctl stop blkmap@s-hyd
+
+# --- sparse image over http with a map: hydration transfers only the data (s-sparse) ---
+echo "== sparse image + map over http (s-sparse)" | tee -a $OUT
+truncate -s 1G $dir/sparse.img
+dd if=/dev/urandom of=$dir/sparse.img bs=1M count=8 seek=100 conv=notrunc status=none   # 8 MiB of data at 100 MiB
+dd if=/dev/urandom of=$dir/sparse.img bs=1M count=4 seek=900 conv=notrunc status=none   # 4 MiB at 900 MiB
+blkmap map $dir/sparse.img > $dir/sparse.img.map
+grep -c . $dir/sparse.img.map | sed 's/^/  map lines: /' | tee -a $OUT
+cat > /etc/blkmap/s-sparse.yml <<YML
+segments:
+  - type: http
+    url: http://localhost:18099/sparse.img
+hydrate:
+  concurrency: 4
+  report-every: 2s
+YML
+: > $dir/bytes.log
+systemctl start blkmap@s-sparse
+for i in $(seq 1 120); do journalctl -u blkmap@s-sparse $since --no-pager -o cat | grep -q 'hydration done' && break; sleep 1; done
+journalctl -u blkmap@s-sparse $since --no-pager -o cat | grep 'hydration done' | sed 's/^/  /' | tee -a $OUT
+cmp <(dd if=/dev/blkmap/s-sparse bs=1M skip=100 count=8 status=none) <(dd if=$dir/sparse.img bs=1M skip=100 count=8 status=none) && echo "  data region content OK" | tee -a $OUT
+cmp <(dd if=/dev/blkmap/s-sparse bs=1M skip=500 count=8 status=none) <(head -c $((8<<20)) /dev/zero) && echo "  hole region reads zeros" | tee -a $OUT
+sent=$(awk '{s+=$1} END {print s+0}' $dir/bytes.log)
+echo "  bytes over http while hydrating a 1 GiB image with 12 MiB of data: $((sent/1048576)) MiB" | tee -a $OUT
+[ $sent -lt $((32<<20)) ] && echo "  hydration transferred only the data, not the holes" | tee -a $OUT
+echo "  cow file allocated: $(du -h /var/lib/blkmap/s-sparse.cow | cut -f1)" | tee -a $OUT
+systemctl stop blkmap@s-sparse
 
 # --- stop while mounted: data is flushed before deletion waits; the unit's stop timeout
 # kills the daemon, the next start cleans up the dead device ---

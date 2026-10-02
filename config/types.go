@@ -82,6 +82,10 @@ type Segment struct {
 	// custom only: the registered constructor and its parameters
 	Name   string
 	Params map[string]string
+
+	// Map is a path or URL of a data-extent map for this source (any type); everything
+	// not listed reads as zeros and is never fetched.
+	Map string
 }
 
 // rawConfig mirrors the YAML file; sizes are strings so they can carry K/M/G suffixes.
@@ -125,4 +129,5 @@ type rawSegment struct {
 	Slow         *rawSegment       `yaml:"slow"`
 	Name         string            `yaml:"name"`
 	Params       map[string]string `yaml:"params"`
+	Map          string            `yaml:"map"`
 }

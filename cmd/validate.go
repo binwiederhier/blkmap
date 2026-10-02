@@ -55,7 +55,7 @@ func execValidate(c *cli.Context) error {
 			fmt.Fprintf(w, "  %s\t%s\tgap (zeros)\n", util.FormatSize(pos), util.FormatSize(s.Offset-pos))
 		}
 		cs := conf.Segments[i]
-		fmt.Fprintf(w, "  %s\t%s\t%s\n", util.FormatSize(s.Offset), util.FormatSize(s.Source.Size()), describe(cs))
+		fmt.Fprintf(w, "  %s\t%s\t%s%s\n", util.FormatSize(s.Offset), util.FormatSize(s.Source.Size()), describe(cs), describeMap(s.Source))
 		for j, m := range cs.Members {
 			fmt.Fprintf(w, "  \tmember %d\t%s\n", j, describeNested(m))
 		}
@@ -108,6 +108,15 @@ func describeNested(s *config.Segment) string {
 		out += fmt.Sprintf(" (offset %s)", util.FormatSize(s.SourceOffset))
 	}
 	return out
+}
+
+// describeMap notes an attached map (configured or probed) and how much of the source is data.
+func describeMap(s source.Source) string {
+	m, ok := s.(*source.Mapped)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(" (map: %d extents, %s data of %s)", len(m.Map().Extents()), util.FormatSize(m.Map().DataBytes()), util.FormatSize(s.Size()))
 }
 
 // describeHydrate summarizes the hydration plan, reading the prefetch list to validate it.

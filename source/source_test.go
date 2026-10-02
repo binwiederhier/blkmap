@@ -1,7 +1,10 @@
 package source
 
 import (
+	"bytes"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -137,4 +140,59 @@ segments:
 	_, err = FromConfig(c)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "segment 0: fast:")
+}
+
+func TestFromConfigMaps(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	img := filepath.Join(dir, "img")
+	data := bytes.Repeat([]byte{0xaa}, 16<<10) // garbage everywhere; the map says only 4K..8K is data
+	copy(data[4096:8192], pattern(4096))
+	require.NoError(t, os.WriteFile(img, data, 0600))
+	require.NoError(t, os.WriteFile(img+".map", []byte("4K 4K\n"), 0600))
+	srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	t.Cleanup(srv.Close)
+	// Explicit map on a file source with a source-offset: map coordinates are the file's
+	c, err := config.Parse("m", []byte(`
+segments:
+  - type: file
+    path: `+img+`
+    source-offset: 2K
+    map: `+img+`.map
+  - type: http
+    url: `+srv.URL+`/img
+`))
+	require.NoError(t, err)
+	src, err := FromConfig(c)
+	require.NoError(t, err)
+	t.Cleanup(func() { src.Close() })
+	expected := make([]byte, 14<<10)
+	copy(expected[2048:6144], pattern(4096))
+	expected = append(expected, make([]byte, 16<<10)...)
+	copy(expected[14<<10+4096:], pattern(4096))
+	got := make([]byte, src.Size())
+	_, err = src.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, expected, got)
+	// Both segments report holes: the file from its explicit map, the http source from
+	// the <url>.map it probed
+	holes, err := Holes(src, 0, src.Size())
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{0, 2048}, {6144, 8192}, {14 << 10, 4096}, {14<<10 + 8192, 8192}}, holes)
+	// Without a sidecar the http source reports nothing
+	require.NoError(t, os.Remove(img+".map"))
+	c, err = config.Parse("m", []byte("segments:\n  - type: http\n    url: "+srv.URL+"/img\n"))
+	require.NoError(t, err)
+	src2, err := FromConfig(c)
+	require.NoError(t, err)
+	t.Cleanup(func() { src2.Close() })
+	holes, err = Holes(src2, 0, src2.Size())
+	require.NoError(t, err)
+	assert.Nil(t, holes)
+	// A configured map that cannot be loaded is an error naming the segment
+	c, err = config.Parse("m", []byte("segments:\n  - type: file\n    path: "+img+"\n    map: "+dir+"/missing.map\n"))
+	require.NoError(t, err)
+	_, err = FromConfig(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "segment 0: map")
 }

@@ -16,6 +16,7 @@ func New(version, commit, date string) *cli.App {
 		Commands: []*cli.Command{
 			cmdServe,
 			cmdValidate,
+			cmdMap,
 		},
 		Version:         fmt.Sprintf("%s (%s, %s)", version, commit, date),
 		HideHelpCommand: true,

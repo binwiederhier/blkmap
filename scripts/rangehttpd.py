@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Minimal static file server with HTTP Range support, for blkmap's e2e script (python's
 # stock http.server answers Range requests with 200 + the whole body, which blkmap rejects).
-# Usage: rangehttpd.py DIR PORT
+# Usage: rangehttpd.py DIR PORT [BYTES_LOG]   (BYTES_LOG receives one line per response: bytes sent)
 import os
 import sys
 from http.server import SimpleHTTPRequestHandler, HTTPServer
@@ -38,11 +38,17 @@ class RangeHandler(SimpleHTTPRequestHandler):
         limit = getattr(self, "_limit", None)
         if limit is None:
             return super().copyfile(source, outputfile)
-        outputfile.write(source.read(limit))
+        data = source.read(limit)
+        outputfile.write(data)
+        if BYTES_LOG:
+            with open(BYTES_LOG, "a") as f:
+                f.write("%d\n" % len(data))
 
     def log_message(self, *args):
         pass
 
+
+BYTES_LOG = sys.argv[3] if len(sys.argv) > 3 else None
 
 if __name__ == "__main__":
     os.chdir(sys.argv[1])

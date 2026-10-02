@@ -13,6 +13,8 @@ import (
 const (
 	// httpTimeout bounds one block fetch; blocks are 1 MiB so this is generous.
 	httpTimeout = 60 * time.Second
+	// mapSuffix is probed next to an http image when no map is configured.
+	mapSuffix = ".map"
 )
 
 var (
@@ -100,8 +102,44 @@ func FromConfig(c *config.Config) (*Concat, error) {
 	return concat, nil
 }
 
-// open creates the Source for one config segment.
+// open creates the Source for one config segment, attaching its map if it has one.
 func open(s *config.Segment) (Source, error) {
+	src, err := openPlain(s)
+	if err != nil {
+		return nil, err
+	}
+	m, err := mapFor(s)
+	if err != nil {
+		src.Close()
+		return nil, err
+	}
+	if m == nil {
+		return src, nil
+	}
+	return WithMap(src, m, s.SourceOffset), nil
+}
+
+// mapFor loads the segment's configured map, or probes <url>.map for an http source.
+func mapFor(s *config.Segment) (*Map, error) {
+	if s.Map != "" {
+		m, err := LoadMap(s.Map)
+		if err != nil {
+			return nil, fmt.Errorf("map: %w", err)
+		}
+		return m, nil
+	}
+	if s.Type != config.SourceHTTP {
+		return nil, nil
+	}
+	m, err := LoadMap(s.URL + mapSuffix)
+	if err != nil {
+		return nil, nil // no sidecar: the source is opaque about holes
+	}
+	return m, nil
+}
+
+// openPlain creates the Source for one config segment without its map.
+func openPlain(s *config.Segment) (Source, error) {
 	switch s.Type {
 	case config.SourceZero:
 		return NewZero(s.Size), nil

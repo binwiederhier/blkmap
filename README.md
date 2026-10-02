@@ -127,15 +127,24 @@ cache; concurrent readers of one block share a single request, and transient fai
 (network errors, 5xx, truncated bodies) are retried twice with backoff. A 404, 410 or 416 is
 reported as `source.ErrNotFound`, which a cache tier treats as a miss.
 
-### Holes
+### Holes and maps
 
 `ReadAt` cannot say "this is a hole"; a source that knows can implement `source.Sparse`,
 `Holes(off, length)`, returning ranges that read as zeros. Files and devices answer from
 `SEEK_HOLE`/`SEEK_DATA` (a reported hole always reads as zeros, so this direction is safe;
 data may contain zeros too), zero segments report themselves, and concat, cache and swappable
-sources compose their parts. HTTP has no standard for it and reports nothing. Hydration
-asks for holes in 4 GiB windows and marks hole chunks in the bitmap without copying, so a
-mostly empty image hydrates without inflating the COW file.
+sources compose their parts. Hydration asks for holes in 4 GiB windows and marks hole chunks
+in the bitmap without copying, so a mostly empty image hydrates without inflating the COW
+file, and without transferring its zeros.
+
+Sources that cannot tell (HTTP, a custom source, a device holding a sparse image) get the
+same from a **map**: a text file of the data extents (`offset length` per line, same format as
+the prefetch list; everything not listed is a hole), produced on the server side with
+`blkmap map disk.img > disk.img.map`. Attach it to any source with `map:` (a path or URL); an
+`http` source also probes `<url>.map` on its own. With a map attached, holes read as zeros
+locally and are never requested, so a 1 TB image holding 100 MB hydrates by moving 100 MB.
+`validate` shows how much of each mapped source is data. From code: `source.WithMap(src,
+m, base)`, `source.LoadMap`, `source.NewMap`.
 
 Writes never touch the sources. They land in the COW file, a sparse raw image of the overlay
 at device offsets, and a bitmap records which chunks are there. Delete both files to reset

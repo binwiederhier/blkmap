@@ -170,7 +170,7 @@ func parseCOW(id string, raw *rawCOW, blockSize int) (*COW, error) {
 // parseSegment parses a top-level segment, or a nested source (raid5 member, cache tier) when
 // nested is set; where is the position used in error messages.
 func parseSegment(where string, raw *rawSegment, blockSize int, nested bool) (*Segment, error) {
-	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL, Layout: raw.Layout, Missing: raw.Missing, Name: raw.Name, Params: raw.Params}
+	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL, Layout: raw.Layout, Missing: raw.Missing, Name: raw.Name, Params: raw.Params, Map: raw.Map}
 	var err error
 	if raw.Offset != "" {
 		if nested {
@@ -204,6 +204,10 @@ func parseSegment(where string, raw *rawSegment, blockSize int, nested bool) (*S
 	}
 	if s.Type != SourceCustom && (raw.Name != "" || len(raw.Params) > 0) {
 		return nil, fmt.Errorf("%w: %s: name and params are only valid for custom segments", errConfig, where)
+	}
+	// A map makes sense for sources that are opaque about holes; zero and raid5 are not
+	if s.Map != "" && (s.Type == SourceZero || s.Type == SourceRAID5 || s.Type == SourceCache) {
+		return nil, fmt.Errorf("%w: %s: map is not valid for %s segments (put it on the tiers or members)", errConfig, where, s.Type)
 	}
 	if s.Type != SourceFile && s.Type != SourceDevice && s.Path != "" {
 		return nil, fmt.Errorf("%w: %s: path is only valid for file and device segments", errConfig, where)

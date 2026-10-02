@@ -49,6 +49,10 @@ segments:
     offset: 5G
     url: https://example.com/disk.img
     size: 2G
+    # Data-extent map of the image (make one with "blkmap map disk.img > disk.img.map" on
+    # the server): holes are read as zeros locally and never fetched, and hydration moves
+    # only the data. Any source type takes "map"; http also probes <url>.map by itself.
+    map: https://example.com/disk.img.map
   # A fast cache in front of a slow origin. Any error from "fast" (a 404 from an HTTP cache,
   # a missing file) falls through to "slow", without retries; the cache is never written.
   # Both tiers accept every source type.

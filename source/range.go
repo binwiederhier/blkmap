@@ -23,6 +23,11 @@ type Range struct {
 // ParsePrefetch reads a prefetch list: one "offset length" range per line (binary size
 // suffixes allowed), '#' comments, highest priority first.
 func ParsePrefetch(r io.Reader) ([]Range, error) {
+	return parseRanges(r, "prefetch list")
+}
+
+// parseRanges reads "offset length" lines; what names the file kind in errors.
+func parseRanges(r io.Reader, what string) ([]Range, error) {
 	var ranges []Range
 	scanner := bufio.NewScanner(r)
 	for n := 1; scanner.Scan(); n++ {
@@ -35,18 +40,18 @@ func ParsePrefetch(r io.Reader) ([]Range, error) {
 			continue
 		}
 		if len(fields) != 2 {
-			return nil, fmt.Errorf("prefetch list line %d: expected \"offset length\", got %q", n, line)
+			return nil, fmt.Errorf("%s line %d: expected \"offset length\", got %q", what, n, line)
 		}
 		offset, err := util.ParseSize(fields[0])
 		if err != nil {
-			return nil, fmt.Errorf("prefetch list line %d: offset: %w", n, err)
+			return nil, fmt.Errorf("%s line %d: offset: %w", what, n, err)
 		}
 		length, err := util.ParseSize(fields[1])
 		if err != nil {
-			return nil, fmt.Errorf("prefetch list line %d: length: %w", n, err)
+			return nil, fmt.Errorf("%s line %d: length: %w", what, n, err)
 		}
 		if length == 0 {
-			return nil, fmt.Errorf("prefetch list line %d: length must be positive", n)
+			return nil, fmt.Errorf("%s line %d: length must be positive", what, n)
 		}
 		ranges = append(ranges, Range{Offset: offset, Length: length})
 	}

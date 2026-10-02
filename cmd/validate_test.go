@@ -120,3 +120,15 @@ hydrate:
 	assert.Regexp(t, `slow\s+file `+dir+`/slow\n`, out)
 	assert.Contains(t, out, "Hydrate: 1 prefetch ranges from "+dir+"/list, then the rest at 20M/s, cache never")
 }
+
+func TestValidateShowsMap(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "img")
+	require.NoError(t, os.WriteFile(img, make([]byte, 1<<20), 0600))
+	require.NoError(t, os.WriteFile(img+".map", []byte("0 64K\n512K 128K\n"), 0600))
+	path := filepath.Join(dir, "m.yml")
+	require.NoError(t, os.WriteFile(path, []byte("segments:\n  - type: file\n    path: "+img+"\n    map: "+img+".map\n"), 0600))
+	app, stdout, _ := newTestApp()
+	require.NoError(t, app.Run([]string{"blkmap", "validate", path}))
+	assert.Regexp(t, `file `+img+` \(map: 2 extents, 192K data of 1M\)`, stdout.String())
+}

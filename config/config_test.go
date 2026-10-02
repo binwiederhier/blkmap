@@ -330,3 +330,28 @@ hydrate:
 		assert.Contains(t, err.Error(), "hydrate")
 	}
 }
+
+func TestParseMap(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("m", []byte(`
+segments:
+  - type: http
+    url: https://origin/img.raw
+    map: https://origin/img.raw.map
+  - type: cache
+    fast: {type: file, path: /fast, map: /fast.map}
+    slow: {type: custom, name: x, size: 1G, map: /x.map}
+  - type: zero
+    size: 1M
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "https://origin/img.raw.map", c.Segments[0].Map)
+	assert.Equal(t, "/fast.map", c.Segments[1].Fast.Map)
+	assert.Equal(t, "/x.map", c.Segments[1].Slow.Map)
+	_, err = Parse("m", []byte("segments:\n  - type: zero\n    size: 1M\n    map: /z.map\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "map is not valid for zero")
+	_, err = Parse("m", []byte("segments:\n  - type: raid5\n    map: /r.map\n    members:\n      - type: file\n        path: /a\n      - type: file\n        path: /b\n      - type: file\n        path: /c\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "map is not valid for raid5")
+}
