@@ -1,0 +1,272 @@
+package device
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"sync"
+
+	"heckel.io/blkmap/cow"
+	"heckel.io/blkmap/source"
+)
+
+// Alias declares that [Offset, Offset+Length) of a device is a view of
+// [TargetOffset, TargetOffset+Length) of another device in the same group: reads and writes
+// there go to the target's store, so both devices always show the same bytes and a write
+// through either is stored once. A mirror's second plex is an alias of its first.
+type Alias struct {
+	Offset       int64
+	Length       int64
+	Target       string // device id within the group
+	TargetOffset int64
+}
+
+// GroupOptions describes one device of a group: Options plus its aliases into siblings.
+type GroupOptions struct {
+	Options
+	Aliases []Alias
+	// ElideIdenticalWrites drops writes whose bytes equal what the device already reads
+	// there (see cow.Store.SetElision).
+	ElideIdenticalWrites bool
+}
+
+// Group is a set of devices served by one process whose bases may read each other through
+// their live views and whose ranges may alias each other.
+type Group struct {
+	Devices map[string]*Device
+	order   []string
+}
+
+// ServeGroup opens every device's store, binds the sources that read siblings, then brings
+// the kernel devices up. Any failure closes what was opened. ServeGroup owns every Base.
+func ServeGroup(ctx context.Context, opts []*GroupOptions) (*Group, error) {
+	if len(opts) == 0 {
+		return nil, errors.New("a group needs at least one device")
+	}
+	routers := make(map[string]*router, len(opts))
+	closeStores := func() {
+		for id, r := range routers {
+			closeStore(id, r.store, r.pred)
+		}
+	}
+	for _, o := range opts {
+		if _, dup := routers[o.ID]; dup {
+			closeStores()
+			return nil, fmt.Errorf("duplicate device id %q", o.ID)
+		}
+		if o.Hydrate != nil && len(o.Aliases) > 0 {
+			closeStores()
+			return nil, fmt.Errorf("%s: hydration and aliases cannot be combined", o.ID)
+		}
+		store, pred, err := openStore(&o.Options)
+		if err != nil {
+			closeStores()
+			return nil, fmt.Errorf("%s: %w", o.ID, err)
+		}
+		store.SetElision(o.ElideIdenticalWrites)
+		routers[o.ID] = &router{id: o.ID, store: store, pred: pred}
+	}
+	for _, o := range opts {
+		if err := routers[o.ID].setAliases(o.Aliases, routers); err != nil {
+			closeStores()
+			return nil, fmt.Errorf("%s: %w", o.ID, err)
+		}
+	}
+	lookup := source.Lookup(func(id string) (io.ReaderAt, bool) {
+		r, ok := routers[id]
+		return r, ok
+	})
+	for _, o := range opts {
+		if b, ok := o.Base.(source.Binder); ok {
+			b.Bind(lookup)
+		}
+	}
+	g := &Group{Devices: make(map[string]*Device, len(opts))}
+	for _, o := range opts {
+		d, err := serveStore(ctx, &o.Options, routers[o.ID].store, routers[o.ID].pred, routers[o.ID])
+		if err != nil {
+			g.Close()
+			for id, r := range routers { // stores of devices that never came up
+				if _, up := g.Devices[id]; !up {
+					closeStore(id, r.store, r.pred)
+				}
+			}
+			return nil, fmt.Errorf("%s: %w", o.ID, err)
+		}
+		g.Devices[o.ID] = d
+		g.order = append(g.order, o.ID)
+	}
+	return g, nil
+}
+
+// Close shuts the devices down in reverse order of creation.
+func (g *Group) Close() error {
+	var errs []error
+	for i := len(g.order) - 1; i >= 0; i-- {
+		if d := g.Devices[g.order[i]]; d != nil {
+			errs = append(errs, d.Close())
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// router is the I/O entry point of one group device: ranges covered by an alias go to the
+// target device's router, everything else to the device's own store.
+type router struct {
+	id      string
+	store   *cow.Store
+	pred    *predecessor // the kernel device a previous server left for recovery, until serveStore takes it
+	aliases []alias
+	targets []*router // every distinct alias target, for Flush
+	mu      sync.Mutex
+}
+
+type alias struct {
+	Alias
+	target *router
+}
+
+func (r *router) setAliases(aliases []Alias, routers map[string]*router) error {
+	size := r.store.Size()
+	sorted := make([]alias, 0, len(aliases))
+	seen := map[*router]bool{}
+	for _, a := range aliases {
+		if a.Length <= 0 || a.Offset < 0 || a.Offset+a.Length > size {
+			return fmt.Errorf("alias [%d, %d) is outside the device (size %d)", a.Offset, a.Offset+a.Length, size)
+		}
+		t, ok := routers[a.Target]
+		if !ok {
+			return fmt.Errorf("alias target %q is not in the group", a.Target)
+		}
+		if t == r {
+			return errors.New("a device cannot alias itself")
+		}
+		if a.TargetOffset < 0 || a.TargetOffset+a.Length > t.store.Size() {
+			return fmt.Errorf("alias target range [%d, %d) is outside %s (size %d)", a.TargetOffset, a.TargetOffset+a.Length, a.Target, t.store.Size())
+		}
+		sorted = append(sorted, alias{Alias: a, target: t})
+		if !seen[t] {
+			seen[t] = true
+			r.targets = append(r.targets, t)
+		}
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Offset < sorted[j].Offset })
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i].Offset < sorted[i-1].Offset+sorted[i-1].Length {
+			return fmt.Errorf("aliases [%d, %d) and [%d, %d) overlap", sorted[i-1].Offset, sorted[i-1].Offset+sorted[i-1].Length, sorted[i].Offset, sorted[i].Offset+sorted[i].Length)
+		}
+	}
+	r.aliases = sorted
+	return nil
+}
+
+// piece is one part of a request: either in an alias (target set) or in the own store.
+type piece struct {
+	off, length int64 // in the request's device
+	target      *router
+	targetOff   int64
+}
+
+// split cuts [off, off+length) into pieces at alias boundaries.
+func (r *router) split(off, length int64) []piece {
+	var pieces []piece
+	i := sort.Search(len(r.aliases), func(i int) bool { return r.aliases[i].Offset+r.aliases[i].Length > off })
+	for length > 0 {
+		if i >= len(r.aliases) || r.aliases[i].Offset >= off+length {
+			pieces = append(pieces, piece{off: off, length: length})
+			break
+		}
+		a := r.aliases[i]
+		if a.Offset > off {
+			n := a.Offset - off
+			pieces = append(pieces, piece{off: off, length: n})
+			off, length = off+n, length-n
+		}
+		n := min(length, a.Offset+a.Length-off)
+		pieces = append(pieces, piece{off: off, length: n, target: a.target, targetOff: a.TargetOffset + (off - a.Offset)})
+		off, length = off+n, length-n
+		i++
+	}
+	return pieces
+}
+
+func (r *router) ReadAt(p []byte, off int64) (int, error) {
+	n := 0
+	for _, pc := range r.split(off, int64(len(p))) {
+		buf := p[pc.off-off : pc.off-off+pc.length]
+		var m int
+		var err error
+		if pc.target != nil {
+			m, err = pc.target.ReadAt(buf, pc.targetOff)
+		} else {
+			m, err = r.store.ReadAt(buf, pc.off)
+		}
+		n += m
+		if err != nil && !(errors.Is(err, io.EOF) && m == len(buf)) {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func (r *router) WriteAt(p []byte, off int64) (int, error) {
+	n := 0
+	for _, pc := range r.split(off, int64(len(p))) {
+		buf := p[pc.off-off : pc.off-off+pc.length]
+		var m int
+		var err error
+		if pc.target != nil {
+			m, err = pc.target.WriteAt(buf, pc.targetOff)
+		} else {
+			m, err = r.store.WriteAt(buf, pc.off)
+		}
+		n += m
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func (r *router) Size() int64 { return r.store.Size() }
+
+// Flush makes the own store and every alias target durable.
+func (r *router) Flush() error {
+	errs := []error{r.store.Flush()}
+	for _, t := range r.targets {
+		errs = append(errs, t.Flush())
+	}
+	return errors.Join(errs...)
+}
+
+func (r *router) Discard(off, length int64) error {
+	for _, pc := range r.split(off, length) {
+		var err error
+		if pc.target != nil {
+			err = pc.target.Discard(pc.targetOff, pc.length)
+		} else {
+			err = r.store.Discard(pc.off, pc.length)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *router) WriteZeroes(off, length int64) error {
+	for _, pc := range r.split(off, length) {
+		var err error
+		if pc.target != nil {
+			err = pc.target.WriteZeroes(pc.targetOff, pc.length)
+		} else {
+			err = r.store.WriteZeroes(pc.off, pc.length)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}

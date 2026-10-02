@@ -30,8 +30,8 @@ const (
 	// RunDir holds per-device runtime state (ublk id and server pid, the live bitmap, the
 	// status socket), so a restarted server can re-attach to the device it left behind.
 	RunDir        = "/run/blkmap"
-	devDirMode    = 0755
-	stateFileMode = 0600
+	devDirMode    = 0o755
+	stateFileMode = 0o600
 	// flushInterval bounds how long a completed write can sit without reaching disk when
 	// the guest never issues a flush (raw dd, no filesystem).
 	flushInterval = 5 * time.Second
@@ -144,35 +144,38 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 // from here on, even when it fails. The context only guards setup; the device lives until
 // Close.
 func Serve(ctx context.Context, o *Options) (*Device, error) {
-	if o.Base == nil {
-		return nil, errors.New("a base source is required")
-	}
-	if err := ctx.Err(); err != nil {
-		o.Base.Close()
+	store, pred, err := openStore(o)
+	if err != nil {
 		return nil, err
+	}
+	d, err := serveStore(ctx, o, store, pred, store)
+	if err != nil {
+		closeStore(o.ID, store, pred)
+		return nil, err
+	}
+	return d, nil
+}
+
+// openStore validates the options, fills their defaults, claims the ID in this process, takes
+// over a predecessor device and opens the COW store over the base; it owns o.Base from here
+// on. What it returns is released with closeStore until a Device owns it.
+func openStore(o *Options) (*cow.Store, *predecessor, error) {
+	if o.Base == nil {
+		return nil, nil, errors.New("a base source is required")
 	}
 	if !config.ValidID(o.ID) {
 		o.Base.Close()
-		return nil, fmt.Errorf("invalid device id %q", o.ID)
+		return nil, nil, fmt.Errorf("invalid device id %q", o.ID)
 	}
 	if o.COWFile == "" {
 		o.Base.Close()
-		return nil, errors.New("a cow file is required")
+		return nil, nil, errors.New("a cow file is required")
 	}
 	o.defaults()
 	if !markServed(o.ID) {
 		o.Base.Close()
-		return nil, fmt.Errorf("%s is already served by this process", o.ID)
+		return nil, nil, fmt.Errorf("%s is already served by this process", o.ID)
 	}
-	d, err := serve(o)
-	if err != nil {
-		unmarkServed(o.ID)
-	}
-	return d, err
-}
-
-// serve is Serve once the options are complete and the ID is claimed in this process.
-func serve(o *Options) (*Device, error) {
 	if o.Recovery && !recoverySupported() {
 		log.Printf("%s: the kernel lacks ublk user recovery; a crash fails I/O instead of pausing it", o.ID)
 		o.Recovery = false
@@ -181,13 +184,16 @@ func serve(o *Options) (*Device, error) {
 	pred, err := takeOver(o, statePath)
 	if err != nil {
 		o.Base.Close()
-		return nil, err
+		unmarkServed(o.ID)
+		return nil, nil, err
 	}
 	livePath := ""
 	if o.Recovery {
 		if err := os.MkdirAll(o.RunDir, devDirMode); err != nil {
 			o.Base.Close()
-			return nil, err
+			pred.drop(o.ID)
+			unmarkServed(o.ID)
+			return nil, nil, err
 		}
 		livePath = filepath.Join(o.RunDir, o.ID+liveBitmapExt)
 	}
@@ -195,9 +201,28 @@ func serve(o *Options) (*Device, error) {
 	if err != nil {
 		o.Base.Close()
 		pred.drop(o.ID)
+		unmarkServed(o.ID)
+		return nil, nil, err
+	}
+	return store, pred, nil
+}
+
+// closeStore releases what openStore returned when no Device came to own it.
+func closeStore(id string, store *cow.Store, pred *predecessor) {
+	store.Close()
+	pred.drop(id)
+	unmarkServed(id)
+}
+
+// serveStore brings up the kernel device for an opened store, re-attaching to the predecessor
+// when there is one; io is what the kernel talks to (the store itself, or a group router in
+// front of it). The caller releases the store on failure.
+func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predecessor, io target) (*Device, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	b := &backend{store: store, id: o.ID}
+	statePath := filepath.Join(o.RunDir, o.ID)
+	b := &backend{store: io, id: o.ID}
 	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery}
 	dev, err := pred.recover(o.ID, params)
 	recovered := dev != nil
@@ -205,7 +230,6 @@ func serve(o *Options) (*Device, error) {
 		dev, err = ublk.Create(params)
 	}
 	if err != nil {
-		store.Close()
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
 	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev,
@@ -259,6 +283,12 @@ func (o *Options) defaults() {
 	if o.RunDir == "" {
 		o.RunDir = RunDir
 	}
+}
+
+// Writeback commits the device's overlay into dst, see cow.Store.Writeback. It is for a
+// device that is done serving: writes that arrive meanwhile may or may not be included.
+func (d *Device) Writeback(dst io.WriterAt) (int64, error) {
+	return d.store.Writeback(dst)
 }
 
 // flushLoop makes completed writes durable every flushInterval, for guests that never

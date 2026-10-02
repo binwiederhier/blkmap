@@ -3,6 +3,7 @@
 package cow
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -64,6 +65,7 @@ type Store struct {
 	chunkSize int64
 	size      int64
 	dirty     atomic.Bool  // something changed since the last Flush
+	elide     atomic.Bool  // drop writes whose bytes equal what the device already reads there
 	bufs      sync.Pool    // chunk-sized scratch buffers for read-modify-write
 	runBufs   sync.Pool    // MaxRunBytes buffers for hydration runs
 	srcReads  atomic.Int64 // base reads, for SourceStats
@@ -293,6 +295,43 @@ func (s *Store) Close() error {
 	return errors.Join(err, s.cow.Close(), closeBitmap(), s.base.Close())
 }
 
+// Writeback copies every chunk the overlay holds into dst at its device offset, committing the
+// overlay to a writable copy of the base: for a server whose device was a scratch view of
+// files that must end up holding the result. It flushes first and leaves the overlay as it is,
+// so the device keeps reading what it read before. Chunks that were hole-punched are written
+// as zeros.
+func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
+	if err := s.Flush(); err != nil {
+		return 0, err
+	}
+	buf := make([]byte, s.chunkSize)
+	var n int64
+	for chunk := int64(0); chunk < s.bitmap.Chunks(); chunk++ {
+		if !s.bitmap.Test(chunk) {
+			continue
+		}
+		start := chunk * s.chunkSize
+		length := min(s.chunkSize, s.size-start)
+		if _, err := s.cow.ReadAt(buf[:length], start); err != nil && !errors.Is(err, io.EOF) {
+			return n, fmt.Errorf("read chunk %d from the cow file: %w", chunk, err)
+		}
+		if _, err := dst.WriteAt(buf[:length], start); err != nil {
+			return n, fmt.Errorf("write back chunk %d: %w", chunk, err)
+		}
+		n++
+	}
+	return n, nil
+}
+
+// SetElision turns write elision on or off: with it on, a write whose bytes equal what the
+// device already returns for that range (from the COW file or the base) is dropped. That
+// costs one read per write and saves the copy-up and the space for guests that rewrite what
+// is already there, such as a RAID resynchronisation after a crash-consistent snapshot, the
+// way ZFS nopwrite skips rewrites of identical blocks.
+func (s *Store) SetElision(on bool) {
+	s.elide.Store(on)
+}
+
 // writeChunk writes p, which lies entirely within chunk, at device offset off. The first
 // write to a chunk that does not cover it entirely first copies the chunk from base, so
 // the COW file always holds whole chunks and the bitmap stays exact.
@@ -302,13 +341,33 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	mu := &s.locks[chunk%lockStripes]
 	mu.Lock()
 	defer mu.Unlock()
-	if !s.bitmap.Test(chunk) && int64(len(p)) < length {
+	written := s.bitmap.Test(chunk)
+	elide := s.elide.Load()
+	var buf []byte // the whole chunk from base, when a copy-up or an elision check needs it
+	if !written && (int64(len(p)) < length || elide) {
 		scratch := s.bufs.Get().(*[]byte)
 		defer s.bufs.Put(scratch)
-		buf := (*scratch)[:length]
+		buf = (*scratch)[:length]
 		if _, err := s.readBase(buf, start); err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("copy chunk %d from base: %w", chunk, err)
 		}
+	}
+	if elide {
+		same := false
+		if written {
+			scratch := s.bufs.Get().(*[]byte)
+			cur := (*scratch)[:len(p)]
+			_, err := s.cow.ReadAt(cur, off)
+			same = err == nil && bytes.Equal(cur, p)
+			s.bufs.Put(scratch)
+		} else {
+			same = bytes.Equal(buf[off-start:off-start+int64(len(p))], p)
+		}
+		if same {
+			return nil
+		}
+	}
+	if !written && int64(len(p)) < length {
 		copy(buf[off-start:], p)
 		if _, err := s.cow.WriteAt(buf, start); err != nil {
 			return err
@@ -362,7 +421,9 @@ func (s *Store) WriteZeroes(off, length int64) error {
 		if off == chunkStart && m == chunkEnd-chunkStart {
 			mu := &s.locks[chunk%lockStripes]
 			mu.Lock()
-			if err = s.punch(chunk); err == nil {
+			if s.elide.Load() && !s.bitmap.Test(chunk) && s.baseIsZero(chunkStart, m) {
+				// the base already reads as zeros there: nothing to record
+			} else if err = s.punch(chunk); err == nil {
 				s.bitmap.Set(chunk)
 				s.dirty.Store(true)
 			}
@@ -379,6 +440,26 @@ func (s *Store) WriteZeroes(off, length int64) error {
 		off += m
 	}
 	return nil
+}
+
+// baseIsZero reports whether the base reads as zeros over [start, start+length): from its
+// hole map when it has one, else by reading it. Callers hold the chunk lock.
+func (s *Store) baseIsZero(start, length int64) bool {
+	if holes, err := source.Holes(s.base, start, length); err == nil && len(holes) == 1 && holes[0].Offset == start && holes[0].Length == length {
+		return true
+	}
+	scratch := s.bufs.Get().(*[]byte)
+	defer s.bufs.Put(scratch)
+	buf := (*scratch)[:length]
+	if _, err := s.base.ReadAt(buf, start); err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+	for _, b := range buf {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // punch deallocates chunk in the COW file; it reads back as zeros. Callers hold the lock.
