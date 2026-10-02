@@ -8,4 +8,5 @@ if [ "$1" = "configure" ] || [ "$1" -ge 1 ]; then
   if [ -d /run/systemd/system ]; then
     systemctl --system daemon-reload >/dev/null || true
   fi
+  udevadm control --reload-rules 2>/dev/null || true
 fi

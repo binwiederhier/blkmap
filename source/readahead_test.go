@@ -1,6 +1,7 @@
 package source
 
 import (
+	"io"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func TestReadAhead(t *testing.T) {
 	tail := make([]byte, 200)
 	n, err := r.ReadAt(tail, 16*cacheBlockSize)
 	assert.Equal(t, 100, n)
-	assert.ErrorIs(t, err, errEOFSentinel())
+	assert.ErrorIs(t, err, io.EOF)
 	assert.Equal(t, inner.data[16*cacheBlockSize:], tail[:100])
 	// Direct reads bypass the cache
 	time.Sleep(50 * time.Millisecond) // let the read-ahead settle before counting

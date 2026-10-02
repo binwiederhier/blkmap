@@ -1,0 +1,3 @@
+# Name ublk disks served by blkmap: /dev/blkmap/<id>. blkmap creates the link itself too,
+# but systemd only makes .device units (which fstab mounts wait for) from udev's links.
+SUBSYSTEM=="block", KERNEL=="ublkb[0-9]*", ENV{DEVTYPE}=="disk", ACTION!="remove", PROGRAM="/usr/bin/blkmap udev-name %k", SYMLINK+="blkmap/%c"

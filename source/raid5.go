@@ -109,6 +109,15 @@ func (r *RAID5) Size() int64 {
 }
 
 // Close closes every present member and returns the first error.
+// Abort aborts every present member.
+func (r *RAID5) Abort() {
+	for _, m := range r.members {
+		if m != nil {
+			Abort(m)
+		}
+	}
+}
+
 func (r *RAID5) Close() error {
 	var errs []error
 	for _, m := range r.members {

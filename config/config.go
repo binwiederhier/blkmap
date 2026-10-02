@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -128,19 +129,10 @@ func decode(content []byte) (*rawConfig, error) {
 	raw := &rawConfig{}
 	dec := yaml.NewDecoder(bytes.NewReader(content))
 	dec.KnownFields(true)
-	if err := dec.Decode(raw); err != nil && !errors.Is(err, errEOF(err)) {
+	if err := dec.Decode(raw); err != nil && !errors.Is(err, io.EOF) { // empty file: zero config, fails validation
 		return nil, err
 	}
 	return raw, nil
-}
-
-// errEOF returns err itself when it is the decoder's end-of-input (empty file), else nil,
-// so an empty config decodes to the zero rawConfig and fails validation with a clear message.
-func errEOF(err error) error {
-	if err != nil && err.Error() == "EOF" {
-		return err
-	}
-	return nil
 }
 
 func parseCOW(id string, raw *rawCOW, blockSize int) (*COW, error) {

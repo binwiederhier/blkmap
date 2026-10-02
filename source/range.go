@@ -12,6 +12,8 @@ import (
 
 const (
 	prefetchComment = "#"
+	// maxRanges bounds a list so a hostile or broken file cannot exhaust memory.
+	maxRanges = 1 << 20
 )
 
 // Range is a byte range of the device address space.
@@ -52,6 +54,9 @@ func parseRanges(r io.Reader, what string) ([]Range, error) {
 		}
 		if length == 0 {
 			return nil, fmt.Errorf("%s line %d: length must be positive", what, n)
+		}
+		if len(ranges) == maxRanges {
+			return nil, fmt.Errorf("%s: more than %d ranges", what, maxRanges)
 		}
 		ranges = append(ranges, Range{Offset: offset, Length: length})
 	}

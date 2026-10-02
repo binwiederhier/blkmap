@@ -44,6 +44,6 @@ for i in $(seq 1 50); do [ -e /dev/blkmap/stitch ] && break; sleep 0.1; done
 mount /dev/blkmap/stitch $mnt
 cat $mnt/hello.txt
 umount $mnt
-ls -la $dir/stitch.cow $dir/stitch.cow.bitmap
+ls -la /var/lib/blkmap/example-stitch.cow /var/lib/blkmap/example-stitch.cow.bitmap
 kill $srv; wait $srv || true; srv=
 echo "done"

@@ -16,7 +16,11 @@ import (
 
 const (
 	// maxRead bounds one Read RPC; blkmap requests are at most 1 MiB.
-	maxRead     = 1 << 20
+	maxRead = 1 << 20
+	// maxExtents bounds the data map an Open reply carries (a 1 TiB file with 1M extents
+	// is already an extreme fragmentation); maxStreams bounds concurrent RPCs per client.
+	maxExtents  = 1 << 20
+	maxStreams  = 64
 	readTimeout = 30 * time.Second
 )
 

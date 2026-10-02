@@ -34,8 +34,3 @@ func window(offset, size, total int64) (int64, error) {
 	}
 	return size, nil
 }
-
-// errEOFSentinel exists so tests can refer to io.EOF without importing io in each file.
-func errEOFSentinel() error {
-	return io.EOF
-}

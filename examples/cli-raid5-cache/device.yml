@@ -4,7 +4,7 @@
 # through to the full copy ("slow", here served over HTTP). Background hydration copies the
 # boot area first, then everything else, bypassing the caches.
 cow:
-  file: /var/tmp/blkmap-example-raid5/raid.cow
+  file: /var/lib/blkmap/example-raid5.cow
 hydrate:
   prefetch-list: /var/tmp/blkmap-example-raid5/prefetch
   rest: true

@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestBitmap(t *testing.T) {
@@ -125,4 +126,17 @@ func BenchmarkBitmap(b *testing.B) {
 			bm.Sync()
 		}
 	})
+}
+
+func TestOpenBitmapPreallocates(t *testing.T) {
+	t.Parallel()
+	// A full cow filesystem must not stop the bitmap from recording what was written, so
+	// the file is allocated up front rather than sparse
+	path := filepath.Join(t.TempDir(), "p.bitmap")
+	b, err := OpenBitmap(path, 1<<30, 4096)
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(path, &st))
+	assert.GreaterOrEqual(t, st.Blocks*512, st.Size)
 }

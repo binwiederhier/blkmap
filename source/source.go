@@ -13,6 +13,9 @@ import (
 const (
 	// httpTimeout bounds one block fetch; blocks are 1 MiB so this is generous.
 	httpTimeout = 60 * time.Second
+	// httpMaxConns bounds the connections one http source opens to its origin, so parallel
+	// dispatch plus read-ahead cannot pile up hundreds of sockets against a slow server.
+	httpMaxConns = 16
 	// mapSuffix is probed next to an http image when no map is configured.
 	mapSuffix = ".map"
 )
@@ -60,6 +63,20 @@ func ReadDirect(s Source, p []byte, off int64) (int, error) {
 		return d.ReadAtDirect(p, off)
 	}
 	return s.ReadAt(p, off)
+}
+
+// Aborter is implemented by sources whose reads can block on something external (a
+// network); Abort makes in-flight and later reads fail at once so a stopping device never
+// waits on them. Containers forward it to their parts.
+type Aborter interface {
+	Abort()
+}
+
+// Abort aborts s if it can be aborted.
+func Abort(s Source) {
+	if a, ok := s.(Aborter); ok {
+		a.Abort()
+	}
 }
 
 // Holes returns the holes of s within [off, off+length), ascending and non-overlapping,
@@ -146,7 +163,7 @@ func openPlain(s *config.Segment) (Source, error) {
 	case config.SourceFile, config.SourceDevice:
 		return OpenFile(s.Path, s.SourceOffset, s.Size)
 	case config.SourceHTTP:
-		return NewHTTP(&http.Client{Timeout: httpTimeout}, s.URL, s.SourceOffset, s.Size)
+		return NewHTTP(newHTTPClient(), s.URL, s.SourceOffset, s.Size)
 	case config.SourceRAID5:
 		return openRAID5(s)
 	case config.SourceCache:
@@ -199,4 +216,13 @@ func openRAID5(s *config.Segment) (Source, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+// newHTTPClient returns the client an http segment uses: a transport of its own with a
+// bounded connection count, and a timeout per fetch.
+func newHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxConnsPerHost = httpMaxConns
+	transport.MaxIdleConnsPerHost = httpMaxConns
+	return &http.Client{Timeout: httpTimeout, Transport: transport}
 }

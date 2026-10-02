@@ -15,6 +15,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -60,7 +61,7 @@ func main() {
 	dev, err := device.Serve(ctx, &device.Options{
 		ID:      *id,
 		Base:    cache,
-		COWFile: "/var/tmp/blkmap-example-" + *id + ".cow",
+		COWFile: filepath.Join(config.DefaultStateDir, "example-"+*id+".cow"),
 		Hydrate: &device.Hydrate{
 			Rest:     true,
 			Rate:     16 << 20,

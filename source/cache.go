@@ -50,7 +50,16 @@ func (c *Cache) ReadAt(p []byte, off int64) (int, error) {
 	if err != nil && !(errors.Is(err, io.EOF) && read == n) {
 		return read, err
 	}
+	if read < n { // the unread rest of p may hold the fast tier's partial answer
+		return read, io.ErrUnexpectedEOF
+	}
 	return n, eof
+}
+
+// Abort aborts both tiers.
+func (c *Cache) Abort() {
+	Abort(c.fast)
+	Abort(c.slow)
 }
 
 // ReadAtDirect reads from the slow source only.

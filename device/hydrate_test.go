@@ -3,6 +3,7 @@ package device
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -212,4 +213,53 @@ func TestHydratorCancel(t *testing.T) {
 		t.Fatal("hydrator did not stop on cancel")
 	}
 	assert.Less(t, s.Written(), int64(300)) // the first run (256 chunks) plus little else
+}
+
+// flaky is a base whose reads fail until a number of attempts have been made.
+type flaky struct {
+	recorder
+	failures  atomic.Int32
+	remaining atomic.Int32
+}
+
+func (f *flaky) ReadAt(p []byte, off int64) (int, error) {
+	if f.remaining.Add(-1) >= 0 {
+		f.failures.Add(1)
+		return 0, errors.New("origin down")
+	}
+	return f.recorder.ReadAt(p, off)
+}
+
+func TestHydratorRetriesFailedRuns(t *testing.T) {
+	t.Parallel()
+	base := &flaky{recorder: recorder{data: pat(hSize)}}
+	base.remaining.Store(3)
+	s := newHydrateStore(t, base)
+	var last Progress
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Concurrency: 2, OnProgress: func(p Progress) { last = p }}, idle)
+	h.retryDelay = time.Millisecond
+	h.run(context.Background())
+	assert.Equal(t, s.Chunks(), s.Written(), "failed runs are retried in a later pass")
+	assert.True(t, last.Done)
+	assert.Equal(t, int64(3), last.Errors)
+	assert.Equal(t, int32(3), base.failures.Load())
+	got := make([]byte, hSize)
+	_, err := s.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, pat(hSize), got)
+}
+
+func TestHydratorGivesUpAfterMaxPasses(t *testing.T) {
+	t.Parallel()
+	base := &flaky{recorder: recorder{data: pat(hSize)}}
+	base.remaining.Store(1 << 30)
+	s := newHydrateStore(t, base)
+	var last Progress
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Concurrency: 1, OnProgress: func(p Progress) { last = p }}, idle)
+	h.retryDelay = time.Millisecond
+	h.run(context.Background())
+	assert.Equal(t, int64(0), s.Written())
+	assert.True(t, last.Done, "hydration ends even when the source never recovers")
+	assert.Positive(t, last.Errors)
+	assert.LessOrEqual(t, base.failures.Load(), int32(hydrateMaxPasses*(hSize/hydrateRunBytes+1)), "bounded passes")
 }

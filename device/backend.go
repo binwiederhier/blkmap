@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	// maxLoggedErrors caps I/O error lines so a dead source cannot flood the journal.
+	// maxLoggedErrors caps I/O and hydration error lines so a dead source cannot flood the
+	// journal; the totals stay visible in the hydration report and the counters.
 	maxLoggedErrors = 20
 )
 

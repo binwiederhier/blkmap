@@ -27,8 +27,13 @@ func NewReadAhead(src Source) *ReadAhead {
 func (r *ReadAhead) setMap(m *Map) {
 	r.cache.skip = func(index int64) bool {
 		start := index * cacheBlockSize
-		return len(m.Data(start, min(cacheBlockSize, r.src.Size()-start))) == 0
+		return !m.HasData(start, min(cacheBlockSize, r.src.Size()-start))
 	}
+}
+
+// Abort aborts the inner source.
+func (r *ReadAhead) Abort() {
+	Abort(r.src)
 }
 
 // isHole reports whether a whole block lies in a hole of the inner source.

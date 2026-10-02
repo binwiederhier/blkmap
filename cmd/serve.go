@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os/signal"
 	"syscall"
@@ -40,13 +41,20 @@ func execServe(c *cli.Context) error {
 	if _, err := util.SdNotify(util.NotifyReady); err != nil {
 		log.Printf("sd_notify failed: %s", err.Error())
 	}
-	<-ctx.Done()
-	log.Printf("stopping %s", d.Path)
+	var failure error
+	select {
+	case <-ctx.Done():
+		log.Printf("stopping %s", d.Path)
+	case <-d.Done():
+		// The kernel device is dead underneath; exit non-zero so systemd restarts the unit
+		failure = d.Err()
+		log.Printf("%s failed: %s; stopping", d.Path, failure.Error())
+	}
 	util.SdNotify(util.NotifyStopping)
 	written := d.Written()
 	if err := d.Close(); err != nil {
-		return err
+		return errors.Join(failure, err)
 	}
 	log.Printf("stopped %s, %d chunks in cow file", d.Path, written)
-	return nil
+	return failure
 }

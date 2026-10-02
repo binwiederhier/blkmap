@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -28,6 +29,11 @@ const (
 	// charDeviceWait is how long to wait for udev to create /dev/ublkcN after ADD_DEV.
 	charDeviceWait = 5 * time.Second
 	charDevicePoll = 50 * time.Millisecond
+)
+
+var (
+	// ErrReowned means the device id now belongs to another server, so nothing was deleted.
+	ErrReowned = errors.New("ublk device id reused by another server")
 )
 
 // Backend is the storage a device is served from. Reads must fill the whole buffer and
@@ -71,6 +77,15 @@ type Device struct {
 	stopping  atomic.Bool
 	stopped   bool
 	deleted   bool
+	failed    chan struct{} // closed when a queue loop died while the device was live
+	failErr   error
+	failOnce  sync.Once
+}
+
+// Info is the kernel's view of a device.
+type Info struct {
+	Live      bool // serving I/O; false once the server died or stopped it
+	ServerPID int
 }
 
 // Create registers the device with the kernel, starts its queues, and returns once
@@ -89,7 +104,7 @@ func Create(p *Params) (*Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Device{ID: id, BlockPath: fmt.Sprintf("%s%d", blockPrefix, id), CharPath: fmt.Sprintf("%s%d", charPrefix, id), params: p, charFd: -1}
+	d := &Device{ID: id, BlockPath: fmt.Sprintf("%s%d", blockPrefix, id), CharPath: fmt.Sprintf("%s%d", charPrefix, id), params: p, charFd: -1, failed: make(chan struct{})}
 	fail := func(err error) (*Device, error) {
 		d.teardown(ctl)
 		return nil, err
@@ -140,10 +155,28 @@ func (d *Device) Close() error {
 func (d *Device) Stop() error {
 	ctl, err := openControl()
 	if err != nil {
-		return err
+		// Without the control device the queues are still joined and the char device
+		// released, which is what makes the kernel give up on the device
+		return errors.Join(err, d.stop(nil))
 	}
 	defer ctl.close()
 	return d.stop(ctl)
+}
+
+// Done is closed when a queue loop died while the device was live. Such a device answers
+// no requests any more and should be closed; Err says why.
+func (d *Device) Done() <-chan struct{} {
+	return d.failed
+}
+
+// Err returns why the device failed, or nil.
+func (d *Device) Err() error {
+	select {
+	case <-d.failed:
+		return d.failErr
+	default:
+		return nil
+	}
 }
 
 // Delete removes the kernel device (DEL_DEV). It blocks while anything still holds the
@@ -174,8 +207,10 @@ func (d *Device) stop(ctl *control) error {
 	}
 	d.stopped = true
 	var errs []error
-	if err := ctl.stopDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
-		errs = append(errs, err)
+	if ctl != nil {
+		if err := ctl.stopDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
+			errs = append(errs, err)
+		}
 	}
 	d.stopping.Store(true)
 	for _, q := range d.queues {
@@ -208,6 +243,14 @@ func (d *Device) delete(ctl *control) error {
 		return err
 	}
 	return nil
+}
+
+// fail records the first queue failure and wakes Done.
+func (d *Device) fail(err error) {
+	d.failOnce.Do(func() {
+		d.failErr = err
+		close(d.failed)
+	})
 }
 
 // defaults fills in the zero-value parameters.
@@ -301,18 +344,6 @@ func openCharDevice(path string) (int, error) {
 	}
 }
 
-var (
-	// ErrReowned means the device id now belongs to another server, so nothing was deleted.
-	ErrReowned = errors.New("ublk device id reused by another server")
-)
-
-// Info is the kernel's view of a device.
-type Info struct {
-	ID        uint32
-	Live      bool // serving I/O; false once the server died or stopped it
-	ServerPID int
-}
-
 // GetInfo describes device id, or returns an error wrapping syscall.ENODEV if it does not exist.
 func GetInfo(id uint32) (*Info, error) {
 	ctl, err := openControl()
@@ -324,7 +355,7 @@ func GetInfo(id uint32) (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Info{ID: info.DevID, Live: info.State == stateLive, ServerPID: int(info.UblksrvPID)}, nil
+	return &Info{Live: info.State == stateLive, ServerPID: int(info.UblksrvPID)}, nil
 }
 
 // Delete removes device id, stopping it first if it is still live. It is how a device left
@@ -336,7 +367,7 @@ func Delete(id uint32) error {
 		return err
 	}
 	defer ctl.close()
-	if err := ctl.stopDevice(id); err != nil {
+	if err := ctl.stopDevice(id); err != nil && !errors.Is(err, syscall.ENODEV) {
 		return err
 	}
 	return ctl.deleteDevice(id)

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -39,6 +38,9 @@ func (s *server) Open(ctx context.Context, req *remotepb.OpenRequest) (*remotepb
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%s: extents: %v", req.Name, err)
 	}
+	if len(extents) > maxExtents {
+		return nil, status.Errorf(codes.ResourceExhausted, "%s: %d extents, more than the %d the protocol carries", req.Name, len(extents), maxExtents)
+	}
 	resp := &remotepb.OpenResponse{Size: f.Size()}
 	for _, e := range extents {
 		resp.Data = append(resp.Data, &remotepb.Extent{Offset: e.Offset, Length: e.Length})
@@ -69,15 +71,22 @@ func (s *server) Read(ctx context.Context, req *remotepb.ReadRequest) (*remotepb
 	return &remotepb.ReadResponse{Data: buf[:n]}, nil
 }
 
-// resolve keeps names inside the export directory.
+// resolve keeps names inside the export directory, symlinks included.
 func (s *server) resolve(name string) (string, error) {
 	clean := filepath.Clean("/" + name)
 	if name == "" || strings.Contains(name, "..") || clean == "/" {
 		return "", status.Errorf(codes.InvalidArgument, "bad name %q", name)
 	}
-	return filepath.Join(s.dir, clean), nil
-}
-
-func (s *server) String() string {
-	return fmt.Sprintf("remote export of %s", s.dir)
+	path := filepath.Join(s.dir, clean)
+	real, err := filepath.EvalSymlinks(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", status.Errorf(codes.NotFound, "%s: no such file", name)
+	} else if err != nil {
+		return "", status.Errorf(codes.Internal, "%s: %v", name, err)
+	}
+	root, err := filepath.EvalSymlinks(s.dir)
+	if err != nil || (real != root && !strings.HasPrefix(real, root+string(filepath.Separator))) {
+		return "", status.Errorf(codes.PermissionDenied, "%s: outside the export", name)
+	}
+	return real, nil
 }

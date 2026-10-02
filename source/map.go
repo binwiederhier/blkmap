@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -13,6 +14,8 @@ import (
 const (
 	mapURLPrefixHTTP  = "http://"
 	mapURLPrefixHTTPS = "https://"
+	// maxMapBytes bounds a map fetched over http; maxRanges lines fit comfortably.
+	maxMapBytes = 64 << 20
 )
 
 // Map is the data layout of a source: sorted, merged data extents; everything else reads as
@@ -27,7 +30,7 @@ type Map struct {
 func NewMap(data []Range) (*Map, error) {
 	extents := make([]Range, 0, len(data))
 	for _, r := range data {
-		if r.Offset < 0 || r.Length <= 0 {
+		if r.Offset < 0 || r.Length <= 0 || r.Offset > math.MaxInt64-r.Length {
 			return nil, fmt.Errorf("invalid map extent: offset %d, length %d", r.Offset, r.Length)
 		}
 		extents = append(extents, r)
@@ -66,7 +69,10 @@ func LoadMap(pathOrURL string) (*Map, error) {
 			resp.Body.Close()
 			return nil, fmt.Errorf("%s: got %d %s", pathOrURL, resp.StatusCode, http.StatusText(resp.StatusCode))
 		}
-		r = resp.Body
+		r = struct {
+			io.Reader
+			io.Closer
+		}{io.LimitReader(resp.Body, maxMapBytes), resp.Body}
 	} else {
 		f, err := os.Open(pathOrURL)
 		if err != nil {
@@ -92,6 +98,12 @@ func (m *Map) Data(off, length int64) []Range {
 		out = append(out, Range{Offset: start, Length: stop - start})
 	}
 	return out
+}
+
+// HasData reports whether any data extent intersects [off, off+length).
+func (m *Map) HasData(off, length int64) bool {
+	i := m.first(off)
+	return i < len(m.extents) && m.extents[i].Offset-off < length
 }
 
 // Holes returns the holes within [off, off+length), clipped, ascending.
@@ -153,22 +165,22 @@ func WithMap(src Source, m *Map, base int64) *Mapped {
 	return &Mapped{src: src, m: m, base: base}
 }
 
-func (w *Mapped) ReadAt(p []byte, off int64) (int, error) {
-	return w.readAt(p, off, false)
+func (d *Mapped) ReadAt(p []byte, off int64) (int, error) {
+	return d.readAt(p, off, false)
 }
 
-func (w *Mapped) ReadAtDirect(p []byte, off int64) (int, error) {
-	return w.readAt(p, off, true)
+func (d *Mapped) ReadAtDirect(p []byte, off int64) (int, error) {
+	return d.readAt(p, off, true)
 }
 
 // readAt zero-fills the holes locally and reads only the data extents from the inner source.
-func (w *Mapped) readAt(p []byte, off int64, direct bool) (int, error) {
-	n, eof := clampRead(len(p), off, w.src.Size())
+func (d *Mapped) readAt(p []byte, off int64, direct bool) (int, error) {
+	n, eof := clampRead(len(p), off, d.src.Size())
 	p = p[:n]
-	pos := w.base + off // in the map's (resource) coordinates
+	pos := d.base + off // in the map's (resource) coordinates
 	end := pos + int64(n)
-	for i := w.m.first(pos); i < len(w.m.extents) && w.m.extents[i].Offset < end; i++ {
-		e := w.m.extents[i]
+	for i := d.m.first(pos); i < len(d.m.extents) && d.m.extents[i].Offset < end; i++ {
+		e := d.m.extents[i]
 		if e.Offset > pos { // hole before this extent
 			clear(p[:e.Offset-pos])
 			p = p[e.Offset-pos:]
@@ -178,9 +190,9 @@ func (w *Mapped) readAt(p []byte, off int64, direct bool) (int, error) {
 		var read int
 		var err error
 		if direct {
-			read, err = ReadDirect(w.src, p[:m], pos-w.base)
+			read, err = ReadDirect(d.src, p[:m], pos-d.base)
 		} else {
-			read, err = w.src.ReadAt(p[:m], pos-w.base)
+			read, err = d.src.ReadAt(p[:m], pos-d.base)
 		}
 		if err != nil && !(errors.Is(err, io.EOF) && read == m) {
 			return n - len(p) + read, err
@@ -195,29 +207,34 @@ func (w *Mapped) readAt(p []byte, off int64, direct bool) (int, error) {
 	return n, eof
 }
 
-func (w *Mapped) Holes(off, length int64) ([]Range, error) {
-	length = min(length, w.src.Size()-off)
+func (d *Mapped) Holes(off, length int64) ([]Range, error) {
+	length = min(length, d.src.Size()-off)
 	if off < 0 || length <= 0 {
 		return nil, nil
 	}
-	holes := w.m.Holes(w.base+off, length)
+	holes := d.m.Holes(d.base+off, length)
 	for i := range holes {
-		holes[i].Offset -= w.base
+		holes[i].Offset -= d.base
 	}
 	return holes, nil
 }
 
+// Abort aborts the inner source.
+func (d *Mapped) Abort() {
+	Abort(d.src)
+}
+
 // Map returns the attached map.
-func (w *Mapped) Map() *Map {
-	return w.m
+func (d *Mapped) Map() *Map {
+	return d.m
 }
 
-func (w *Mapped) Size() int64 {
-	return w.src.Size()
+func (d *Mapped) Size() int64 {
+	return d.src.Size()
 }
 
-func (w *Mapped) Close() error {
-	return w.src.Close()
+func (d *Mapped) Close() error {
+	return d.src.Close()
 }
 
 // Extents returns the data extents of any source, as a map would list them: the complement

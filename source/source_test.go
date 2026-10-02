@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -195,4 +196,27 @@ segments:
 	_, err = FromConfig(c)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "segment 0: map")
+}
+
+// aborter records Abort calls.
+type aborter struct {
+	mem
+	aborted atomic.Int32
+}
+
+func (a *aborter) Abort() {
+	a.aborted.Add(1)
+}
+
+func TestAbortPropagates(t *testing.T) {
+	t.Parallel()
+	a, b := &aborter{mem: mem{data: pattern(4096)}}, &aborter{mem: mem{data: pattern(4096)}}
+	m, err := NewMap([]Range{{Offset: 0, Length: 4096}})
+	require.NoError(t, err)
+	concat, err := NewConcat([]*Segment{{Offset: 0, Source: NewCache(NewReadAhead(a), WithMap(NewSwappable(b), m, 0))}}, 0)
+	require.NoError(t, err)
+	Abort(concat)
+	assert.Equal(t, int32(1), a.aborted.Load())
+	assert.Equal(t, int32(1), b.aborted.Load())
+	Abort(NewZero(10)) // sources without Abort are fine
 }

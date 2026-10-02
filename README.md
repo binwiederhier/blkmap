@@ -59,7 +59,12 @@ systemctl stop blkmap@disk1           # unmount first: deletion waits for opener
 ```
 
 The unit is `Type=notify`, so `systemctl start` returns only once the device exists. A mount
-in fstab can depend on it with `x-systemd.requires=blkmap@disk1.service`.
+in fstab can depend on it with `x-systemd.requires=blkmap@disk1.service`; the packaged udev
+rule names the disk `/dev/blkmap/disk1`, so systemd sees the device the mount waits for:
+
+```
+/dev/blkmap/disk1  /mnt/disk1  ext4  x-systemd.requires=blkmap@disk1.service,nofail  0 0
+```
 
 ### RAID-5 segments (Windows dynamic disks and others)
 
@@ -182,7 +187,7 @@ without the COW layer.
 
 Requests from the kernel are served by one thread per ublk queue. While the backend answers
 in microseconds (a local file) that thread serves reads itself, because a handoff would cost
-more than the work; once the smoothed read service time passes 250 µs (a network source) it
+more than the work; once the smoothed read service time passes 250 us (a network source) it
 hands reads to a worker pool, one backend call per queue slot, so up to the full queue depth
 of reads runs concurrently against the source. Writes, flushes and discards always run
 inline: they target the local COW file, where parallel read-modify-writes only contend. The
@@ -202,9 +207,9 @@ RAID-5 reads including parity reconstruction (pooled stripe buffers), and the CO
 read-modify-write of a fresh chunk (pooled chunk buffers). `go test -bench . -benchmem
 ./source/ ./cow/` reports, on a 12 vCPU KVM guest: concat read 39 ns with one segment and
 391 ns with a thousand, RAID-5 reconstruction 2.5 GB/s, bitmap set/test 3.5 ns, a 64 KiB
-COW chunk write 37 µs.
+COW chunk write 37 us.
 
-The ublk transport lives in-tree (`ublk/`, about 800 lines, derived from go-ublk): an
+The ublk transport lives in-tree (`ublk/`, about 1,300 lines, derived from go-ublk): an
 ioctl-encoded control plane, a minimal SQE128/CQE32 io_uring per queue, one OS thread per
 queue, and per-tag buffers sized to the 1 MiB maximum request, so large I/O is never split.
 Defaults are 4 queues (fewer on smaller machines) at depth 64, which costs at most 256 MiB of
@@ -239,7 +244,9 @@ builds them.
 make test        # unit tests (no root)
 make test-root   # ublk and device integration tests; needs root and ublk_drv loaded
 make stress      # e2e + fio verify workloads, ext4/xfs/btrfs, fstrim, SIGKILL under load, restarts
-make test-remote HOST=ip STRESS=stress   # the same on a throwaway VM (recommended, see below)
+make scenarios   # 30 real-life scenarios: origins that die or hang, SIGKILL mid-write and
+                 # mid-hydration, restart storms, lost cow/bitmap, full disk, 8 TiB device, ...
+make test-remote HOST=ip SUITE=all   # all of the above on a throwaway VM (recommended, see below)
 make vet
 ```
 
@@ -260,8 +267,9 @@ issues, every 5 seconds when anything changed, and on shutdown. After a crash or
 the device therefore shows, per chunk, either the write or the base, never zeros for a
 write that was acknowledged but not flushed.
 
-Shutdown order is: stop hydration and the flush timer, STOP_DEV (drains in-flight I/O),
-flush and close the store, then DEL_DEV, then remove the symlink. DEL_DEV waits for anything
+Shutdown order is: stop hydration and the flush timer, abort reads blocked in a source (a
+hung origin fails those with EIO rather than holding up the stop), STOP_DEV (drains in-flight
+I/O), flush and close the store, then DEL_DEV, then remove the symlink. DEL_DEV waits for anything
 holding the block device open, so `systemctl stop` on a mounted device logs a warning and
 waits; after `TimeoutStopSec` systemd kills the daemon, which by then has everything on
 disk, and the next start deletes the dead kernel device.

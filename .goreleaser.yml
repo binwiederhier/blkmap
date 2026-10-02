@@ -35,10 +35,14 @@ nfpms:
         dst: /lib/systemd/system/blkmap@.service
       - src: blkmap.conf
         dst: /usr/lib/modules-load.d/blkmap.conf
+      - src: blkmap.rules
+        dst: /usr/lib/udev/rules.d/60-blkmap.rules
       - src: blkmap.example.yml
         dst: /usr/share/doc/blkmap/blkmap.example.yml
       - dst: /etc/blkmap
         type: dir
+        file_info:
+          mode: 0750
       - dst: /var/lib/blkmap
         type: dir
         file_info:

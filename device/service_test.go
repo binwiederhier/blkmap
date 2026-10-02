@@ -3,6 +3,7 @@ package device
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,6 +36,21 @@ func pattern(n int) []byte {
 		p[i] = byte(i*7 + i/256)
 	}
 	return p
+}
+
+// alignedBuf returns a page-aligned buffer, as O_DIRECT requires.
+func alignedBuf(n int) []byte {
+	b := make([]byte, n+4096)
+	off := 4096 - int(uintptr(unsafe.Pointer(&b[0]))%4096)
+	return b[off : off+n]
+}
+
+// relativeLink is the symlink target udev would write for d: relative to the link's directory.
+func relativeLink(t *testing.T, d *Device) string {
+	t.Helper()
+	rel, err := filepath.Rel(filepath.Dir(d.Path), d.BlockPath)
+	require.NoError(t, err)
+	return rel
 }
 
 // requireUblk skips unless the test can actually create ublk devices (root + ublk_drv loaded).
@@ -74,7 +90,7 @@ segments:
 	assert.Equal(t, filepath.Join(devDir, "test"), d.Path)
 	target, err := os.Readlink(d.Path)
 	require.NoError(t, err)
-	assert.Equal(t, d.BlockPath, target)
+	assert.Equal(t, relativeLink(t, d), target, "udev writes relative links; blkmap must agree or udev and blkmap fight over the link")
 	assert.Regexp(t, `^/dev/ublkb\d+$`, d.BlockPath)
 	// Size and stitched content as seen through the kernel
 	f, err := os.OpenFile(d.Path, os.O_RDWR, 0)
@@ -156,7 +172,7 @@ func TestStartStaleSymlink(t *testing.T) {
 	t.Cleanup(func() { d.Close() })
 	target, err := os.Readlink(d.Path)
 	require.NoError(t, err)
-	assert.Equal(t, d.BlockPath, target)
+	assert.Equal(t, relativeLink(t, d), target, "udev writes relative links; blkmap must agree or udev and blkmap fight over the link")
 }
 
 // computed is a Source that synthesizes its content: block i is filled with byte i. It is
@@ -475,7 +491,7 @@ func TestCloseLeavesSuccessorAlone(t *testing.T) {
 	require.NoError(t, old.Close())
 	target, err := os.Readlink(next.Path)
 	require.NoError(t, err, "the successor's symlink must survive the predecessor's Close")
-	assert.Equal(t, next.BlockPath, target)
+	assert.Equal(t, relativeLink(t, next), target)
 	state, err := os.ReadFile(filepath.Join(dir, "run", "succ"))
 	require.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
@@ -583,10 +599,68 @@ func TestCloseLeavesDifferentIDSuccessorAlone(t *testing.T) {
 	require.NoError(t, old.Close())
 	target, err := os.Readlink(next.Path)
 	require.NoError(t, err, "the successor's symlink must survive the predecessor's Close")
-	assert.Equal(t, next.BlockPath, target)
+	assert.Equal(t, relativeLink(t, next), target)
 	state, err := os.ReadFile(filepath.Join(dir, "run", "succ2"))
 	require.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
 	_, err = os.Stat(old.BlockPath)
 	assert.True(t, os.IsNotExist(err), "the old kernel device itself is gone")
+}
+
+// hung is a base whose reads in the middle half block until Abort is called. The rest
+// answers zeros, so the kernel's partition scan (first and last sectors) completes.
+type hung struct {
+	size    int64
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *hung) ReadAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) <= h.size/4 || off >= h.size*3/4 {
+		clear(p)
+		return len(p), nil
+	}
+	<-h.release
+	return 0, errors.New("aborted")
+}
+
+func (h *hung) Size() int64 {
+	return h.size
+}
+
+func (h *hung) Close() error {
+	return nil
+}
+
+func (h *hung) Abort() {
+	h.once.Do(func() { close(h.release) })
+}
+
+func TestCloseAbortsHungBase(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	base := &hung{size: 8 << 20, release: make(chan struct{})}
+	d, err := Serve(context.Background(), &Options{ID: "t-hung", Base: base, COWFile: filepath.Join(dir, "c.cow"), DevDir: dir, RunDir: dir})
+	require.NoError(t, err)
+	// A guest read blocks in the source forever; Close must abort it and finish promptly
+	// instead of waiting for STOP_DEV to drain a request that never completes
+	f, err := os.OpenFile(d.BlockPath, os.O_RDONLY|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := f.ReadAt(alignedBuf(4096), 4<<20)
+		f.Close() // a real reader (dd) exits on the error; DEL_DEV waits for that
+		readDone <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- d.Close() }()
+	select {
+	case <-closed:
+		assert.Less(t, time.Since(start), 10*time.Second)
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close hung behind the stuck source")
+	}
+	assert.Error(t, <-readDone)
 }

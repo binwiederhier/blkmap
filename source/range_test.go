@@ -41,3 +41,12 @@ func TestParsePrefetchFile(t *testing.T) {
 	_, err = ParsePrefetchFile(filepath.Join(t.TempDir(), "missing"))
 	require.Error(t, err)
 }
+
+func TestParseRangesLimit(t *testing.T) {
+	t.Parallel()
+	_, err := parseRanges(strings.NewReader(strings.Repeat("0 1\n", maxRanges+1)), "list")
+	assert.Error(t, err, "more ranges than a sane list holds")
+	ranges, err := parseRanges(strings.NewReader(strings.Repeat("0 1\n", 10)), "list")
+	require.NoError(t, err)
+	assert.Len(t, ranges, 10)
+}

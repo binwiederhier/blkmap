@@ -15,11 +15,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"heckel.io/blkmap/config"
 	"heckel.io/blkmap/device"
 	"heckel.io/blkmap/examples/grpc-remote/remotepb"
 )
@@ -56,7 +59,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	s := grpc.NewServer(grpc.MaxSendMsgSize(2 * maxRead))
+	s := grpc.NewServer(grpc.MaxSendMsgSize(2*maxRead), grpc.MaxConcurrentStreams(maxStreams))
 	remotepb.RegisterRemoteServer(s, &server{dir: *dir})
 	log.Printf("exporting %s on %s", *dir, *listen)
 	if err := s.Serve(l); err != nil {
@@ -86,9 +89,9 @@ func mount(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	opts := &device.Options{ID: *id, Base: src, COWFile: "/var/tmp/blkmap-example-" + *id + ".cow"}
+	opts := &device.Options{ID: *id, Base: src, COWFile: filepath.Join(config.DefaultStateDir, "example-"+*id+".cow")}
 	if *hydrate {
-		opts.Hydrate = &device.Hydrate{Rest: true, Report: 2e9}
+		opts.Hydrate = &device.Hydrate{Rest: true, Report: 2 * time.Second}
 	}
 	dev, err := device.Serve(ctx, opts)
 	if err != nil {

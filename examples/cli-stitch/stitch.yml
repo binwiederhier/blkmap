@@ -2,7 +2,7 @@
 # and the HTTP origin are never modified. Paths match run.sh.
 size: 64M
 cow:
-  file: /var/tmp/blkmap-example-stitch/stitch.cow
+  file: /var/lib/blkmap/example-stitch.cow
 segments:
   - type: zero            # 1 MiB of zeros, e.g. room for a partition table
     size: 1M

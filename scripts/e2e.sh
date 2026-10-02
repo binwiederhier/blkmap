@@ -39,7 +39,7 @@ segments:
 YML
 echo "== validate"; blkmap validate $id
 echo "== start"; systemctl start blkmap@$id; systemctl is-active blkmap@$id
-ls -la $dev; readlink $dev
+ls -la $dev; readlink -f $dev
 echo "== content"
 [ "$(blockdev --getsize64 $dev)" = 67108864 ] && echo "size OK"
 cmp <(dd if=$dev bs=1M skip=1 count=8 status=none) $dir/part.img && echo "file segment OK"

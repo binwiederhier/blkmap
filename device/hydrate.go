@@ -22,12 +22,14 @@ const (
 	holeWindow = 4 << 30
 	// hydrateRunBytes is how much consecutive unwritten data one background read covers, so a
 	// remote source sees requests of this size rather than one per chunk.
-	hydrateRunBytes = 1 << 20
-	// hydrateMaxLoggedErrors caps per-chunk error lines; the total is logged at the end.
-	hydrateMaxLoggedErrors = 20
-	phaseList              = "list"
-	phaseRest              = "rest"
-	phaseDone              = "done"
+	hydrateRunBytes = cow.MaxRunBytes
+	// hydrateMaxPasses bounds how often failed runs are retried; hydrateRetryDelay separates
+	// the passes so a brief source outage is ridden out.
+	hydrateMaxPasses  = 5
+	hydrateRetryDelay = 10 * time.Second
+	phaseList         = "list"
+	phaseRest         = "rest"
+	phaseDone         = "done"
 )
 
 // Hydrate configures background copying of the base into the COW file, so the device
@@ -43,28 +45,38 @@ type Hydrate struct {
 	OnProgress  func(Progress) // optional, called at every report and once at the end
 }
 
-// Progress is a hydration status snapshot.
+// Progress is a hydration status snapshot. Done means hydration has ended; whether every
+// chunk made it is Hydrated == Total, since a source that stays down ends it with errors.
 type Progress struct {
 	Phase    string // "list", "rest", or "done"
 	Hydrated int64  // chunks in the COW file (written or hydrated)
 	Total    int64  // chunks in the device
 	Copied   int64  // bytes copied by this run so far
+	Errors   int64  // failed background reads so far (each is retried in a later pass)
 	Done     bool
 }
 
 // hydrator runs the background copy. It is driven entirely by the Store's chunk primitives
 // and a busy predicate, so it can be tested without a kernel device.
 type hydrator struct {
-	store   *cow.Store
-	base    source.Source
-	opts    *Hydrate
-	busy    func() bool
-	id      string
-	zero    *util.Bitset // chunks that read as zeros: marked, never copied
-	phase   atomic.Pointer[string]
-	copied  atomic.Int64
-	errors  atomic.Int64
-	limiter *bucket
+	store      *cow.Store
+	base       source.Source
+	opts       *Hydrate
+	busy       func() bool
+	id         string
+	zero       *util.Bitset // chunks that read as zeros: marked, never copied
+	phase      atomic.Pointer[string]
+	copied     atomic.Int64
+	errors     atomic.Int64
+	limiter    *bucket
+	retryDelay time.Duration
+}
+
+// batch is a run of consecutive chunks handed to a worker: zero chunks are marked, unwritten
+// chunks are copied with one base read.
+type batch struct {
+	first, count int64
+	zero         bool
 }
 
 func newHydrator(id string, store *cow.Store, base source.Source, opts *Hydrate, busy func() bool) *hydrator {
@@ -78,28 +90,15 @@ func newHydrator(id string, store *cow.Store, base source.Source, opts *Hydrate,
 	if o.UseCache == "" {
 		o.UseCache = config.CacheAlways
 	}
-	h := &hydrator{store: store, base: base, opts: &o, busy: busy, id: id, zero: util.NewBitset(store.Chunks())}
-	// Chunks entirely inside a hole need no copy; ask in windows to bound the range lists
-	chunkSize := store.ChunkSize()
-	for off := int64(0); off < base.Size(); off += holeWindow {
-		holes, err := source.Holes(base, off, holeWindow)
-		if err != nil {
-			log.Printf("%s: cannot query holes at %d: %s (hydrating by copying)", id, off, err.Error())
-			break
-		}
-		for _, r := range holes {
-			for c := (r.Offset + chunkSize - 1) / chunkSize; c < (r.Offset+r.Length)/chunkSize; c++ {
-				h.zero.Set(c)
-			}
-		}
-	}
+	h := &hydrator{store: store, base: base, opts: &o, busy: busy, id: id, zero: util.NewBitset(store.Chunks()), retryDelay: hydrateRetryDelay}
 	if o.Rate > 0 {
-		h.limiter = newBucket(o.Rate, max(hydrateRunBytes, chunkSize))
+		h.limiter = newBucket(o.Rate, max(hydrateRunBytes, store.ChunkSize()))
 	}
 	return h
 }
 
-// run hydrates until everything requested is in the COW file or ctx is cancelled.
+// run hydrates until everything requested is in the COW file or ctx is cancelled. Runs
+// that failed (the source was down) are retried in later passes, a few times.
 func (h *hydrator) run(ctx context.Context) {
 	reportCtx, stopReports := context.WithCancel(ctx)
 	var reports sync.WaitGroup
@@ -108,7 +107,54 @@ func (h *hydrator) run(ctx context.Context) {
 		defer reports.Done()
 		h.reportLoop(reportCtx)
 	}()
-	// The list phase: chunks of the prefetch ranges in order, each once
+	h.scanHoles()
+	for pass := 1; ctx.Err() == nil; pass++ {
+		before := h.errors.Load()
+		h.pass(ctx)
+		failed := h.errors.Load() - before
+		if failed == 0 || pass == hydrateMaxPasses {
+			break
+		}
+		log.Printf("%s: hydration pass %d: %d reads failed, retrying in %s", h.id, pass, failed, h.retryDelay)
+		select {
+		case <-ctx.Done():
+		case <-time.After(h.retryDelay):
+		}
+	}
+	stopReports()
+	reports.Wait()
+	if ctx.Err() != nil {
+		return
+	}
+	h.setPhase(phaseDone)
+	p := h.progress()
+	log.Printf("%s: hydration done: %d/%d chunks in the cow file, %s copied, %d errors", h.id, p.Hydrated, p.Total, util.FormatSize(p.Copied), p.Errors)
+	if h.opts.OnProgress != nil {
+		h.opts.OnProgress(p)
+	}
+}
+
+// scanHoles marks chunks that lie entirely inside holes of the base, which are recorded
+// without a copy; the query runs in windows to bound the range lists.
+func (h *hydrator) scanHoles() {
+	chunkSize := h.store.ChunkSize()
+	for off := int64(0); off < h.base.Size(); off += holeWindow {
+		holes, err := source.Holes(h.base, off, holeWindow)
+		if err != nil {
+			log.Printf("%s: cannot query holes at %d: %s (hydrating by copying)", h.id, off, err.Error())
+			return
+		}
+		for _, r := range holes {
+			for c := (r.Offset + chunkSize - 1) / chunkSize; c < (r.Offset+r.Length)/chunkSize; c++ {
+				h.zero.Set(c)
+			}
+		}
+	}
+}
+
+// pass runs the list phase (prefetch ranges in order, each chunk once) and then the rest
+// phase (everything else, ascending, paced) over whatever is not yet in the COW file.
+func (h *hydrator) pass(ctx context.Context) {
 	visited := util.NewBitset(h.store.Chunks())
 	h.process(ctx, phaseList, func(yield func(int64) bool) {
 		for _, r := range h.opts.Prefetch {
@@ -124,7 +170,6 @@ func (h *hydrator) run(ctx context.Context) {
 			}
 		}
 	}, nil)
-	// The rest phase: everything the list did not cover, ascending, paced
 	if h.opts.Rest && ctx.Err() == nil {
 		h.process(ctx, phaseRest, func(yield func(int64) bool) {
 			for c := int64(0); c < h.store.Chunks(); c++ {
@@ -134,24 +179,6 @@ func (h *hydrator) run(ctx context.Context) {
 			}
 		}, h.limiter)
 	}
-	stopReports()
-	reports.Wait()
-	if ctx.Err() != nil {
-		return
-	}
-	h.setPhase(phaseDone)
-	p := h.progress()
-	log.Printf("%s: hydration done: %d/%d chunks in the cow file, %s copied, %d errors", h.id, p.Hydrated, p.Total, util.FormatSize(p.Copied), h.errors.Load())
-	if h.opts.OnProgress != nil {
-		h.opts.OnProgress(p)
-	}
-}
-
-// run is a batch of consecutive chunks handed to a worker: a run of zero chunks is marked,
-// a run of unwritten chunks is copied with one base read.
-type run struct {
-	first, count int64
-	zero         bool
 }
 
 // process hydrates the chunks produced by next, in order, with the configured concurrency,
@@ -160,26 +187,26 @@ type run struct {
 // are batched into runs of up to hydrateRunBytes.
 func (h *hydrator) process(ctx context.Context, phase string, next func(yield func(int64) bool), limiter *bucket) {
 	h.setPhase(phase)
-	work := make(chan run)
+	work := make(chan batch)
 	var wg sync.WaitGroup
 	for i := 0; i < h.opts.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for r := range work {
-				h.handleRun(ctx, r, limiter)
+			for b := range work {
+				h.handle(ctx, b, limiter)
 			}
 		}()
 	}
 	maxRun := max(hydrateRunBytes/h.store.ChunkSize(), 1)
-	var pending run
+	var pending batch
 	flush := func() bool {
 		if pending.count == 0 {
 			return true
 		}
 		select {
 		case work <- pending:
-			pending = run{}
+			pending = batch{}
 			return true
 		case <-ctx.Done():
 			return false
@@ -196,7 +223,7 @@ func (h *hydrator) process(ctx context.Context, phase string, next func(yield fu
 			}
 		}
 		if pending.count == 0 {
-			pending = run{first: c, zero: zero}
+			pending = batch{first: c, zero: zero}
 		}
 		pending.count++
 		return true
@@ -206,23 +233,23 @@ func (h *hydrator) process(ctx context.Context, phase string, next func(yield fu
 	wg.Wait()
 }
 
-func (h *hydrator) handleRun(ctx context.Context, r run, limiter *bucket) {
+func (h *hydrator) handle(ctx context.Context, b batch, limiter *bucket) {
 	if !h.waitIdle(ctx) {
 		return
 	}
-	if r.zero {
-		for c := r.first; c < r.first+r.count; c++ {
+	if b.zero {
+		for c := b.first; c < b.first+b.count; c++ {
 			h.store.MarkZero(c)
 		}
 		return
 	}
-	if limiter != nil && !limiter.wait(ctx, r.count*h.store.ChunkSize()) {
+	if limiter != nil && !limiter.wait(ctx, b.count*h.store.ChunkSize()) {
 		return
 	}
-	copied, err := h.store.HydrateRun(r.first, r.count, h.opts.UseCache == config.CacheNever)
+	copied, err := h.store.HydrateRun(b.first, b.count, h.opts.UseCache == config.CacheNever)
 	h.copied.Add(copied)
 	if err != nil {
-		if n := h.errors.Add(1); n <= hydrateMaxLoggedErrors {
+		if n := h.errors.Add(1); n <= maxLoggedErrors {
 			log.Printf("%s: %s", h.id, err.Error())
 		}
 	}
@@ -259,7 +286,7 @@ func (h *hydrator) reportLoop(ctx context.Context) {
 
 func (h *hydrator) progress() Progress {
 	phase := h.phase.Load()
-	p := Progress{Hydrated: h.store.Written(), Total: h.store.Chunks(), Copied: h.copied.Load()}
+	p := Progress{Hydrated: h.store.Written(), Total: h.store.Chunks(), Copied: h.copied.Load(), Errors: h.errors.Load()}
 	if phase != nil {
 		p.Phase = *phase
 	}

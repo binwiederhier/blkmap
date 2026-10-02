@@ -175,3 +175,21 @@ func TestBlockCacheReadAheadSkipsHoles(t *testing.T) {
 		assert.False(t, b >= 3 && b <= 20, "block %d is a hole and was fetched", b)
 	}
 }
+
+func TestBlockCacheSequentialUnderInterleavedStreams(t *testing.T) {
+	t.Parallel()
+	f := &fetcher{data: pattern(64 * cacheBlockSize)}
+	c := newBlockCache(int64(len(f.data)), f.fetch)
+	p := make([]byte, cacheBlockSize)
+	// Two readers advance in turns (the kernel's parallel dispatch interleaves them); each
+	// one's second read continues where its own first ended and must count as sequential
+	require.NoError(t, c.readAt(p, 0))
+	require.NoError(t, c.readAt(p, 40*cacheBlockSize))
+	require.NoError(t, c.readAt(p, cacheBlockSize))
+	time.Sleep(100 * time.Millisecond) // let A's read-ahead drain, the semaphore is shared
+	require.NoError(t, c.readAt(p, 41*cacheBlockSize))
+	time.Sleep(200 * time.Millisecond)
+	fetched := f.fetched()
+	assert.Contains(t, fetched, int64(2), "stream A read-ahead")
+	assert.Contains(t, fetched, int64(42), "stream B read-ahead")
+}

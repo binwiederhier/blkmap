@@ -1,7 +1,7 @@
 MAKEFLAGS := --jobs=1
 VERSION := $(shell git describe --tag 2>/dev/null || echo dev)
 
-.PHONY: help build test test-root stress test-remote examples vet fmt release release-snapshot install-deb clean
+.PHONY: help build test test-root stress scenarios test-remote examples vet fmt release release-snapshot install-deb clean
 
 help:
 	@echo "blkmap"
@@ -9,7 +9,8 @@ help:
 	@echo "  make test             - Unit tests (no root needed)"
 	@echo "  make test-root        - Also run the ublk integration tests (needs root + ublk_drv)"
 	@echo "  make stress           - e2e + fio/mkfs/crash workloads against the installed deb (root, fio)"
-	@echo "  make test-remote HOST=ip [STRESS=stress] - root suites (+stress) on a scratch VM"
+	@echo "  make scenarios        - real-life scenarios: crashes, outages, restarts, bad configs (root, deb, fio)"
+	@echo "  make test-remote HOST=ip [SUITE=stress|scenarios|all] - root suites (+workloads) on a scratch VM"
 	@echo "  make examples         - vet, test and build everything under examples/"
 	@echo "  make release-snapshot - Build debs/rpms/tarballs into dist/ via goreleaser (no tag needed)"
 	@echo "  make release          - Tagged release via goreleaser"
@@ -34,9 +35,13 @@ examples:
 	go vet ./examples/... && go test ./examples/... && go build -o /dev/null ./examples/lib-synthetic && go build -o /dev/null ./examples/lib-dircache
 	cd examples/grpc-remote && go vet ./... && go test ./... && go build -o /dev/null .
 
-# Same suites on a throwaway VM (HOST=... ; add STRESS=stress for the workloads)
+scenarios:
+	go build -o dist/rangehttpd ./scripts/rangehttpd
+	sudo scripts/scenarios.sh
+
+# Same suites on a throwaway VM (HOST=... ; SUITE=stress|scenarios|all adds the workloads)
 test-remote:
-	scripts/remote-test.sh $(HOST) $(STRESS)
+	scripts/remote-test.sh $(HOST) $(SUITE)
 
 vet:
 	gofmt -l . && go vet ./...

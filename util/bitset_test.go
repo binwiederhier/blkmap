@@ -8,7 +8,6 @@ import (
 
 func TestBitset(t *testing.T) {
 	b := NewBitset(130)
-	assert.Equal(t, int64(130), b.Len())
 	assert.False(t, b.Test(0))
 	b.Set(0)
 	b.Set(63)

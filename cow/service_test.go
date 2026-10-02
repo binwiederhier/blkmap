@@ -2,6 +2,7 @@ package cow
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
@@ -249,72 +250,6 @@ func TestStoreWriteZeroes(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
-// cached is a base whose plain reads return garbage and direct reads the real data, to
-// tell the two hydration read paths apart.
-type cached struct {
-	mem
-}
-
-func (c *cached) ReadAt(p []byte, off int64) (int, error) {
-	for i := range p {
-		p[i] = 0xee
-	}
-	return len(p), nil
-}
-
-func (c *cached) ReadAtDirect(p []byte, off int64) (int, error) {
-	return c.mem.ReadAt(p, off)
-}
-
-func TestStoreHydrateChunk(t *testing.T) {
-	t.Parallel()
-	base := &cached{mem: mem{data: pattern(testSize)}}
-	dir := t.TempDir()
-	s := newTestStore(t, dir, base)
-	assert.Equal(t, int64(16), s.Chunks())
-	assert.Equal(t, int64(testChunk), s.ChunkSize())
-	// Through the cache path (plain reads)
-	copied, err := s.HydrateChunk(3, false)
-	require.NoError(t, err)
-	assert.True(t, copied)
-	assert.True(t, s.IsWritten(3))
-	// Direct path
-	copied, err = s.HydrateChunk(4, true)
-	require.NoError(t, err)
-	assert.True(t, copied)
-	// Already written: no copy, content untouched
-	_, err = s.WriteAt([]byte("guest"), 5*testChunk)
-	require.NoError(t, err)
-	copied, err = s.HydrateChunk(5, true)
-	require.NoError(t, err)
-	assert.False(t, copied)
-	copied, err = s.HydrateChunk(3, true)
-	require.NoError(t, err)
-	assert.False(t, copied)
-	// Plain reads (unwritten chunks, the chunk hydrated through the cache path, and the
-	// read-modify-write around the guest write) all see the fake cache's fill byte; only
-	// the directly hydrated chunk holds the real base data
-	expected := bytes.Repeat([]byte{0xee}, testSize)
-	copy(expected[4*testChunk:], pattern(testSize)[4*testChunk:5*testChunk])
-	copy(expected[5*testChunk:], "guest")
-	assert.Equal(t, expected, readAll(t, s))
-	assert.Equal(t, int64(3), s.Written())
-	// The last chunk may be partial
-	short := &cached{mem: mem{data: pattern(testSize + 100)}}
-	s2, err := Open(short, filepath.Join(dir, "p.cow"), filepath.Join(dir, "p.cow.bitmap"), testChunk)
-	require.NoError(t, err)
-	assert.Equal(t, int64(17), s2.Chunks())
-	copied, err = s2.HydrateChunk(16, true)
-	require.NoError(t, err)
-	assert.True(t, copied)
-	got := make([]byte, 100)
-	_, err = s2.ReadAt(got, testSize)
-	require.NoError(t, err)
-	assert.Equal(t, pattern(testSize + 100)[testSize:], got)
-	require.NoError(t, s2.Close())
-	require.NoError(t, s.Close())
-}
-
 func TestStoreMarkZeroAndComplete(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -528,4 +463,140 @@ func TestStoreHydrateRun(t *testing.T) {
 	assert.Equal(t, int64(0), copied)
 	_, err = s.HydrateRun(17, 1, false)
 	require.Error(t, err)
+}
+
+func TestStoreFlushNeverPersistsBitBeforeData(t *testing.T) {
+	t.Parallel()
+	// A write that lands between the COW sync and the bitmap sync of one Flush must not have
+	// its bit on disk before a later flush covers its data. Model it by racing writers against
+	// flushes and checking, after every flush, that the on-disk bitmap never claims a chunk
+	// whose data is not in the (page-cache backed, so always visible here) COW file: the
+	// invariant that matters is the snapshot order, which the test observes through Flush's
+	// bitmap pages being taken before the COW sync.
+	dir := t.TempDir()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, dir, base)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s.WriteAt([]byte{byte(i)}, int64(i%16)*testChunk)
+		}
+	}()
+	for i := 0; i < 50; i++ {
+		require.NoError(t, s.Flush())
+	}
+	close(stop)
+	wg.Wait()
+	require.NoError(t, s.Close())
+}
+
+func TestStoreCloseAfterFailedFlushKeepsBitmapBehindData(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	_, err := s.WriteAt([]byte("x"), 0)
+	require.NoError(t, err)
+	// Make the COW file unsyncable by closing its descriptor underneath the store
+	require.NoError(t, s.cow.Close())
+	require.Error(t, s.Close())
+	info, err := Inspect(filepath.Join(dir, "d.cow.bitmap"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), info.Written, "a bit must not reach disk when its data could not")
+}
+
+func TestOpenRefusesLostCowFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	_, err := s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 2*testChunk)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	require.NoError(t, os.Remove(filepath.Join(dir, "d.cow")))
+	_, err = Open(&mem{data: pattern(testSize)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cow file")
+	assert.Contains(t, err.Error(), "missing")
+	// A truncated cow file is just as bad
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "d.cow"), make([]byte, testChunk), 0600))
+	_, err = Open(&mem{data: pattern(testSize)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cow file")
+}
+
+func TestOpenLocksCowFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	_, err := Open(&mem{data: pattern(testSize)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "in use")
+	require.NoError(t, s.Close())
+	s2, err := Open(&mem{data: pattern(testSize)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	require.NoError(t, s2.Close())
+}
+
+func TestStoreChunkAPIsCheckBounds(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, t.TempDir(), &mem{data: pattern(testSize)})
+	assert.False(t, s.IsWritten(-1))
+	assert.False(t, s.IsWritten(16))
+	assert.False(t, s.MarkZero(16))
+	_, err := s.HydrateRun(16, 1, false)
+	require.Error(t, err)
+	_, err = s.HydrateRun(-1, 1, false)
+	require.Error(t, err)
+	n, err := s.ReadAt(make([]byte, 10), -5)
+	require.Error(t, err)
+	assert.Equal(t, 0, n)
+	require.NoError(t, s.Close())
+}
+
+func TestInspectRejectsBadHeader(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bits")
+	b, err := OpenBitmap(path, testSize, testChunk)
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	for _, bad := range []struct {
+		name  string
+		patch func([]byte)
+	}{
+		{"zero chunk", func(h []byte) { binary.LittleEndian.PutUint64(h[bitmapOffChunk:], 0) }},
+		{"chunk not power of two", func(h []byte) { binary.LittleEndian.PutUint64(h[bitmapOffChunk:], 3000) }},
+		{"negative size", func(h []byte) { binary.LittleEndian.PutUint64(h[bitmapOffSize:], 1<<63) }},
+		{"size too large for the file", func(h []byte) { binary.LittleEndian.PutUint64(h[bitmapOffSize:], 1<<50) }},
+	} {
+		corrupt := append([]byte(nil), data...)
+		bad.patch(corrupt)
+		require.NoError(t, os.WriteFile(path, corrupt, 0600))
+		_, err := Inspect(path)
+		assert.Error(t, err, bad.name)
+		_, _, _, err = Complete(path)
+		assert.Error(t, err, bad.name)
+	}
+}
+
+func TestOpenRefusesSymlinkedFiles(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "elsewhere")
+	require.NoError(t, os.WriteFile(target, nil, 0600))
+	require.NoError(t, os.Symlink(target, filepath.Join(dir, "c.cow")))
+	_, err := Open(&mem{data: make([]byte, 16*testChunk)}, filepath.Join(dir, "c.cow"), filepath.Join(dir, "c.bitmap"), testChunk)
+	assert.Error(t, err, "a symlinked cow file must not be followed")
+	require.NoError(t, os.Symlink(target, filepath.Join(dir, "d.bitmap")))
+	_, err = Open(&mem{data: make([]byte, 16*testChunk)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.bitmap"), testChunk)
+	assert.Error(t, err, "a symlinked bitmap must not be followed")
 }

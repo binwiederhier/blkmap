@@ -26,12 +26,14 @@ const (
 	// Reads are served inline on the queue thread while the backend answers fast (a local
 	// file: a few microseconds, where a worker handoff would cost more than the work), and
 	// handed to workers once the smoothed read service time passes parallelAbove (a network
-	// source: milliseconds, where only concurrency fills the pipe). Back to inline below
-	// parallelBelow; the gap is hysteresis. Writes, flushes and discards always run inline:
-	// they go to the local COW file, where parallel read-modify-writes only contend on the
-	// inode lock.
+	// source: milliseconds, where only concurrency fills the pipe). The queue returns to
+	// inline only after inlineAfter consecutive reads under fastRead: a mean would flip
+	// back on a run of cache hits and then stall every request behind the next slow read.
+	// Writes, flushes and discards always run inline: they go to the local COW file, where
+	// parallel read-modify-writes only contend on the inode lock.
 	parallelAbove = 250 * time.Microsecond
-	parallelBelow = 100 * time.Microsecond
+	fastRead      = 100 * time.Microsecond
+	inlineAfter   = 1024
 	// serviceSmoothing is the EWMA weight (1/n) of the service time estimate.
 	serviceSmoothing = 8
 )
@@ -66,7 +68,8 @@ type queue struct {
 	completed []uint16   // tags whose backend call finished, waiting for COMMIT
 	compMu    sync.Mutex // Protects completed
 	service   int64      // smoothed backend read service time in nanoseconds (queue thread only)
-	parallel  bool       // whether reads currently go to the workers
+	fastRun   int        // consecutive reads under fastRead (queue thread only)
+	parallel  bool       // whether reads currently go to the workers (queue thread only)
 }
 
 func newQueue(d *Device, id uint16) (*queue, error) {
@@ -106,6 +109,13 @@ func newQueue(d *Device, id uint16) (*queue, error) {
 func (q *queue) run(ready chan<- error) {
 	runtime.LockOSThread()
 	defer close(q.done)
+	defer func() {
+		// A loop that dies while the device is live leaves its requests unanswered forever;
+		// the owner is told so it can tear the device down instead of serving a zombie
+		if q.err != nil && !q.dev.stopping.Load() {
+			q.dev.fail(fmt.Errorf("queue %d: %w", q.id, q.err))
+		}
+	}()
 	for tag := range q.cmds {
 		if err := q.prepare(cmdFetchReq, uint16(tag), 0); err != nil {
 			ready <- err
@@ -145,13 +155,14 @@ func (q *queue) run(ready chan<- error) {
 					q.err = err
 					return
 				}
+			case userData >= uint64(len(q.cmds)):
+				log.Printf("ublk queue %d: completion for unknown tag %d ignored", q.id, userData)
 			case res == resultAbort: // the kernel is aborting the queue (device stopping)
 				aborted = true
 			case res < 0:
 				// A failed FETCH/COMMIT for one tag: that tag is dead, the others keep
 				// serving. Exiting here instead would wedge every request on this queue.
 				log.Printf("ublk queue %d tag %d: command failed: %s", q.id, userData, syscall.Errno(-res).Error())
-				q.err = fmt.Errorf("queue %d tag %d: %w", q.id, userData, syscall.Errno(-res))
 			case q.parallel && q.op(uint16(userData)) == opRead:
 				busy++
 				q.work <- uint16(userData) // never blocks: at most depth tags are outstanding
@@ -211,10 +222,15 @@ func (q *queue) commitCompleted() int {
 // observe folds one backend service time into the estimate and picks the dispatch mode.
 func (q *queue) observe(d time.Duration) {
 	q.service += (int64(d) - q.service) / serviceSmoothing
+	if d > fastRead {
+		q.fastRun = 0
+	} else {
+		q.fastRun++
+	}
 	if !q.parallel && q.service > int64(parallelAbove) {
 		q.parallel = true
-	} else if q.parallel && q.service < int64(parallelBelow) {
-		q.parallel = false
+	} else if q.parallel && q.fastRun >= inlineAfter {
+		q.parallel, q.fastRun = false, 0
 	}
 }
 
@@ -230,8 +246,15 @@ func (q *queue) armWake() error {
 }
 
 // serve runs the request behind tag against the backend and returns the result to commit.
+// A data request outside the device is refused before the backend sees it; the kernel never
+// sends one, but the descriptor is shared memory and the backend is user code. A flush
+// carries no range (the kernel sets its sector to -1), so it is not range checked.
 func (q *queue) serve(tag uint16) int32 {
 	d := q.desc(tag)
+	size := q.dev.params.Backend.Size()
+	if op := d.OpFlags & opMask; op != opFlush && (d.StartSector > uint64(size)/sectorSize || int64(d.NrSectors)*sectorSize > size-int64(d.StartSector)*sectorSize) {
+		return resultEIO
+	}
 	off := int64(d.StartSector) * sectorSize
 	length := int64(d.NrSectors) * sectorSize
 	buf := q.buf(tag)
@@ -288,13 +311,13 @@ func (q *queue) prepare(nr uint32, tag uint16, res int32) error {
 }
 
 // desc reads tag's descriptor with atomic loads, since the kernel wrote it from another CPU.
+// Addr is left out: the buffer address is ours, not the kernel's.
 func (q *queue) desc(tag uint16) ioDesc {
 	base := unsafe.Add(unsafe.Pointer(unsafe.SliceData(q.descs)), uintptr(tag)*unsafe.Sizeof(ioDesc{}))
 	return ioDesc{
 		OpFlags:     atomic.LoadUint32((*uint32)(base)),
 		NrSectors:   atomic.LoadUint32((*uint32)(unsafe.Add(base, unsafe.Offsetof(ioDesc{}.NrSectors)))),
 		StartSector: atomic.LoadUint64((*uint64)(unsafe.Add(base, unsafe.Offsetof(ioDesc{}.StartSector)))),
-		Addr:        atomic.LoadUint64((*uint64)(unsafe.Add(base, unsafe.Offsetof(ioDesc{}.Addr)))),
 	}
 }
 

@@ -21,14 +21,25 @@ const (
 	// lockStripes bounds the per-chunk mutexes; chunks share a stripe by index modulo.
 	lockStripes = 1024
 	cowFileMode = 0600
+	// MaxRunBytes is the largest HydrateRun served from a pooled buffer; the hydrator sizes
+	// its runs to it.
+	MaxRunBytes = 1 << 20
 )
 
 var (
 	errOutOfRange = errors.New("range beyond device end")
 )
 
+// Info is what Inspect reads from a bitmap file.
+type Info struct {
+	Size      int64 // device size the bitmap was created for
+	ChunkSize int64
+	Chunks    int64
+	Written   int64 // chunks recorded as present in the COW file
+}
+
 // Store is the writable device image: reads come from the COW file for written chunks and
-// from the base source otherwise. It implements the go-ublk Backend interface.
+// from the base source otherwise. It implements ublk.Backend.
 type Store struct {
 	base      source.Source
 	cow       *os.File
@@ -36,32 +47,46 @@ type Store struct {
 	chunkSize int64
 	size      int64
 	dirty     atomic.Bool             // something changed since the last Flush
-	bufs      sync.Pool               // chunk-sized scratch buffers for read-modify-write and hydration
+	bufs      sync.Pool               // chunk-sized scratch buffers for read-modify-write
+	runBufs   sync.Pool               // MaxRunBytes buffers for hydration runs
+	flushMu   sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
 	locks     [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 }
 
 // Open opens or creates the COW file and bitmap for base. The Store takes ownership of base.
+// The COW file is locked so a second server cannot corrupt it, and a bitmap that records
+// written chunks refuses a COW file that is missing or shorter than the device: the data it
+// describes would read as zeros.
 func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Store, error) {
 	size := base.Size()
+	cow, err := os.OpenFile(cowPath, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, cowFileMode)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*Store, error) {
+		cow.Close()
+		return nil, err
+	}
+	if err := unix.Flock(int(cow.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fail(fmt.Errorf("cow file %s is in use by another process", cowPath))
+	}
+	st, err := cow.Stat()
+	if err != nil {
+		return fail(err)
+	}
 	bitmap, err := OpenBitmap(bitmapPath, size, chunkSize)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	cow, err := os.OpenFile(cowPath, os.O_RDWR|os.O_CREATE, cowFileMode)
-	if err != nil {
-		bitmap.Close()
-		return nil, err
+	if written := bitmap.Count(); written > 0 && st.Size() < size {
+		bitmap.CloseNoSync()
+		return fail(fmt.Errorf("cow file %s is missing or truncated (%d bytes) but its bitmap records %d written chunks; restore it or delete the bitmap to start over", cowPath, st.Size(), written))
 	}
-	// Extend a fresh (or short) COW file to the device size so it is a complete sparse image
-	if st, err := cow.Stat(); err != nil {
-		cow.Close()
-		bitmap.Close()
-		return nil, err
-	} else if st.Size() < size {
+	// Extend a fresh COW file to the device size so it is a complete sparse image
+	if st.Size() < size {
 		if err := cow.Truncate(size); err != nil {
-			cow.Close()
-			bitmap.Close()
-			return nil, fmt.Errorf("cow file %s: %w", cowPath, err)
+			bitmap.CloseNoSync()
+			return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 		}
 	}
 	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
@@ -69,10 +94,17 @@ func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Sto
 		b := make([]byte, chunkSize)
 		return &b
 	}
+	s.runBufs.New = func() any {
+		b := make([]byte, MaxRunBytes)
+		return &b
+	}
 	return s, nil
 }
 
 func (s *Store) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("%w: negative offset %d", errOutOfRange, off)
+	}
 	var eof error
 	if off >= s.size {
 		return 0, io.EOF
@@ -127,15 +159,28 @@ func (s *Store) Size() int64 {
 	return s.size
 }
 
-// Flush makes all completed writes durable: COW data first, then the bitmap, so a bit on
-// disk never describes data that is not.
+// Abort makes blocked and future base reads fail at once, if the base supports it, so a
+// stopping device never waits on a hung source.
+func (s *Store) Abort() {
+	source.Abort(s.base)
+}
+
+// Flush makes all completed writes durable: the bitmap pages are snapshotted first, then the
+// COW data is synced, then the snapshot is written, so a bit on disk never describes data
+// that is not (a write landing between the two syncs stays dirty for the next Flush).
 func (s *Store) Flush() error {
-	s.dirty.Store(false)
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	if !s.dirty.Swap(false) {
+		return nil
+	}
+	pages := s.bitmap.Snapshot()
 	if err := s.cow.Sync(); err != nil {
+		s.bitmap.Redirty(pages)
 		s.dirty.Store(true)
 		return err
 	}
-	if err := s.bitmap.Sync(); err != nil {
+	if err := s.bitmap.Commit(pages); err != nil {
 		s.dirty.Store(true)
 		return err
 	}
@@ -147,9 +192,15 @@ func (s *Store) Written() int64 {
 	return s.bitmap.Count()
 }
 
-// Close flushes and closes the COW file, the bitmap, and the base source.
+// Close flushes and closes the COW file, the bitmap, and the base source. If the data could
+// not be made durable, pending bits are dropped rather than written ahead of it.
 func (s *Store) Close() error {
-	return errors.Join(s.Flush(), s.cow.Close(), s.bitmap.Close(), s.base.Close())
+	err := s.Flush()
+	closeBitmap := s.bitmap.Close
+	if err != nil {
+		closeBitmap = s.bitmap.CloseNoSync
+	}
+	return errors.Join(err, s.cow.Close(), closeBitmap(), s.base.Close())
 }
 
 // writeChunk writes p, which lies entirely within chunk, at device offset off. The first
@@ -264,48 +315,17 @@ func (s *Store) ChunkSize() int64 {
 	return s.chunkSize
 }
 
-// IsWritten reports whether chunk lives in the COW file.
+// IsWritten reports whether chunk lives in the COW file; out-of-range chunks do not.
 func (s *Store) IsWritten(chunk int64) bool {
 	return s.bitmap.Test(chunk)
-}
-
-// HydrateChunk copies chunk from the base into the COW file unless it is already there.
-// With direct, the read bypasses cache tiers. It reports whether a copy happened.
-func (s *Store) HydrateChunk(chunk int64, direct bool) (bool, error) {
-	start := chunk * s.chunkSize
-	scratch := s.bufs.Get().(*[]byte)
-	defer s.bufs.Put(scratch)
-	buf := (*scratch)[:min(s.chunkSize, s.size-start)]
-	mu := &s.locks[chunk%lockStripes]
-	mu.Lock()
-	defer mu.Unlock()
-	if s.bitmap.Test(chunk) {
-		return false, nil
-	}
-	var n int
-	var err error
-	if direct {
-		n, err = source.ReadDirect(s.base, buf, start)
-	} else {
-		n, err = s.base.ReadAt(buf, start)
-	}
-	if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
-		return false, fmt.Errorf("hydrate chunk %d: %w", chunk, err)
-	}
-	if n < len(buf) {
-		return false, fmt.Errorf("hydrate chunk %d: short read (%d of %d bytes)", chunk, n, len(buf))
-	}
-	if _, err := s.cow.WriteAt(buf, start); err != nil {
-		return false, err
-	}
-	s.bitmap.Set(chunk)
-	s.dirty.Store(true)
-	return true, nil
 }
 
 // MarkZero records chunk as written without copying anything, for chunks known to read as
 // zeros: the sparse COW file reads zeros there. It reports whether the bit was newly set.
 func (s *Store) MarkZero(chunk int64) bool {
+	if chunk < 0 || chunk >= s.bitmap.Chunks() {
+		return false
+	}
 	mu := &s.locks[chunk%lockStripes]
 	mu.Lock()
 	defer mu.Unlock()
@@ -340,14 +360,6 @@ func Complete(bitmapPath string) (size, chunkSize int64, complete bool, err erro
 	return info.Size, info.ChunkSize, info.Written == info.Chunks, nil
 }
 
-// Info is what Inspect reads from a bitmap file.
-type Info struct {
-	Size      int64 // device size the bitmap was created for
-	ChunkSize int64
-	Chunks    int64
-	Written   int64 // chunks recorded as present in the COW file
-}
-
 // Inspect reads a bitmap file without opening the store.
 func Inspect(bitmapPath string) (*Info, error) {
 	data, err := os.ReadFile(bitmapPath)
@@ -359,6 +371,9 @@ func Inspect(bitmapPath string) (*Info, error) {
 		return nil, fmt.Errorf("%w %s: %w", errBitmap, bitmapPath, err)
 	}
 	info := &Info{Size: size, ChunkSize: chunkSize, Chunks: (size + chunkSize - 1) / chunkSize}
+	if int64(len(data)-bitmapHeaderSize)*8 < info.Chunks {
+		return nil, fmt.Errorf("%w %s: file too short for %d chunks", errBitmap, bitmapPath, info.Chunks)
+	}
 	for _, b := range data[bitmapHeaderSize:] {
 		info.Written += int64(bits.OnesCount8(b))
 	}
@@ -380,7 +395,13 @@ func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
 	}
 	last := min(first+count, chunks)
 	start := first * s.chunkSize
-	buf := make([]byte, min(last*s.chunkSize, s.size)-start)
+	length := min(last*s.chunkSize, s.size) - start
+	buf := make([]byte, length)
+	if length <= MaxRunBytes {
+		scratch := s.runBufs.Get().(*[]byte)
+		defer s.runBufs.Put(scratch)
+		buf = (*scratch)[:length]
+	}
 	var n int
 	var err error
 	if direct {

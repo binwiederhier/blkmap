@@ -12,8 +12,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
+	"heckel.io/blkmap/config"
 	"heckel.io/blkmap/device"
 	"heckel.io/blkmap/util"
 )
@@ -55,7 +57,7 @@ func main() {
 	dev, err := device.Serve(ctx, &device.Options{
 		ID:      *id,
 		Base:    &synthetic{size: n},
-		COWFile: "/var/tmp/blkmap-example-" + *id + ".cow",
+		COWFile: filepath.Join(config.DefaultStateDir, "example-"+*id+".cow"),
 	})
 	if err != nil {
 		log.Fatal(err)

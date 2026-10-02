@@ -3,6 +3,7 @@ package source
 import (
 	"errors"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -114,4 +115,26 @@ func BenchmarkCacheReadAt(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestCacheShortReadFromSlow(t *testing.T) {
+	t.Parallel()
+	fast := &tier{mem: mem{data: pattern(100)}, notFound: func(int64) bool { return true }}
+	slow := &short{mem: mem{data: pattern(4096)}}
+	c := NewCache(fast, slow)
+	p := make([]byte, 1000)
+	n, err := c.ReadAt(p, 0)
+	// The slow tier returned fewer bytes than asked without an error; the rest of p is
+	// stale and must not be handed up as data
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, 10, n)
+}
+
+// short is a source that returns only 10 bytes of any read, with no error.
+type short struct {
+	mem
+}
+
+func (s *short) ReadAt(p []byte, off int64) (int, error) {
+	return s.mem.ReadAt(p[:min(10, len(p))], off)
 }

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -49,7 +51,7 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 	chunks := (size + chunkSize - 1) / chunkSize
 	words := (chunks + bitmapWordBits - 1) / bitmapWordBits
 	areaSize := (words*bitmapWordSize + bitmapPageSize - 1) / bitmapPageSize * bitmapPageSize
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, bitmapFileMode)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, bitmapFileMode)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +62,11 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 	}
 	if st.Size() == 0 {
 		err = writeHeader(f, bitmapHeaderSize+areaSize, size, chunkSize)
+		// Allocate the whole file now: a full cow filesystem must not stop the bitmap from
+		// recording what made it into the cow file
+		if err == nil {
+			err = preallocate(f, bitmapHeaderSize+areaSize)
+		}
 	} else {
 		err = checkHeader(f, size, chunkSize)
 	}
@@ -75,13 +82,19 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 	return b, nil
 }
 
-// Test reports whether chunk i is marked written.
+// Test reports whether chunk i is marked written; out-of-range chunks are not.
 func (b *Bitmap) Test(i int64) bool {
+	if i < 0 || i >= b.chunks {
+		return false
+	}
 	return atomic.LoadUint32(&b.words[i/bitmapWordBits])&(1<<(i%bitmapWordBits)) != 0
 }
 
 // Set marks chunk i as written. The bit is in memory until the next Sync.
 func (b *Bitmap) Set(i int64) {
+	if i < 0 || i >= b.chunks {
+		return
+	}
 	word := i / bitmapWordBits
 	atomic.OrUint32(&b.words[word], 1<<(i%bitmapWordBits))
 	b.dirty[word*bitmapWordSize/bitmapPageSize].Store(true)
@@ -101,28 +114,72 @@ func (b *Bitmap) Chunks() int64 {
 	return b.chunks
 }
 
-// Sync writes every page with changed bits to the file and makes the file durable. Call it
-// only after the COW data those bits describe is durable.
-func (b *Bitmap) Sync() error {
-	b.syncMu.Lock()
-	defer b.syncMu.Unlock()
+// page is a snapshot of one dirty page of the bit area, taken before the COW data is synced
+// so that only bits whose data is already durable can reach the file.
+type page struct {
+	index int
+	data  []byte
+}
+
+// Snapshot copies every page with changed bits and clears their dirty flags. Bits set
+// afterwards stay dirty for the next snapshot.
+func (b *Bitmap) Snapshot() []page {
+	var pages []page
 	area := b.area()
-	for page := range b.dirty {
-		if !b.dirty[page].Swap(false) {
+	for i := range b.dirty {
+		if !b.dirty[i].Swap(false) {
 			continue
 		}
-		start := page * bitmapPageSize
-		if _, err := b.f.WriteAt(area[start:start+bitmapPageSize], int64(bitmapHeaderSize+start)); err != nil {
-			b.dirty[page].Store(true)
+		start := i * bitmapPageSize
+		pages = append(pages, page{index: i, data: append([]byte(nil), area[start:start+bitmapPageSize]...)})
+	}
+	return pages
+}
+
+// Commit writes snapshotted pages to the file and makes it durable. On failure the pages are
+// marked dirty again so a later Sync retries them.
+func (b *Bitmap) Commit(pages []page) error {
+	if len(pages) == 0 {
+		return nil
+	}
+	b.syncMu.Lock()
+	defer b.syncMu.Unlock()
+	for _, p := range pages {
+		if _, err := b.f.WriteAt(p.data, int64(bitmapHeaderSize+p.index*bitmapPageSize)); err != nil {
+			b.Redirty(pages)
 			return err
 		}
 	}
-	return b.f.Sync()
+	if err := b.f.Sync(); err != nil {
+		b.Redirty(pages)
+		return err
+	}
+	return nil
+}
+
+// Redirty marks snapshotted pages dirty again, when their data sync failed.
+func (b *Bitmap) Redirty(pages []page) {
+	for _, p := range pages {
+		b.dirty[p.index].Store(true)
+	}
+}
+
+// Sync writes every page with changed bits to the file and makes the file durable. Call it
+// only when the data those bits describe is already durable; the store uses Snapshot and
+// Commit around its own data sync instead.
+func (b *Bitmap) Sync() error {
+	return b.Commit(b.Snapshot())
 }
 
 // Close syncs and closes the bitmap.
 func (b *Bitmap) Close() error {
 	return errors.Join(b.Sync(), b.f.Close())
+}
+
+// CloseNoSync closes the bitmap without writing pending bits, for when their data is not
+// known to be durable.
+func (b *Bitmap) CloseNoSync() error {
+	return b.f.Close()
 }
 
 // area views the words as the bytes stored in the file (host byte order).
@@ -165,13 +222,25 @@ func checkHeader(f *os.File, size, chunkSize int64) error {
 	return nil
 }
 
-// parseHeader validates the magic and version and returns the recorded geometry.
+// parseHeader validates the magic, version and geometry and returns the recorded geometry.
 func parseHeader(header []byte) (size, chunkSize int64, err error) {
 	if len(header) < bitmapHeaderSize || string(header[:len(bitmapMagic)]) != bitmapMagic {
-		return 0, 0, fmt.Errorf("not a blkmap bitmap (bad magic)")
+		return 0, 0, errors.New("not a blkmap bitmap (bad magic)")
 	}
 	if v := binary.LittleEndian.Uint32(header[bitmapOffVersion:]); v != bitmapVersion {
 		return 0, 0, fmt.Errorf("unsupported version %d", v)
 	}
-	return int64(binary.LittleEndian.Uint64(header[bitmapOffSize:])), int64(binary.LittleEndian.Uint64(header[bitmapOffChunk:])), nil
+	size, chunkSize = int64(binary.LittleEndian.Uint64(header[bitmapOffSize:])), int64(binary.LittleEndian.Uint64(header[bitmapOffChunk:]))
+	if chunkSize <= 0 || chunkSize&(chunkSize-1) != 0 || size <= 0 {
+		return 0, 0, fmt.Errorf("corrupt header: size %d, chunk size %d", size, chunkSize)
+	}
+	return size, chunkSize, nil
+}
+
+// preallocate reserves n bytes for f; filesystems without fallocate (tmpfs) are left sparse.
+func preallocate(f *os.File, n int64) error {
+	if err := unix.Fallocate(int(f.Fd()), 0, 0, n); err != nil && !errors.Is(err, unix.EOPNOTSUPP) {
+		return err
+	}
+	return nil
 }

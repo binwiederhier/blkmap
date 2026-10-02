@@ -113,6 +113,13 @@ func (c *Concat) readAt(p []byte, off int64, direct bool) (int, error) {
 	return n, eof
 }
 
+// Abort aborts every segment.
+func (c *Concat) Abort() {
+	for _, s := range c.segments {
+		Abort(s.Source)
+	}
+}
+
 func (c *Concat) Size() int64 {
 	return c.size
 }

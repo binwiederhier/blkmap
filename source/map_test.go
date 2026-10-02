@@ -2,6 +2,7 @@ package source
 
 import (
 	"bytes"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -175,4 +176,24 @@ func (r *recordingSource) recorded() []Range {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]Range(nil), r.reads...)
+}
+
+func TestNewMapRejectsOverflow(t *testing.T) {
+	t.Parallel()
+	_, err := NewMap([]Range{{Offset: math.MaxInt64 - 10, Length: 100}})
+	assert.Error(t, err, "offset + length overflows")
+	_, err = NewMap([]Range{{Offset: 0, Length: math.MaxInt64}, {Offset: 10, Length: math.MaxInt64}})
+	assert.Error(t, err, "merging overflows")
+}
+
+func TestMapHasData(t *testing.T) {
+	m, err := NewMap([]Range{{Offset: 100, Length: 50}, {Offset: 1000, Length: 10}})
+	require.NoError(t, err)
+	assert.False(t, m.HasData(0, 100))
+	assert.True(t, m.HasData(0, 101))
+	assert.True(t, m.HasData(149, 1))
+	assert.False(t, m.HasData(150, 850))
+	assert.True(t, m.HasData(150, 851))
+	assert.False(t, m.HasData(1010, 1<<40))
+	assert.Zero(t, testing.AllocsPerRun(100, func() { m.HasData(0, 2000) }))
 }

@@ -1,8 +1,10 @@
 package ublk
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -16,14 +18,24 @@ const (
 	controlWait    = 100 * time.Millisecond
 )
 
+var (
+	errControlPoisoned = errors.New("ublk control: a previous command never completed")
+	// leaked pins controls whose command timed out: the kernel may still write into their
+	// buffers, so they are never freed or closed.
+	leaked   []*control
+	leakedMu sync.Mutex
+)
+
 // control talks to /dev/ublk-control. Its command and data buffers are fields so their
 // addresses are stable while the kernel reads or writes them.
 type control struct {
-	fd   int
-	ring *ring
-	cmd  ctrlCmd
-	info devInfo
-	par  params
+	fd       int
+	ring     *ring
+	seq      uint64 // user data of the command in flight, so a late completion is told apart
+	poisoned bool
+	cmd      ctrlCmd
+	info     devInfo
+	par      params
 }
 
 func openControl() (*control, error) {
@@ -40,6 +52,12 @@ func openControl() (*control, error) {
 }
 
 func (c *control) close() error {
+	if c.poisoned {
+		leakedMu.Lock()
+		leaked = append(leaked, c)
+		leakedMu.Unlock()
+		return nil
+	}
 	c.ring.close()
 	return syscall.Close(c.fd)
 }
@@ -96,9 +114,15 @@ func (c *control) deleteDevice(id uint32) error {
 }
 
 // run submits c.cmd as command nr and waits for its completion. The control ring carries
-// one command at a time, so the next CQE is this command's result.
+// one command at a time; a completion with another sequence number is a stale one from a
+// command that timed out and is skipped. After a timeout the control is poisoned, since
+// its buffers may still be written by the kernel.
 func (c *control) run(nr uint32) error {
-	if err := c.ring.prepare(ioctl(nr, uint32(unsafe.Sizeof(c.cmd))), 0, unsafe.Pointer(&c.cmd), unsafe.Sizeof(c.cmd)); err != nil {
+	if c.poisoned {
+		return errControlPoisoned
+	}
+	c.seq++
+	if err := c.ring.prepare(ioctl(nr, uint32(unsafe.Sizeof(c.cmd))), c.seq, unsafe.Pointer(&c.cmd), unsafe.Sizeof(c.cmd)); err != nil {
 		return err
 	}
 	if err := c.ring.flush(); err != nil {
@@ -106,13 +130,17 @@ func (c *control) run(nr uint32) error {
 	}
 	deadline := time.Now().Add(controlTimeout)
 	for {
-		if _, res, ok := c.ring.next(); ok {
+		if userData, res, ok := c.ring.next(); ok {
+			if userData != c.seq {
+				continue
+			}
 			if res < 0 {
 				return fmt.Errorf("ublk control %#x: %w", nr, syscall.Errno(-res))
 			}
 			return nil
 		}
 		if time.Now().After(deadline) {
+			c.poisoned = true
 			return fmt.Errorf("ublk control %#x: timed out after %s", nr, controlTimeout)
 		}
 		if err := c.ring.wait(controlWait); err != nil {

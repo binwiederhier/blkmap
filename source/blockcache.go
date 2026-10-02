@@ -13,6 +13,9 @@ const (
 	// readAheadBlocks is how far a sequential reader triggers fetches past its current
 	// block, and the bound on concurrent read-ahead fetches.
 	readAheadBlocks = 8
+	// recentEnds is how many recent read ends are remembered for sequential detection, so
+	// interleaved streams (parallel dispatch, several readers) are each still recognized.
+	recentEnds = 16
 )
 
 // blockCache is an LRU of fixed-size blocks in front of a fetch function, with single-flight
@@ -26,11 +29,11 @@ type blockCache struct {
 	blocks  map[int64]*list.Element
 	lru     *list.List
 	pending map[int64]*cacheFetch
-	mu      sync.Mutex // Protects blocks, lru, pending, lastEnd
-
-	lastEnd int64                  // where the previous read ended, for sequential detection
+	ends    [recentEnds]int64      // where recent reads ended, for sequential detection
+	next    int                    // ends slot to overwrite next
 	ahead   chan struct{}          // semaphore bounding read-ahead goroutines
 	skip    func(index int64) bool // blocks read-ahead must not fetch (holes), may be nil
+	mu      sync.Mutex             // Protects blocks, lru, pending, ends, next
 }
 
 // cacheBlock is one cached block.
@@ -53,7 +56,6 @@ func newBlockCache(total int64, fetch func(index int64) ([]byte, error)) *blockC
 		blocks:  make(map[int64]*list.Element),
 		lru:     list.New(),
 		pending: make(map[int64]*cacheFetch),
-		lastEnd: -1,
 		ahead:   make(chan struct{}, readAheadBlocks),
 	}
 }
@@ -63,8 +65,9 @@ func newBlockCache(total int64, fetch func(index int64) ([]byte, error)) *blockC
 func (c *blockCache) readAt(p []byte, off int64) error {
 	end := off + int64(len(p))
 	c.mu.Lock()
-	sequential := off == c.lastEnd
-	c.lastEnd = end
+	sequential := off > 0 && c.endedAt(off)
+	c.ends[c.next] = end
+	c.next = (c.next + 1) % recentEnds
 	c.mu.Unlock()
 	for pos := off; pos < end; {
 		block, err := c.block(pos / cacheBlockSize)
@@ -77,6 +80,16 @@ func (c *blockCache) readAt(p []byte, off int64) error {
 		c.readAhead((end - 1) / cacheBlockSize)
 	}
 	return nil
+}
+
+// endedAt reports whether a recent read ended at off. Called with mu held.
+func (c *blockCache) endedAt(off int64) bool {
+	for _, end := range c.ends {
+		if end == off {
+			return true
+		}
+	}
+	return false
 }
 
 // block returns the block at index, fetching it on a miss; concurrent readers share one fetch.

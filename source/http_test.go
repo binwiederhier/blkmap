@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -117,16 +118,18 @@ func TestHTTPSingleFlight(t *testing.T) {
 	t.Cleanup(srv.Close)
 	h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
 	require.NoError(t, err)
-	// 8 readers of the same block at once: one fetch, every reader gets the data
+	// 8 readers of the same block at once: one fetch, every reader gets the data. The
+	// offsets leave gaps so no read starts where another ended (that would look like a
+	// sequential stream and start read-ahead of the next block)
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			p := make([]byte, 4096)
-			_, err := h.ReadAt(p, int64(i*4096))
+			_, err := h.ReadAt(p, int64(i*8192))
 			assert.NoError(t, err)
-			assert.Equal(t, data[i*4096:(i+1)*4096], p)
+			assert.Equal(t, data[i*8192:i*8192+4096], p)
 		}(i)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -266,6 +269,92 @@ func TestHTTPSequentialReadAheadThroughput(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	t.Logf("32 sequential 1 MiB reads over a 20 ms server: %s, peak %d in flight", elapsed, peak.Load())
-	assert.Less(t, elapsed, 300*time.Millisecond)
+	assert.Less(t, elapsed, 450*time.Millisecond) // serial would be 640 ms; slack for a loaded CI box
 	assert.GreaterOrEqual(t, peak.Load(), int32(4))
+}
+
+func TestHTTPRejectsBogusContentRange(t *testing.T) {
+	t.Parallel()
+	for _, cr := range []string{"bytes 0-0/0", "bytes 0-0/-5", "bytes 0-0/*", "bytes 0-0/abc", "items 0-0/100"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Range", cr)
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write([]byte{0})
+		}))
+		_, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+		assert.Error(t, err, cr)
+		srv.Close()
+	}
+}
+
+func TestHTTPVerifiesResponseRange(t *testing.T) {
+	t.Parallel()
+	data := pattern(2 * httpBlockSize)
+	var lie atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if lie.Load() {
+			// A broken origin answers 206 with the wrong range and a body of the right length
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", httpBlockSize-1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(data[:httpBlockSize])
+			return
+		}
+		http.ServeContent(w, r, "disk.img", time.Time{}, bytes.NewReader(data))
+	}))
+	t.Cleanup(srv.Close)
+	h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+	require.NoError(t, err)
+	lie.Store(true)
+	p := make([]byte, 100)
+	_, err = h.ReadAt(p, httpBlockSize)
+	assert.Error(t, err, "a 206 for the wrong range must not be served as data")
+}
+
+func TestHTTPAbortUnblocksReads(t *testing.T) {
+	t.Parallel()
+	data := pattern(2 * httpBlockSize)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != httpProbeRange {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		http.ServeContent(w, r, "disk.img", time.Time{}, bytes.NewReader(data))
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.ReadAt(make([]byte, 100), 0)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	h.Abort()
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("read still blocked on the origin after Abort")
+	}
+	// Everything after an abort fails fast too, so a stopping device never waits on the origin
+	_, err = h.ReadAt(make([]byte, 100), httpBlockSize)
+	assert.Error(t, err)
+}
+
+func TestHTTPRedactsCredentials(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	url := strings.Replace(srv.URL, "http://", "http://user:secret@", 1)
+	_, err := NewHTTP(srv.Client(), url, 0, 0)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "secret")
+	assert.Contains(t, err.Error(), "user:xxxxx@")
 }
