@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -28,14 +29,30 @@ const (
 
 var (
 	errOutOfRange = errors.New("range beyond device end")
+	// ErrSourceChanged means the base no longer has the content the COW file was written
+	// over; see Options.Identity.
+	ErrSourceChanged = errors.New("source changed")
 )
+
+// Options locates a store's files.
+type Options struct {
+	COWFile    string
+	Bitmap     string
+	LiveBitmap string // on tmpfs, optional; see Bitmap
+	ChunkSize  int64
+	// Identity fingerprints the base's content (source.Identity). It is recorded, and once
+	// chunks are written a different one is refused: the overlay belongs to that content.
+	// Empty skips the check.
+	Identity string
+}
 
 // Info is what Inspect reads from a bitmap file.
 type Info struct {
 	Size      int64 // device size the bitmap was created for
 	ChunkSize int64
 	Chunks    int64
-	Written   int64 // chunks recorded as present in the COW file
+	Written   int64  // chunks recorded as present in the COW file
+	Identity  string // the source the COW file overlays (see Options.Identity)
 }
 
 // Store is the writable device image: reads come from the COW file for written chunks and
@@ -46,9 +63,13 @@ type Store struct {
 	bitmap    *Bitmap
 	chunkSize int64
 	size      int64
-	dirty     atomic.Bool             // something changed since the last Flush
-	bufs      sync.Pool               // chunk-sized scratch buffers for read-modify-write
-	runBufs   sync.Pool               // MaxRunBytes buffers for hydration runs
+	dirty     atomic.Bool  // something changed since the last Flush
+	bufs      sync.Pool    // chunk-sized scratch buffers for read-modify-write
+	runBufs   sync.Pool    // MaxRunBytes buffers for hydration runs
+	srcReads  atomic.Int64 // base reads, for SourceStats
+	srcBytes  atomic.Int64
+	srcErrors atomic.Int64
+	srcNanos  atomic.Int64
 	flushMu   sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
 	locks     [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 }
@@ -58,6 +79,14 @@ type Store struct {
 // written chunks refuses a COW file that is missing or shorter than the device: the data it
 // describes would read as zeros.
 func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Store, error) {
+	return OpenWith(base, &Options{COWFile: cowPath, Bitmap: bitmapPath, ChunkSize: chunkSize})
+}
+
+// OpenWith is Open with all options. A server that re-attaches to a device after a crash
+// must use a live bitmap, or writes acknowledged before the crash but not yet flushed would
+// silently revert.
+func OpenWith(base source.Source, o *Options) (*Store, error) {
+	cowPath, bitmapPath, livePath, chunkSize := o.COWFile, o.Bitmap, o.LiveBitmap, o.ChunkSize
 	size := base.Size()
 	cow, err := os.OpenFile(cowPath, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, cowFileMode)
 	if err != nil {
@@ -74,13 +103,17 @@ func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Sto
 	if err != nil {
 		return fail(err)
 	}
-	bitmap, err := OpenBitmap(bitmapPath, size, chunkSize)
+	bitmap, err := OpenLiveBitmap(bitmapPath, livePath, size, chunkSize)
 	if err != nil {
 		return fail(err)
 	}
 	if written := bitmap.Count(); written > 0 && st.Size() < size {
 		bitmap.CloseNoSync()
 		return fail(fmt.Errorf("cow file %s is missing or truncated (%d bytes) but its bitmap records %d written chunks; restore it or delete the bitmap to start over", cowPath, st.Size(), written))
+	}
+	if err := checkIdentity(bitmap, o.Identity); err != nil {
+		bitmap.CloseNoSync()
+		return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 	}
 	// Extend a fresh COW file to the device size so it is a complete sparse image
 	if st.Size() < size {
@@ -90,6 +123,7 @@ func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Sto
 		}
 	}
 	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
+	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
 	s.bufs.New = func() any {
 		b := make([]byte, chunkSize)
 		return &b
@@ -99,6 +133,62 @@ func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Sto
 		return &b
 	}
 	return s, nil
+}
+
+// SourceStats counts the reads a store made from its base source.
+type SourceStats struct {
+	Reads    int64
+	Bytes    int64
+	Errors   int64
+	Duration time.Duration // total time spent in base reads
+}
+
+// SourceStats returns the base read counters.
+func (s *Store) SourceStats() SourceStats {
+	return SourceStats{Reads: s.srcReads.Load(), Bytes: s.srcBytes.Load(), Errors: s.srcErrors.Load(), Duration: time.Duration(s.srcNanos.Load())}
+}
+
+// readBase reads from the base source, counting the read.
+func (s *Store) readBase(p []byte, off int64) (int, error) {
+	start := time.Now()
+	n, err := s.base.ReadAt(p, off)
+	s.countBase(n, err, start)
+	return n, err
+}
+
+// readBaseDirect is readBase bypassing cache tiers (source.ReadDirect).
+func (s *Store) readBaseDirect(p []byte, off int64) (int, error) {
+	start := time.Now()
+	n, err := source.ReadDirect(s.base, p, off)
+	s.countBase(n, err, start)
+	return n, err
+}
+
+func (s *Store) countBase(n int, err error, start time.Time) {
+	s.srcReads.Add(1)
+	s.srcBytes.Add(int64(n))
+	s.srcNanos.Add(int64(time.Since(start)))
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.srcErrors.Add(1)
+	}
+}
+
+// checkIdentity records the base's identity, refusing a changed one once chunks are written.
+func checkIdentity(bitmap *Bitmap, identity string) error {
+	if identity == "" {
+		return nil
+	}
+	recorded, err := bitmap.Identity()
+	if err != nil {
+		return err
+	}
+	if recorded == storedIdentity(identity) {
+		return nil
+	}
+	if recorded != "" && bitmap.Count() > 0 {
+		return fmt.Errorf("%w: its %d written chunks overlay %q, the source is now %q; restore the original source, or run blkmap pin if the content is the same", ErrSourceChanged, bitmap.Count(), recorded, storedIdentity(identity))
+	}
+	return bitmap.SetIdentity(identity)
 }
 
 func (s *Store) ReadAt(p []byte, off int64) (int, error) {
@@ -127,7 +217,7 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 		if written {
 			_, err = s.cow.ReadAt(p[:m], off)
 		} else {
-			_, err = s.base.ReadAt(p[:m], off)
+			_, err = s.readBase(p[:m], off)
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			return n - len(p), err
@@ -216,7 +306,7 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 		scratch := s.bufs.Get().(*[]byte)
 		defer s.bufs.Put(scratch)
 		buf := (*scratch)[:length]
-		if _, err := s.base.ReadAt(buf, start); err != nil && !errors.Is(err, io.EOF) {
+		if _, err := s.readBase(buf, start); err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("copy chunk %d from base: %w", chunk, err)
 		}
 		copy(buf[off-start:], p)
@@ -370,7 +460,7 @@ func Inspect(bitmapPath string) (*Info, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w %s: %w", errBitmap, bitmapPath, err)
 	}
-	info := &Info{Size: size, ChunkSize: chunkSize, Chunks: (size + chunkSize - 1) / chunkSize}
+	info := &Info{Size: size, ChunkSize: chunkSize, Chunks: (size + chunkSize - 1) / chunkSize, Identity: headerIdentity(data)}
 	if int64(len(data)-bitmapHeaderSize)*8 < info.Chunks {
 		return nil, fmt.Errorf("%w %s: file too short for %d chunks", errBitmap, bitmapPath, info.Chunks)
 	}
@@ -396,18 +486,20 @@ func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
 	last := min(first+count, chunks)
 	start := first * s.chunkSize
 	length := min(last*s.chunkSize, s.size) - start
-	buf := make([]byte, length)
+	var buf []byte
 	if length <= MaxRunBytes {
 		scratch := s.runBufs.Get().(*[]byte)
 		defer s.runBufs.Put(scratch)
 		buf = (*scratch)[:length]
+	} else {
+		buf = make([]byte, length)
 	}
 	var n int
 	var err error
 	if direct {
-		n, err = source.ReadDirect(s.base, buf, start)
+		n, err = s.readBaseDirect(buf, start)
 	} else {
-		n, err = s.base.ReadAt(buf, start)
+		n, err = s.readBase(buf, start)
 	}
 	if err != nil && !(errors.Is(err, io.EOF) && n == len(buf)) {
 		return 0, fmt.Errorf("hydrate chunks %d..%d: %w", first, last, err)

@@ -4,22 +4,32 @@ Documentation=https://heckel.io/blkmap
 After=local-fs-pre.target
 Before=local-fs.target
 DefaultDependencies=no
-# Crash loops keep restarting (a dead server leaves a kernel device only a restart cleans up)
+# A crashed server's device pauses I/O until the restarted server re-attaches; if systemd
+# gives up restarting, the reap unit deletes it so that I/O fails instead of waiting forever
 StartLimitIntervalSec=60
 StartLimitBurst=10
+OnFailure=blkmap-reap@%i.service
 
 [Service]
 Type=notify
 ExecStartPre=-/sbin/modprobe ublk_drv
 ExecStart=/usr/bin/blkmap serve %i
 Restart=on-failure
-RestartSec=2
+RestartSec=1
+# Restarts go straight back to activating, so a crash does not count as a failure (which
+# would trigger the reap unit before the restarted server could re-attach)
+RestartMode=direct
+# reload hands the device to a fresh server without disturbing it: the server re-executes
+# the (possibly upgraded) binary in place and re-attaches. stop tears the device down. Exit
+# 75 is the fallback if the re-exec fails: systemd starts a new server, which re-attaches.
+ExecReload=/bin/kill -HUP $MAINPID
+SuccessExitStatus=75
+RestartForceExitStatus=75
 # Stopping tears down the kernel device; give in-flight I/O time to drain
 TimeoutStopSec=30
 KillSignal=SIGTERM
 # Root is needed for /dev/ublk-control, but nothing else: no setuid, no home directories,
-# and the OOM killer should pick anything else first (a server killed with I/O in flight
-# leaves the kernel device wedged)
+# and the OOM killer should pick anything else first (I/O pauses until the restart)
 NoNewPrivileges=yes
 ProtectHome=yes
 RestrictSUIDSGID=yes

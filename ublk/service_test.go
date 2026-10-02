@@ -538,3 +538,23 @@ func TestDeviceCloseDrainsInflight(t *testing.T) {
 	}
 	assert.Equal(t, int32(0), m.inflight.Load(), "no backend call may be running after Close")
 }
+
+func TestDescriptorsCloseOnExec(t *testing.T) {
+	// A server that re-executes itself must not carry the char device into the new image:
+	// the kernel would still see the old server and refuse the recovery
+	fd, err := openCloexec("/dev/null")
+	require.NoError(t, err)
+	defer syscall.Close(fd)
+	dup, err := dupCloexec(fd)
+	require.NoError(t, err)
+	defer syscall.Close(dup)
+	for _, f := range []int{fd, dup} {
+		flags, err := unix.FcntlInt(uintptr(f), unix.F_GETFD, 0)
+		require.NoError(t, err)
+		assert.NotZero(t, flags&unix.FD_CLOEXEC)
+	}
+}
+
+func unsafePointer(b []byte) unsafe.Pointer {
+	return unsafe.Pointer(unsafe.SliceData(b))
+}

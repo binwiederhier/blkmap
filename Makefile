@@ -1,7 +1,7 @@
 MAKEFLAGS := --jobs=1
 VERSION := $(shell git describe --tag 2>/dev/null || echo dev)
 
-.PHONY: help build test test-root stress scenarios test-remote examples vet fmt release release-snapshot install-deb clean
+.PHONY: help build test test-root stress scenarios test-remote powercut test-vm examples vet fmt release release-snapshot install-deb clean
 
 help:
 	@echo "blkmap"
@@ -11,6 +11,8 @@ help:
 	@echo "  make stress           - e2e + fio/mkfs/crash workloads against the installed deb (root, fio)"
 	@echo "  make scenarios        - real-life scenarios: crashes, outages, restarts, bad configs (root, deb, fio)"
 	@echo "  make test-remote HOST=ip [SUITE=stress|scenarios|all] - root suites (+workloads) on a scratch VM"
+	@echo "  make powercut HOST=ip [CYCLES=10] [MODE=power|kill]  - power-cut or daemon-kill cycles on a scratch VM"
+	@echo "  make test-vm          - everything above on a throwaway Proxmox VM (PROXMOX=root@box11 TEMPLATE=9000)"
 	@echo "  make examples         - vet, test and build everything under examples/"
 	@echo "  make release-snapshot - Build debs/rpms/tarballs into dist/ via goreleaser (no tag needed)"
 	@echo "  make release          - Tagged release via goreleaser"
@@ -42,6 +44,14 @@ scenarios:
 # Same suites on a throwaway VM (HOST=... ; SUITE=stress|scenarios|all adds the workloads)
 test-remote:
 	scripts/remote-test.sh $(HOST) $(SUITE)
+
+# Power-loss (sysrq reboot) or daemon-kill cycles under write load (HOST=... ; reboots it)
+powercut:
+	scripts/powercut.sh $(HOST) $(or $(CYCLES),10) $(or $(MODE),power)
+
+# The full root-level suite on a VM created for the run and destroyed after it
+test-vm:
+	scripts/ci-vm.sh
 
 vet:
 	gofmt -l . && go vet ./...

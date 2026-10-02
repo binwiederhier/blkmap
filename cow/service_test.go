@@ -3,9 +3,11 @@ package cow
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -599,4 +601,152 @@ func TestOpenRefusesSymlinkedFiles(t *testing.T) {
 	require.NoError(t, os.Symlink(target, filepath.Join(dir, "d.bitmap")))
 	_, err = Open(&mem{data: make([]byte, 16*testChunk)}, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.bitmap"), testChunk)
 	assert.Error(t, err, "a symlinked bitmap must not be followed")
+}
+
+// abandon releases the store the way a killed process does: no flush, no bitmap sync, the
+// live bitmap left in place.
+func (s *Store) abandon() {
+	s.cow.Close()
+	s.bitmap.abandon()
+}
+
+func TestLiveBitmapSurvivesCrash(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cowPath, bitmapPath, livePath := filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), filepath.Join(dir, "d.live")
+	s, err := OpenWith(&mem{data: pattern(testSize)}, &Options{COWFile: cowPath, Bitmap: bitmapPath, LiveBitmap: livePath, ChunkSize: testChunk})
+	require.NoError(t, err)
+	written := bytes.Repeat([]byte{'w'}, testChunk)
+	_, err = s.WriteAt(written, 3*testChunk)
+	require.NoError(t, err)
+	// The write was acknowledged but never flushed, and the process dies: the data is in the
+	// cow file's page cache, the bit only in the live bitmap
+	s.abandon()
+	s, err = OpenWith(&mem{data: pattern(testSize)}, &Options{COWFile: cowPath, Bitmap: bitmapPath, LiveBitmap: livePath, ChunkSize: testChunk})
+	require.NoError(t, err)
+	assert.True(t, s.IsWritten(3), "the restarted server must not revert an acknowledged write")
+	p := make([]byte, testChunk)
+	_, err = s.ReadAt(p, 3*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, written, p)
+	// The recovered bits reach the on-disk bitmap at the next flush
+	require.NoError(t, s.Flush())
+	info, err := Inspect(bitmapPath)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), info.Written)
+	// A clean close leaves the disk bitmap authoritative and removes the live one
+	require.NoError(t, s.Close())
+	_, err = os.Stat(livePath)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestWithoutLiveBitmapCrashRevertsWrite(t *testing.T) {
+	t.Parallel()
+	// Why the live bitmap exists: with bits only in process memory, a crash forgets the
+	// write even though its data sits in the cow file
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	_, err := s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 3*testChunk)
+	require.NoError(t, err)
+	s.abandon()
+	s = newTestStore(t, dir, &mem{data: pattern(testSize)})
+	assert.False(t, s.IsWritten(3))
+	require.NoError(t, s.Close())
+}
+
+func TestLiveBitmapIgnoresForeignGeometry(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cowPath, bitmapPath, livePath := filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), filepath.Join(dir, "d.live")
+	// A live file from another geometry (the device was recreated) is not trusted
+	require.NoError(t, os.WriteFile(livePath, bytes.Repeat([]byte{0xff}, 2*bitmapHeaderSize), 0600))
+	s, err := OpenWith(&mem{data: pattern(testSize)}, &Options{COWFile: cowPath, Bitmap: bitmapPath, LiveBitmap: livePath, ChunkSize: testChunk})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), s.Written())
+	require.NoError(t, s.Close())
+}
+
+func TestStorePinsSourceIdentity(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	open := func(identity string) (*Store, error) {
+		return OpenWith(&mem{data: pattern(testSize)}, &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.cow.bitmap"), ChunkSize: testChunk, Identity: identity})
+	}
+	// Nothing written yet: the source may change freely, the latest one is recorded
+	s, err := open("v0")
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	s, err = open("v1")
+	require.NoError(t, err)
+	_, err = s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 0)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	info, err := Inspect(filepath.Join(dir, "d.cow.bitmap"))
+	require.NoError(t, err)
+	assert.Equal(t, "v1", info.Identity)
+	// Writes overlay v1: another source would mix them with different content
+	_, err = open("v2")
+	require.ErrorIs(t, err, ErrSourceChanged)
+	assert.Contains(t, err.Error(), "v1")
+	// No identity (detached start without sources) skips the check
+	s, err = open("")
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	// An operator who knows v2 has the same content accepts it explicitly
+	require.NoError(t, Pin(filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), "v2"))
+	s, err = open("v2")
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	// Very long identities (many segments) are stored as a hash
+	long := strings.Repeat("segment;", 1000)
+	require.NoError(t, Pin(filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), long))
+	s, err = open(long)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	_, err = open(long + "x")
+	require.ErrorIs(t, err, ErrSourceChanged)
+}
+
+func TestStoreSourceStats(t *testing.T) {
+	t.Parallel()
+	s := newTestStore(t, t.TempDir(), &mem{data: pattern(testSize)})
+	defer s.Close()
+	p := make([]byte, 2*testChunk)
+	_, err := s.ReadAt(p, 0) // unwritten: one coalesced base read
+	require.NoError(t, err)
+	_, err = s.WriteAt(make([]byte, 100), 5*testChunk) // partial first write: read-modify-write
+	require.NoError(t, err)
+	_, err = s.HydrateRun(8, 2, false)
+	require.NoError(t, err)
+	st := s.SourceStats()
+	assert.Equal(t, int64(3), st.Reads)
+	assert.Equal(t, int64(5*testChunk), st.Bytes)
+	assert.Zero(t, st.Errors)
+	assert.Positive(t, st.Duration)
+	// Reads of written chunks never touch the source
+	_, err = s.ReadAt(p[:testChunk], 5*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), s.SourceStats().Reads)
+	failing := newTestStore(t, t.TempDir(), &broken{size: testSize})
+	defer failing.Close()
+	_, err = failing.ReadAt(p, 0)
+	require.Error(t, err)
+	assert.Equal(t, int64(1), failing.SourceStats().Errors)
+}
+
+// broken is a base whose reads fail.
+type broken struct {
+	size int64
+}
+
+func (b *broken) ReadAt(p []byte, off int64) (int, error) {
+	return 0, errors.New("source gone")
+}
+
+func (b *broken) Size() int64 {
+	return b.size
+}
+
+func (b *broken) Close() error {
+	return nil
 }

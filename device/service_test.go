@@ -284,9 +284,10 @@ func TestServeCleansUpDeadPredecessor(t *testing.T) {
 		assert.ErrorIs(t, err, syscall.ENODEV)
 	}
 	// The state file now names the new device and goes away on Close
-	state, err := os.ReadFile(filepath.Join(runDir, "pred"))
-	require.NoError(t, err)
-	assert.Equal(t, strings.TrimPrefix(d.BlockPath, "/dev/ublkb")+"\n", string(state))
+	id, pid, ok := readState(filepath.Join(runDir, "pred"))
+	require.True(t, ok)
+	assert.Equal(t, strings.TrimPrefix(d.BlockPath, "/dev/ublkb"), fmt.Sprint(id))
+	assert.Equal(t, os.Getpid(), pid)
 	require.NoError(t, d.Close())
 	_, err = os.Stat(filepath.Join(runDir, "pred"))
 	assert.True(t, os.IsNotExist(err))
@@ -480,6 +481,7 @@ func TestCloseLeavesSuccessorAlone(t *testing.T) {
 	}
 	old, err := Serve(context.Background(), opts())
 	require.NoError(t, err)
+	unmarkServed(old.id) // the successor stands for another process
 	// A restart races the old server's Close: the new server has already published its
 	// symlink and state file under the same id when the old one gets to its cleanup
 	require.NoError(t, old.ublk.Stop())
@@ -492,9 +494,9 @@ func TestCloseLeavesSuccessorAlone(t *testing.T) {
 	target, err := os.Readlink(next.Path)
 	require.NoError(t, err, "the successor's symlink must survive the predecessor's Close")
 	assert.Equal(t, relativeLink(t, next), target)
-	state, err := os.ReadFile(filepath.Join(dir, "run", "succ"))
-	require.NoError(t, err)
-	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
+	id, _, ok := readState(filepath.Join(dir, "run", "succ"))
+	require.True(t, ok)
+	assert.Equal(t, next.ublk.ID, id)
 }
 
 // laggy is a source whose every read costs a fixed latency, standing in for a remote one.
@@ -590,8 +592,13 @@ func TestCloseLeavesDifferentIDSuccessorAlone(t *testing.T) {
 	}
 	old, err := Serve(context.Background(), opts("a.cow"))
 	require.NoError(t, err)
-	// The successor starts while the old device still exists, so it gets a different ublk
-	// id but the same symlink path and state file
+	unmarkServed(old.id) // the successor stands for another process
+	// The old server is shutting down (stopped, its DEL_DEV still waiting for openers) and
+	// the successor does not know about it (no state file): the old device still exists, so
+	// the successor gets a different ublk id but the same symlink path and state file. A
+	// live old server would be refused; a known stopped one would be deleted first.
+	require.NoError(t, old.ublk.Stop())
+	require.NoError(t, os.Remove(filepath.Join(dir, "run", "succ2")))
 	next, err := Serve(context.Background(), opts("b.cow"))
 	require.NoError(t, err)
 	t.Cleanup(func() { next.Close() })
@@ -600,9 +607,9 @@ func TestCloseLeavesDifferentIDSuccessorAlone(t *testing.T) {
 	target, err := os.Readlink(next.Path)
 	require.NoError(t, err, "the successor's symlink must survive the predecessor's Close")
 	assert.Equal(t, relativeLink(t, next), target)
-	state, err := os.ReadFile(filepath.Join(dir, "run", "succ2"))
-	require.NoError(t, err)
-	assert.Equal(t, fmt.Sprintf("%d\n", next.ublk.ID), string(state))
+	id, _, ok := readState(filepath.Join(dir, "run", "succ2"))
+	require.True(t, ok)
+	assert.Equal(t, next.ublk.ID, id)
 	_, err = os.Stat(old.BlockPath)
 	assert.True(t, os.IsNotExist(err), "the old kernel device itself is gone")
 }
@@ -663,4 +670,38 @@ func TestCloseAbortsHungBase(t *testing.T) {
 		t.Fatal("Close hung behind the stuck source")
 	}
 	assert.Error(t, <-readDone)
+}
+
+func TestStartRefusesChangedSource(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "img")
+	require.NoError(t, os.WriteFile(img, pattern(1<<20), 0600))
+	c := &config.Config{
+		ID:       "chg",
+		Segments: []*config.Segment{{Type: config.SourceFile, Path: img, Offset: -1}},
+		COW:      &config.COW{File: filepath.Join(dir, "chg.cow"), Bitmap: filepath.Join(dir, "chg.cow.bitmap"), ChunkSize: 65536},
+	}
+	// Writes landed over the image as it was
+	src, err := source.FromConfig(c)
+	require.NoError(t, err)
+	s, err := cow.OpenWith(src, &cow.Options{COWFile: c.COW.File, Bitmap: c.COW.Bitmap, ChunkSize: c.COW.ChunkSize, Identity: source.Identity(src)})
+	require.NoError(t, err)
+	_, err = s.WriteAt(make([]byte, 65536), 0)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	// Someone replaces the image
+	require.NoError(t, os.WriteFile(img, pattern(1<<20), 0600))
+	later := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(img, later, later))
+	_, err = startWithHydrate(context.Background(), c, filepath.Join(dir, "dev"), filepath.Join(dir, "run"), nil)
+	require.ErrorIs(t, err, cow.ErrSourceChanged)
+}
+
+func TestServeRefusesSameIDTwiceInProcess(t *testing.T) {
+	dir := t.TempDir()
+	markServed("twice")
+	t.Cleanup(func() { unmarkServed("twice") })
+	_, err := Serve(context.Background(), &Options{ID: "twice", Base: &computed{size: 1 << 20}, COWFile: filepath.Join(dir, "c.cow"), RunDir: dir, DevDir: dir})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already served by this process")
 }

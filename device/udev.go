@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"heckel.io/blkmap/config"
 )
@@ -32,13 +33,11 @@ func UdevName(runDir, kernelName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	want := strconv.FormatUint(id, 10)
 	for _, e := range entries {
 		if !e.Type().IsRegular() || !config.ValidID(e.Name()) {
 			continue
 		}
-		content, err := os.ReadFile(filepath.Join(runDir, e.Name()))
-		if err == nil && strings.TrimSpace(string(content)) == want {
+		if served, _, ok := readState(filepath.Join(runDir, e.Name())); ok && uint64(served) == id {
 			return e.Name(), nil
 		}
 	}
@@ -49,4 +48,59 @@ func UdevName(runDir, kernelName string) (string, error) {
 // names it; the add event came before the name was known.
 func announce(blockPath string) error {
 	return os.WriteFile(filepath.Join("/sys/block", filepath.Base(blockPath), "uevent"), []byte(udevChange), 0)
+}
+
+// writeState records the kernel device id and server pid of a served device. The pid tells
+// a successor whether a device under that id is still its predecessor's: the kernel hands
+// a freed id to the next device created.
+func writeState(path string, id uint32, pid int) error {
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d %d\n", id, pid)), stateFileMode)
+}
+
+// readState parses a state file ("ID PID", or just "ID" from older versions); ok is false
+// if it is missing or malformed.
+func readState(path string) (id uint32, pid int, ok bool) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	fields := strings.Fields(string(content))
+	if len(fields) < 1 || len(fields) > 2 {
+		return 0, 0, false
+	}
+	n, err := strconv.ParseUint(fields[0], 10, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	if len(fields) == 2 {
+		if pid, err = strconv.Atoi(fields[1]); err != nil || pid < 0 {
+			return 0, 0, false
+		}
+	}
+	return uint32(n), pid, true
+}
+
+// ownsKernelID reports whether name's state file is the newest one claiming kernel device
+// id, i.e. whether that device is name's. Stale files from servers whose device was deleted
+// may name an id the kernel has since given to another device.
+func ownsKernelID(runDir, name string, id uint32) bool {
+	entries, err := os.ReadDir(runDir)
+	if err != nil {
+		return false
+	}
+	newest, owner := time.Time{}, ""
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !config.ValidID(e.Name()) {
+			continue
+		}
+		claimed, _, ok := readState(filepath.Join(runDir, e.Name()))
+		info, err := e.Info()
+		if !ok || claimed != id || err != nil {
+			continue
+		}
+		if info.ModTime().After(newest) {
+			newest, owner = info.ModTime(), e.Name()
+		}
+	}
+	return owner == name
 }

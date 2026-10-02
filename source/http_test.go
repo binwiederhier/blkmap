@@ -358,3 +358,25 @@ func TestHTTPRedactsCredentials(t *testing.T) {
 	assert.NotContains(t, err.Error(), "secret")
 	assert.Contains(t, err.Error(), "user:xxxxx@")
 }
+
+func TestHTTPDetectsOriginChange(t *testing.T) {
+	t.Parallel()
+	data := pattern(4 * httpBlockSize)
+	var etag atomic.Value
+	etag.Store(`"v1"`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag.Load().(string))
+		http.ServeContent(w, r, "img", time.Time{}, bytes.NewReader(data))
+	}))
+	t.Cleanup(srv.Close)
+	h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+	require.NoError(t, err)
+	_, err = h.ReadAt(make([]byte, 100), 0)
+	require.NoError(t, err)
+	// The image is replaced under a running device: mixing its blocks with the old ones
+	// would corrupt the device, so reads fail instead
+	etag.Store(`"v2"`)
+	_, err = h.ReadAt(make([]byte, 100), 2*httpBlockSize)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "changed")
+}

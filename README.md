@@ -21,8 +21,12 @@ Build the Debian package with goreleaser (`make release-snapshot`) and install i
 `blkmap@.service` unit, a `modules-load.d` entry for `ublk_drv`, `/etc/blkmap/` and
 `/var/lib/blkmap/`, and an annotated example config at `/usr/share/doc/blkmap/blkmap.example.yml`.
 
-Requirements: Linux 6.8+ with the `ublk_drv` module. On Ubuntu 24.04 that module is in
+Requirements: Linux with the `ublk_drv` module. On Ubuntu that module is in
 `linux-modules-extra-$(uname -r)`, which is not installed by default on minimal images.
+Everything is verified on kernel 7.0 (Ubuntu 26.04), including crash recovery and power cuts;
+the I/O path was also verified on 6.8 (Ubuntu 24.04). Crash recovery needs the kernel's ublk
+user-recovery feature (6.0+); without it blkmap logs a warning and a crash fails I/O instead
+of pausing it.
 
 ## Use
 
@@ -65,6 +69,52 @@ rule names the disk `/dev/blkmap/disk1`, so systemd sees the device the mount wa
 ```
 /dev/blkmap/disk1  /mnt/disk1  ext4  x-systemd.requires=blkmap@disk1.service,nofail  0 0
 ```
+
+### Restarts, crashes and upgrades
+
+The kernel device outlives its server. If `blkmap serve` crashes or is killed, I/O to the
+device pauses (nothing fails, the mount stays), systemd restarts the server within a second,
+and it re-attaches to the same device; requests that were in flight are reissued. Writes
+acknowledged before the crash survive even if they were never flushed: their bits live in a
+shared bitmap in `/run/blkmap/<id>.bitmap`, which outlives the process (but, like the page
+cache it describes, not a reboot).
+
+```
+systemctl reload blkmap@disk1   # restart the server without disturbing the device
+systemctl stop blkmap@disk1     # tear the device down (unmount first)
+blkmap reap disk1               # fail the I/O of a device whose server will not come back
+```
+
+A reload makes everything durable and re-executes the installed binary in the same process,
+which re-attaches; package upgrades reload every running device, so the new binary takes
+over without an unmount. If a server cannot come back (its origin stays down, say), systemd gives up after
+10 attempts in a minute and `blkmap-reap@<id>` stops the waiting device, so its I/O fails
+instead of hanging. A restart whose config no longer matches the device (another size, block
+size or read-only setting) replaces it with a fresh one; the old one's I/O fails.
+
+### Changed sources
+
+The COW file only makes sense over the content it was written over. blkmap records a
+fingerprint of the sources (file size and modification time, HTTP ETag or Last-Modified,
+the layout) and refuses to start once writes exist if it changed; an HTTP origin whose ETag
+changes while running fails reads rather than mixing old and new blocks. If the content is
+known to be the same (an image copied with a new timestamp, a mirror), accept it:
+
+```
+blkmap pin disk1    # with the device stopped
+```
+
+### Status and metrics
+
+```
+blkmap status [disk1]        # state, chunks in the COW file, I/O, source, cache, hydration
+blkmap status --json disk1
+blkmap metrics               # all devices, Prometheus text format
+```
+
+Each server answers on a root-only socket, `/run/blkmap/<id>.sock` (`GET /status` as JSON,
+`GET /metrics`). For Prometheus, write `blkmap metrics` into node_exporter's textfile
+collector directory from a timer, or scrape the socket through a proxy.
 
 ### RAID-5 segments (Windows dynamic disks and others)
 
@@ -244,9 +294,12 @@ builds them.
 make test        # unit tests (no root)
 make test-root   # ublk and device integration tests; needs root and ublk_drv loaded
 make stress      # e2e + fio verify workloads, ext4/xfs/btrfs, fstrim, SIGKILL under load, restarts
-make scenarios   # 30 real-life scenarios: origins that die or hang, SIGKILL mid-write and
-                 # mid-hydration, restart storms, lost cow/bitmap, full disk, 8 TiB device, ...
-make test-remote HOST=ip SUITE=all   # all of the above on a throwaway VM (recommended, see below)
+make scenarios   # 36 real-life scenarios: origins that die or hang, SIGKILL mid-write and
+                 # mid-hydration, reloads and package upgrades under load, crash loops,
+                 # changed sources, lost cow/bitmap, full disk, 8 TiB device, ...
+make test-remote HOST=ip SUITE=all       # all of the above on a scratch VM
+make powercut HOST=ip MODE=power|kill    # power cuts / daemon kills under a verifying writer
+make test-vm     # everything, on a VM created for the run and destroyed after it
 make vet
 ```
 
@@ -255,8 +308,16 @@ http, raid5, concat), `cow/` (bitmap + COW store, discard and write-zeroes aware
 (COW over source over ublk, symlink, crash cleanup), `ublk/` (kernel transport), `util/`.
 
 Run the root suites on a throwaway VM rather than your workstation: a transport bug can wedge
-the kernel for good, and a scratch VM is rebooted in seconds. `scripts/remote-test.sh` builds
-here and runs there; verified on Ubuntu 24.04 (kernel 6.8) and 26.04 (kernel 7.0).
+the kernel for good. `make test-vm` clones a cloud-init Ubuntu template on a Proxmox host
+(`PROXMOX=root@box11 TEMPLATE=9000`), runs every suite, the scenarios, daemon-kill and
+power-cut cycles there, and destroys the VM. GitHub Actions runs the unit tests, vet, the
+examples and a package build on every push.
+
+The power-cut test (`scripts/powercut.sh`) writes checksummed, numbered records, flushes after
+every 16, and records each acknowledged flush on the controlling machine; then the VM loses
+power mid-write (an immediate reboot without sync). After it comes back, every acknowledged
+record must be on the device. In kill mode the daemon is SIGKILLed mid-write instead, three
+times per cycle, and the writer must never see an error.
 
 ### Durability and shutdown
 
@@ -274,11 +335,13 @@ holding the block device open, so `systemctl stop` on a mounted device logs a wa
 waits; after `TimeoutStopSec` systemd kills the daemon, which by then has everything on
 disk, and the next start deletes the dead kernel device.
 
-A crashed server leaves its kernel device behind (only DEL_DEV removes one); `serve` records
-the ublk id in `/run/blkmap/<id>` and deletes the dead predecessor on the next start. Two
-kernel 6.8 traps worth knowing: a ublk server that dies while START_DEV is scanning
-partitions wedges that device for good and makes a global `sync` hang (use `sync -f`), and
-only the ioctl-encoded command set is accepted (`CONFIG_BLKDEV_UBLK_LEGACY_OPCODES` is off).
+`serve` records the ublk id and its pid in `/run/blkmap/<id>`; the next start re-attaches to
+a device waiting for recovery, refuses to start next to a live server of the same id, and
+deletes any other dead predecessor. Devices created without recovery (by older versions)
+are left behind by a crash until the next start deletes them. Two kernel 6.8 traps worth
+knowing: a ublk server without recovery that dies while START_DEV is scanning partitions
+wedges that device for good and makes a global `sync` hang (use `sync -f`), and only the
+ioctl-encoded command set is accepted (`CONFIG_BLKDEV_UBLK_LEGACY_OPCODES` is off).
 
 ## License
 

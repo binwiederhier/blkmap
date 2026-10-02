@@ -9,7 +9,7 @@ host=${1:?usage: remote-test.sh HOST [stress|scenarios|all]}
 suite=${2:-}
 me="$(cd "$(dirname "$0")" && pwd)"
 root="$me/.."
-ssh="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 root@$host"
+ssh="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ${SSH_OPTS:-} root@$host"
 cd "$root"
 goreleaser release --snapshot --clean >/dev/null 2>&1
 go test -c -o dist/ublk.test ./ublk/
@@ -17,9 +17,9 @@ go test -c -o dist/device.test ./device/
 go build -o dist/rangehttpd ./scripts/rangehttpd
 deb=$(ls dist/blkmap_*_linux_amd64.deb)
 $ssh 'mkdir -p /root/blkmap-test/scripts /root/blkmap-test/bin'
-scp -q "$deb" dist/ublk.test dist/device.test root@$host:/root/blkmap-test/
-scp -q dist/rangehttpd root@$host:/root/blkmap-test/bin/
-scp -q scripts/e2e.sh scripts/stress.sh scripts/scenarios.sh scripts/mkraid5.py root@$host:/root/blkmap-test/scripts/
+scp -q ${SSH_OPTS:-} "$deb" dist/ublk.test dist/device.test root@$host:/root/blkmap-test/
+scp -q ${SSH_OPTS:-} dist/rangehttpd root@$host:/root/blkmap-test/bin/
+scp -q ${SSH_OPTS:-} scripts/e2e.sh scripts/stress.sh scripts/scenarios.sh scripts/mkraid5.py root@$host:/root/blkmap-test/scripts/
 # Everything runs detached on the host (a dropped ssh session must not kill a scenario
 # halfway, which would leave devices behind); this side follows the log until it ends.
 steps="modprobe ublk_drv; dpkg -i $(basename "$deb") >/dev/null"
@@ -34,3 +34,14 @@ if [ "$suite" = scenarios ] || [ "$suite" = all ]; then
 fi
 $ssh "cd /root/blkmap-test && rm -f run.log && nohup bash -c \"$steps; echo '== done'\" > run.log 2>&1 < /dev/null &"
 $ssh "cd /root/blkmap-test && tail -n +1 -F run.log 2>/dev/null | sed '/^== done/q'"
+# The suites report in their output: a FAIL line, or a suite that never printed its OK line
+# (e2e and stress stop at the first error), fails the run
+log=$($ssh "cat /root/blkmap-test/run.log")
+failed=""
+grep -qE '^(FAIL|--- FAIL)|failed [1-9]' <<<"$log" && failed=1
+grep -q '^E2E OK' <<<"$log" || failed=1
+case "$suite" in stress|all) grep -q 'STRESS OK' <<<"$log" || failed=1 ;; esac
+if [ -n "$failed" ]; then
+  echo "FAIL: see the output above"
+  exit 1
+fi

@@ -226,3 +226,18 @@ func newHTTPClient() *http.Client {
 	transport.MaxIdleConnsPerHost = httpMaxConns
 	return &http.Client{Timeout: httpTimeout, Transport: transport}
 }
+
+// Walk calls fn for s and every source it is built from.
+func Walk(s Source, fn func(Source)) {
+	fn(s)
+	if c, ok := s.(composite); ok {
+		for _, part := range c.parts() {
+			Walk(part, fn)
+		}
+	}
+}
+
+// composite is implemented by sources built from other sources.
+type composite interface {
+	parts() []Source
+}

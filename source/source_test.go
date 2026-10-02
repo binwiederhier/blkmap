@@ -220,3 +220,22 @@ func TestAbortPropagates(t *testing.T) {
 	assert.Equal(t, int32(1), b.aborted.Load())
 	Abort(NewZero(10)) // sources without Abort are fine
 }
+
+func TestWalk(t *testing.T) {
+	t.Parallel()
+	fast, slow, inner := NewZero(1<<20), NewZero(1<<20), NewZero(1<<20)
+	cache := NewCache(fast, slow)
+	m, err := NewMap([]Range{{Offset: 0, Length: 4096}})
+	require.NoError(t, err)
+	mapped := WithMap(NewReadAhead(inner), m, 0)
+	concat, err := NewConcat([]*Segment{{Offset: 0, Source: cache}, {Offset: 1 << 20, Source: mapped}}, 0)
+	require.NoError(t, err)
+	var seen []Source
+	Walk(concat, func(s Source) { seen = append(seen, s) })
+	assert.Contains(t, seen, Source(concat))
+	assert.Contains(t, seen, Source(cache))
+	assert.Contains(t, seen, Source(fast))
+	assert.Contains(t, seen, Source(slow))
+	assert.Contains(t, seen, Source(inner))
+	assert.Len(t, seen, 7)
+}

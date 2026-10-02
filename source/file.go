@@ -16,6 +16,7 @@ type File struct {
 	offset int64
 	size   int64
 	total  int64      // length of the whole file
+	ident  string     // see Identity
 	seekMu sync.Mutex // Serializes SEEK_HOLE/SEEK_DATA, which move the shared file offset
 }
 
@@ -36,7 +37,17 @@ func OpenFile(path string, offset, size int64) (*File, error) {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &File{f: f, offset: offset, size: size, total: total}, nil
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	// A regular file's version is its modification time; a device cannot tell
+	ident := fmt.Sprintf("device:%d@%d+%d", total, offset, size)
+	if st.Mode().IsRegular() {
+		ident = fmt.Sprintf("file:%d:%d@%d+%d", total, st.ModTime().UnixNano(), offset, size)
+	}
+	return &File{f: f, offset: offset, size: size, total: total, ident: ident}, nil
 }
 
 func (f *File) ReadAt(p []byte, off int64) (int, error) {

@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -29,6 +31,15 @@ const (
 	// charDeviceWait is how long to wait for udev to create /dev/ublkcN after ADD_DEV.
 	charDeviceWait = 5 * time.Second
 	charDevicePoll = 50 * time.Millisecond
+	// recoverWait bounds how long Recover waits for the kernel to notice the old server is
+	// gone (older kernels check every 5 seconds).
+	recoverWait = 20 * time.Second
+	recoverPoll = 100 * time.Millisecond
+)
+
+const (
+	// FeatureRecovery is what Recovery needs from the kernel (see Features).
+	FeatureRecovery = featUserRecovery | featUserRecoveryReissue
 )
 
 var (
@@ -64,6 +75,9 @@ type Params struct {
 	QueueDepth int // in-flight requests per queue; default 64
 	NumQueues  int // default: CPUs, at most 4
 	ReadOnly   bool
+	// Recovery keeps the device alive when the server dies: I/O waits (requests in flight
+	// are reissued) until a new server calls Recover. Without it, I/O fails with EIO.
+	Recovery bool
 }
 
 // Device is a live ublk block device.
@@ -82,9 +96,27 @@ type Device struct {
 	failOnce  sync.Once
 }
 
+// Stats describes how a device's queues dispatch requests.
+type Stats struct {
+	Queues   int
+	Parallel int // queues currently handing reads to workers (a slow backend)
+}
+
+// Stats returns the queue dispatch state.
+func (d *Device) Stats() Stats {
+	s := Stats{Queues: len(d.queues)}
+	for _, q := range d.queues {
+		if q.shown.Load() {
+			s.Parallel++
+		}
+	}
+	return s
+}
+
 // Info is the kernel's view of a device.
 type Info struct {
 	Live      bool // serving I/O; false once the server died or stopped it
+	Quiesced  bool // recoverable and waiting for a new server (see Recover)
 	ServerPID int
 }
 
@@ -100,11 +132,11 @@ func Create(p *Params) (*Device, error) {
 		return nil, err
 	}
 	defer ctl.close()
-	id, err := ctl.addDevice(p.NumQueues, p.QueueDepth, p.MaxIOSize)
+	id, err := ctl.addDevice(p.NumQueues, p.QueueDepth, p.MaxIOSize, deviceFlags(p))
 	if err != nil {
 		return nil, err
 	}
-	d := &Device{ID: id, BlockPath: fmt.Sprintf("%s%d", blockPrefix, id), CharPath: fmt.Sprintf("%s%d", charPrefix, id), params: p, charFd: -1, failed: make(chan struct{})}
+	d := newDevice(id, p)
 	fail := func(err error) (*Device, error) {
 		d.teardown(ctl)
 		return nil, err
@@ -117,25 +149,88 @@ func Create(p *Params) (*Device, error) {
 	if err := ctl.setParams(id, buildParams(p)); err != nil {
 		return fail(err)
 	}
-	if d.charFd, err = openCharDevice(d.CharPath); err != nil {
+	if err := d.attach(int(info.NrHwQueues)); err != nil {
 		return fail(err)
-	}
-	for i := 0; i < int(info.NrHwQueues); i++ {
-		q, err := newQueue(d, uint16(i))
-		if err != nil {
-			return fail(err)
-		}
-		d.queues = append(d.queues, q)
-		ready := make(chan error, 1)
-		go q.run(ready)
-		if err := <-ready; err != nil {
-			return fail(fmt.Errorf("queue %d: %w", i, err))
-		}
 	}
 	if err := ctl.startDevice(id); err != nil {
 		return fail(err)
 	}
 	return d, nil
+}
+
+// Recover re-attaches this process as the server of device id, a device created with
+// Recovery whose server died. I/O that waited meanwhile is served once Recover returns.
+// The kernel device must match what p would create (size, block size, queue depth, request
+// size, read-only); if Recover fails, the caller decides whether to Delete the device.
+func Recover(id uint32, p *Params) (*Device, error) {
+	p.defaults()
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	ctl, err := openControl()
+	if err != nil {
+		return nil, err
+	}
+	defer ctl.close()
+	info, err := ctl.deviceInfo(id)
+	if err != nil {
+		return nil, err
+	}
+	kp, err := ctl.getParams(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkRecoverable(info, kp, p); err != nil {
+		return nil, fmt.Errorf("ublk device %d: %w", id, err)
+	}
+	// The kernel accepts the recovery only once it has noticed the old server is gone
+	deadline := time.Now().Add(recoverWait)
+	for {
+		err := ctl.startUserRecovery(id)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EBUSY) || time.Now().After(deadline) {
+			return nil, fmt.Errorf("ublk device %d: start recovery: %w", id, err)
+		}
+		time.Sleep(recoverPoll)
+	}
+	d := newDevice(id, p)
+	if err := d.attach(int(info.NrHwQueues)); err != nil {
+		d.stop(nil)
+		return nil, err
+	}
+	if err := ctl.endUserRecovery(id); err != nil {
+		d.stop(nil)
+		return nil, fmt.Errorf("ublk device %d: end recovery: %w", id, err)
+	}
+	return d, nil
+}
+
+// newDevice returns the Device for kernel id, not yet attached.
+func newDevice(id uint32, p *Params) *Device {
+	return &Device{ID: id, BlockPath: fmt.Sprintf("%s%d", blockPrefix, id), CharPath: fmt.Sprintf("%s%d", charPrefix, id), params: p, charFd: -1, failed: make(chan struct{})}
+}
+
+// attach opens the char device and starts every queue, each primed with a fetch per tag.
+func (d *Device) attach(queues int) error {
+	var err error
+	if d.charFd, err = openCharDevice(d.CharPath); err != nil {
+		return err
+	}
+	for i := 0; i < queues; i++ {
+		q, err := newQueue(d, uint16(i))
+		if err != nil {
+			return err
+		}
+		d.queues = append(d.queues, q)
+		ready := make(chan error, 1)
+		go q.run(ready)
+		if err := <-ready; err != nil {
+			return fmt.Errorf("queue %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // Close is Stop followed by Delete. Deletion waits until nothing holds the block device
@@ -333,7 +428,7 @@ func buildParams(p *Params) *params {
 func openCharDevice(path string) (int, error) {
 	deadline := time.Now().Add(charDeviceWait)
 	for {
-		fd, err := syscall.Open(path, syscall.O_RDWR, 0)
+		fd, err := openCloexec(path)
 		if err == nil {
 			return fd, nil
 		}
@@ -342,6 +437,46 @@ func openCharDevice(path string) (int, error) {
 		}
 		time.Sleep(charDevicePoll)
 	}
+}
+
+// Features returns the ublk feature flags the running kernel supports.
+func Features() (uint64, error) {
+	ctl, err := openControl()
+	if err != nil {
+		return 0, err
+	}
+	defer ctl.close()
+	return ctl.features()
+}
+
+// checkRecoverable verifies the kernel device was created recoverable and matches what p
+// would create, so the new server serves the device the old one did.
+func checkRecoverable(info *devInfo, kp *params, p *Params) error {
+	want := buildParams(p)
+	switch {
+	case info.Flags&featUserRecovery == 0:
+		return errors.New("created without recovery")
+	case int(info.QueueDepth) != p.QueueDepth:
+		return fmt.Errorf("queue depth %d, want %d", info.QueueDepth, p.QueueDepth)
+	case int(info.MaxIOBufBytes) != p.MaxIOSize:
+		return fmt.Errorf("max request %d bytes, want %d", info.MaxIOBufBytes, p.MaxIOSize)
+	case kp.Basic.DevSectors != want.Basic.DevSectors:
+		return fmt.Errorf("size %d sectors, want %d", kp.Basic.DevSectors, want.Basic.DevSectors)
+	case kp.Basic.LogicalBSShift != want.Basic.LogicalBSShift:
+		return fmt.Errorf("block size %d, want %d", 1<<kp.Basic.LogicalBSShift, p.BlockSize)
+	case kp.Basic.Attrs&attrReadOnly != want.Basic.Attrs&attrReadOnly:
+		return errors.New("read-only setting differs")
+	}
+	return nil
+}
+
+// deviceFlags returns the feature flags ADD_DEV asks for.
+func deviceFlags(p *Params) uint64 {
+	flags := uint64(featURingCmdCompInTask)
+	if p.Recovery {
+		flags |= featUserRecovery | featUserRecoveryReissue
+	}
+	return flags
 }
 
 // GetInfo describes device id, or returns an error wrapping syscall.ENODEV if it does not exist.
@@ -355,7 +490,18 @@ func GetInfo(id uint32) (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Info{Live: info.State == stateLive, ServerPID: int(info.UblksrvPID)}, nil
+	return &Info{Live: info.State == stateLive, Quiesced: info.State == stateQuiesced, ServerPID: int(info.UblksrvPID)}, nil
+}
+
+// Stop stops device id (STOP_DEV) without deleting it: its block device goes away and
+// waiting or new I/O fails. Unlike DEL_DEV it does not wait for openers.
+func Stop(id uint32) error {
+	ctl, err := openControl()
+	if err != nil {
+		return err
+	}
+	defer ctl.close()
+	return ctl.stopDevice(id)
 }
 
 // Delete removes device id, stopping it first if it is still live. It is how a device left
@@ -371,4 +517,14 @@ func Delete(id uint32) error {
 		return err
 	}
 	return ctl.deleteDevice(id)
+}
+
+// openCloexec opens path read-write, closed on exec.
+func openCloexec(path string) (int, error) {
+	return syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
+}
+
+// dupCloexec duplicates fd, closed on exec.
+func dupCloexec(fd int) (int, error) {
+	return unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 }

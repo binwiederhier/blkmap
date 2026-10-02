@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,8 +27,8 @@ import (
 const (
 	// DevDir is where device symlinks are published: /dev/blkmap/<id> -> /dev/ublkbN.
 	DevDir = "/dev/blkmap"
-	// RunDir holds one file per device with its ublk id, so a restart after a crash can
-	// delete the dead kernel device the previous server left behind.
+	// RunDir holds per-device runtime state (ublk id and server pid, the live bitmap, the
+	// status socket), so a restarted server can re-attach to the device it left behind.
 	RunDir        = "/run/blkmap"
 	devDirMode    = 0755
 	stateFileMode = 0600
@@ -38,6 +39,18 @@ const (
 	// (128 KiB) is tuned for disks; for a source that is a network round trip per request,
 	// a window of several requests lets a sequential reader keep many in flight.
 	readAheadKB = 4096
+	// ExitDetached is the exit status after Detach; the unit restarts on it.
+	ExitDetached = 75
+	// liveBitmapExt names the live bitmap in RunDir (<id>.bitmap, see cow.Bitmap).
+	liveBitmapExt   = ".bitmap"
+	ublkBlockPrefix = "/dev/ublkb"
+)
+
+var (
+	// served holds the IDs this process serves, so a second Serve of one is refused rather
+	// than mistaken for a predecessor to recover
+	served   = map[string]bool{}
+	servedMu sync.Mutex
 )
 
 // Options describes a device to serve from an arbitrary read-only base. This is the library
@@ -54,6 +67,14 @@ type Options struct {
 	DevDir    string   // defaults to DevDir
 	RunDir    string   // where the ublk id is recorded; defaults to RunDir
 	Hydrate   *Hydrate // background copy of the base into the COW file; nil = off
+	// Identity fingerprints the base's content; once the COW file holds writes, Serve
+	// refuses a base with another one (see cow.Options). Start fills it in from the sources;
+	// empty skips the check.
+	Identity string
+	// Recovery lets the kernel device outlive this process: if it dies (or Detach hands it
+	// off), I/O waits and the next Serve of the same ID re-attaches. Only for processes a
+	// supervisor restarts; without one, I/O to a crashed device would hang.
+	Recovery bool
 }
 
 // Device is a running blkmap block device.
@@ -66,6 +87,13 @@ type Device struct {
 	stop      context.CancelFunc // ends the background goroutines (hydration, periodic flush)
 	bg        sync.WaitGroup
 	closed    atomic.Bool
+	id        string
+	base      source.Source
+	backend   *backend
+	hydrator  *hydrator // nil without hydration
+	started   time.Time
+	recovered bool      // re-attached to a running device
+	status    io.Closer // the status socket; nil if it could not be opened
 }
 
 // Start opens the sources and COW store for c and serves them as a block device, publishing
@@ -82,6 +110,7 @@ func Start(ctx context.Context, c *config.Config, devDir string) (*Device, error
 // startWithHydrate is Start with an explicit run directory and hydration plan.
 func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir string, hydrate *Hydrate) (*Device, error) {
 	var base source.Source
+	var identity string // stays empty when detached: there are no sources to check
 	size, chunkSize, complete, err := cow.Complete(c.COW.Bitmap)
 	if err != nil {
 		return nil, err
@@ -92,6 +121,8 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 		hydrate = nil
 	} else if base, err = source.FromConfig(c); err != nil {
 		return nil, err
+	} else {
+		identity = source.Identity(base)
 	}
 	return Serve(ctx, &Options{
 		ID:        c.ID,
@@ -104,6 +135,8 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 		DevDir:    devDir,
 		RunDir:    runDir,
 		Hydrate:   hydrate,
+		Identity:  identity,
+		Recovery:  true, // the systemd unit restarts the server
 	})
 }
 
@@ -127,20 +160,56 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 		return nil, errors.New("a cow file is required")
 	}
 	o.defaults()
+	if !markServed(o.ID) {
+		o.Base.Close()
+		return nil, fmt.Errorf("%s is already served by this process", o.ID)
+	}
+	d, err := serve(o)
+	if err != nil {
+		unmarkServed(o.ID)
+	}
+	return d, err
+}
+
+// serve is Serve once the options are complete and the ID is claimed in this process.
+func serve(o *Options) (*Device, error) {
+	if o.Recovery && !recoverySupported() {
+		log.Printf("%s: the kernel lacks ublk user recovery; a crash fails I/O instead of pausing it", o.ID)
+		o.Recovery = false
+	}
 	statePath := filepath.Join(o.RunDir, o.ID)
-	deleteDeadPredecessor(o.ID, statePath)
-	store, err := cow.Open(o.Base, o.COWFile, o.Bitmap, o.ChunkSize)
+	pred, err := takeOver(o, statePath)
 	if err != nil {
 		o.Base.Close()
 		return nil, err
 	}
+	livePath := ""
+	if o.Recovery {
+		if err := os.MkdirAll(o.RunDir, devDirMode); err != nil {
+			o.Base.Close()
+			return nil, err
+		}
+		livePath = filepath.Join(o.RunDir, o.ID+liveBitmapExt)
+	}
+	store, err := cow.OpenWith(o.Base, &cow.Options{COWFile: o.COWFile, Bitmap: o.Bitmap, LiveBitmap: livePath, ChunkSize: o.ChunkSize, Identity: o.Identity})
+	if err != nil {
+		o.Base.Close()
+		pred.drop(o.ID)
+		return nil, err
+	}
 	b := &backend{store: store, id: o.ID}
-	dev, err := ublk.Create(&ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly})
+	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery}
+	dev, err := pred.recover(o.ID, params)
+	recovered := dev != nil
+	if dev == nil && err == nil {
+		dev, err = ublk.Create(params)
+	}
 	if err != nil {
 		store.Close()
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
-	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev}
+	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev,
+		id: o.ID, base: o.Base, backend: b, started: time.Now(), recovered: recovered}
 	if err := os.WriteFile(filepath.Join("/sys/block", filepath.Base(dev.BlockPath), "queue", "read_ahead_kb"), []byte(strconv.Itoa(readAheadKB)), 0); err != nil {
 		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
 	}
@@ -151,6 +220,9 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 	if err := announce(dev.BlockPath); err != nil {
 		log.Printf("%s: cannot trigger udev: %s", o.ID, err.Error())
 	}
+	if d.status, err = ListenStatus(filepath.Join(o.RunDir, o.ID+statusSocketExt), d.Status); err != nil {
+		log.Printf("%s: no status socket: %s", o.ID, err.Error())
+	}
 	bgCtx, cancel := context.WithCancel(context.Background())
 	d.stop = cancel
 	d.bg.Add(1)
@@ -160,6 +232,7 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 	}()
 	if o.Hydrate != nil {
 		h := newHydrator(o.ID, store, o.Base, o.Hydrate, b.busy)
+		d.hydrator = h
 		d.bg.Add(1)
 		go func() {
 			defer d.bg.Done()
@@ -222,27 +295,81 @@ func hydrateFromConfig(h *config.Hydrate) (*Hydrate, error) {
 	return plan, nil
 }
 
-// deleteDeadPredecessor removes the kernel device a previous server of this id left behind
-// (recorded in statePath) if it is no longer being served; a crash leaves such devices
-// around, since only DEL_DEV removes them.
-func deleteDeadPredecessor(id, statePath string) {
-	content, err := os.ReadFile(statePath)
+// predecessor is a kernel device a previous server of this ID left waiting for recovery.
+type predecessor struct {
+	id    uint32
+	valid bool
+}
+
+// takeOver deals with the kernel device a previous server of this ID left behind (recorded
+// in statePath): a device still served is an error, one waiting for recovery is returned
+// for Serve to re-attach, and any other dead one is deleted, since only DEL_DEV removes it.
+// A state file whose id now belongs to another server's device is stale and ignored.
+func takeOver(o *Options, statePath string) (*predecessor, error) {
+	id, pid, ok := readState(statePath)
+	if !ok {
+		return &predecessor{}, nil
+	}
+	info, err := ublk.GetInfo(id)
 	if err != nil {
+		return &predecessor{}, nil
+	}
+	// A live server is recognized by its pid; a dead one's device by the newest state file
+	// claiming its id (the kernel clears the pid of a device waiting for recovery)
+	switch alive := info.Live && processAlive(info.ServerPID); {
+	case alive && info.ServerPID == os.Getpid():
+		// This process served it before re-executing itself (a handoff keeps the pid);
+		// Serve already made sure it does not serve it now
+		if o.Recovery {
+			return &predecessor{id: id, valid: true}, nil
+		}
+	case alive && (pid == 0 || info.ServerPID == pid):
+		return nil, fmt.Errorf("%s is already served by pid %d (%s%d)", o.ID, info.ServerPID, ublkBlockPrefix, id)
+	case alive || !ownsKernelID(o.RunDir, o.ID, id):
+		return &predecessor{}, nil
+	case o.Recovery && (info.Quiesced || info.Live):
+		return &predecessor{id: id, valid: true}, nil
+	}
+	if err := ublk.Delete(id); err != nil && !errors.Is(err, syscall.ENODEV) {
+		log.Printf("%s: cannot delete stale ublk device %d: %s", o.ID, id, err.Error())
+	} else {
+		log.Printf("%s: deleted stale ublk device %d left by a previous server", o.ID, id)
+	}
+	return &predecessor{}, nil
+}
+
+// recover re-attaches to the predecessor; it returns nil without one. A predecessor that
+// cannot be taken over (the config changed) is deleted so its waiting I/O fails instead of
+// hanging, and the caller creates a fresh device.
+func (p *predecessor) recover(id string, params *ublk.Params) (*ublk.Device, error) {
+	if !p.valid {
+		return nil, nil
+	}
+	dev, err := ublk.Recover(p.id, params)
+	if err == nil {
+		log.Printf("%s: re-attached to ublk device %d; I/O resumes", id, p.id)
+		return dev, nil
+	}
+	log.Printf("%s: cannot re-attach to ublk device %d: %s; replacing it", id, p.id, err.Error())
+	p.drop(id)
+	return nil, nil
+}
+
+// drop deletes the predecessor, failing its waiting I/O, when it will not be recovered.
+func (p *predecessor) drop(id string) {
+	if !p.valid {
 		return
 	}
-	old, err := strconv.ParseUint(strings.TrimSpace(string(content)), 10, 32)
-	if err != nil {
-		return
+	p.valid = false
+	if err := ublk.Delete(p.id); err != nil && !errors.Is(err, syscall.ENODEV) {
+		log.Printf("%s: cannot delete ublk device %d: %s", id, p.id, err.Error())
 	}
-	info, err := ublk.GetInfo(uint32(old))
-	if err != nil || info.Live && processAlive(info.ServerPID) {
-		return
-	}
-	if err := ublk.Delete(uint32(old)); err != nil && !errors.Is(err, syscall.ENODEV) {
-		log.Printf("%s: cannot delete stale ublk device %d: %s", id, old, err.Error())
-		return
-	}
-	log.Printf("%s: deleted stale ublk device %d left by a previous server", id, old)
+}
+
+// recoverySupported reports whether the kernel can keep a device across a server's death.
+func recoverySupported() bool {
+	features, err := ublk.Features()
+	return err == nil && features&ublk.FeatureRecovery == ublk.FeatureRecovery
 }
 
 func processAlive(pid int) bool {
@@ -262,6 +389,55 @@ func (d *Device) Chunks() int64 {
 // Written returns the number of COW chunks written so far.
 func (d *Device) Written() int64 {
 	return d.store.Written()
+}
+
+// Detach hands the device to a successor process: background work stops and everything
+// is made durable, then the caller must exit at once (with ExitDetached under systemd). The
+// kernel device keeps waiting I/O until the next Serve of the same ID re-attaches; writes
+// served between the flush and the exit are in the live bitmap. Requires Options.Recovery.
+func (d *Device) Detach() error {
+	defer unmarkServed(d.id)
+	if d.stop != nil {
+		d.stop()
+		d.bg.Wait()
+	}
+	return d.store.Flush()
+}
+
+// Status returns a snapshot of the device's state and counters.
+func (d *Device) Status() *Status {
+	queues := d.ublk.Stats()
+	st := &Status{
+		ID:             d.id,
+		Path:           d.Path,
+		BlockPath:      d.BlockPath,
+		PID:            os.Getpid(),
+		Started:        d.started,
+		Recovered:      d.recovered,
+		Size:           d.store.Size(),
+		ChunkSize:      d.store.ChunkSize(),
+		Chunks:         d.store.Chunks(),
+		Written:        d.store.Written(),
+		Dirty:          d.store.Dirty(),
+		Queues:         queues.Queues,
+		ParallelQueues: queues.Parallel,
+		IO:             d.backend.stats(),
+		Source:         d.store.SourceStats(),
+	}
+	source.Walk(d.base, func(s source.Source) {
+		if c, ok := s.(*source.Cache); ok {
+			if st.Cache == nil {
+				st.Cache = &source.CacheStats{}
+			}
+			cs := c.Stats()
+			st.Cache.Hits, st.Cache.Misses, st.Cache.Failures = st.Cache.Hits+cs.Hits, st.Cache.Misses+cs.Misses, st.Cache.Failures+cs.Failures
+		}
+	})
+	if d.hydrator != nil {
+		p := d.hydrator.progress()
+		st.Hydration = &p
+	}
+	return st
 }
 
 // Done is closed if the kernel device fails underneath (a queue thread died); the device
@@ -284,6 +460,10 @@ func (d *Device) Err() error {
 func (d *Device) Close() error {
 	if d.closed.Swap(true) {
 		return nil
+	}
+	defer unmarkServed(d.id)
+	if d.status != nil {
+		d.status.Close()
 	}
 	if d.stop != nil {
 		d.stop()
@@ -308,7 +488,7 @@ func (d *Device) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if content, err := os.ReadFile(d.statePath); err == nil && strings.TrimSpace(string(content)) == strconv.FormatUint(uint64(d.ublk.ID), 10) {
+	if id, _, ok := readState(d.statePath); ok && id == d.ublk.ID {
 		if err := os.Remove(d.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
@@ -335,7 +515,7 @@ func mountPoint(blockPath string) string {
 }
 
 // publish creates the /dev/blkmap/<id> symlink, replacing a stale one from a previous run,
-// and records the ublk id for deleteDeadPredecessor. The link is relative (../ublkbN), the
+// and records the ublk id for takeOver. The link is relative (../ublkbN), the
 // form udev writes, so when the udev rule re-creates it the two agree and nothing flaps.
 func (d *Device) publish(devDir string) error {
 	if err := os.MkdirAll(devDir, devDirMode); err != nil {
@@ -358,7 +538,7 @@ func (d *Device) publish(devDir string) error {
 	if err := os.MkdirAll(filepath.Dir(d.statePath), devDirMode); err != nil {
 		return err
 	}
-	return os.WriteFile(d.statePath, []byte(fmt.Sprintf("%d\n", d.ublk.ID)), stateFileMode)
+	return writeState(d.statePath, d.ublk.ID, os.Getpid())
 }
 
 // ownsLink reports whether the published symlink still points at this device's kernel
@@ -372,4 +552,61 @@ func (d *Device) ownsLink() bool {
 		target = filepath.Join(filepath.Dir(d.Path), target)
 	}
 	return target == d.BlockPath
+}
+
+// markServed records that this process serves id; it reports false if it already does.
+func markServed(id string) bool {
+	servedMu.Lock()
+	defer servedMu.Unlock()
+	if served[id] {
+		return false
+	}
+	served[id] = true
+	return true
+}
+
+// unmarkServed forgets id.
+func unmarkServed(id string) {
+	servedMu.Lock()
+	defer servedMu.Unlock()
+	delete(served, id)
+}
+
+// Reap disposes of the kernel device a dead server of id left behind. systemd runs it
+// (blkmap reap) once it gives up restarting a unit. A device waiting for recovery is
+// stopped, which fails its waiting I/O at once; deleting it has to wait until nothing holds
+// it open (a mount), so that is left to the next Reap or Serve. A stopped device is deleted.
+// Without a recorded device Reap does nothing, and it refuses while the server is alive.
+func Reap(id, runDir string) error {
+	statePath := filepath.Join(runDir, id)
+	kernelID, pid, ok := readState(statePath)
+	if !ok {
+		return nil
+	}
+	info, err := ublk.GetInfo(kernelID)
+	alive := err == nil && info.Live && processAlive(info.ServerPID)
+	switch {
+	case errors.Is(err, syscall.ENODEV):
+	case err != nil:
+		return err
+	case alive && (pid == 0 || info.ServerPID == pid):
+		return fmt.Errorf("%s is still served by pid %d", id, info.ServerPID)
+	case alive || !ownsKernelID(runDir, id, kernelID):
+		// The id now belongs to someone else's device; only the state file is stale
+	case info.Quiesced || info.Live:
+		if err := ublk.Stop(kernelID); err != nil && !errors.Is(err, syscall.ENODEV) {
+			return err
+		}
+		log.Printf("%s: stopped abandoned ublk device %d; its I/O fails now", id, kernelID)
+		return nil
+	default:
+		if err := ublk.Delete(kernelID); err != nil && !errors.Is(err, syscall.ENODEV) {
+			return err
+		}
+		log.Printf("%s: deleted abandoned ublk device %d", id, kernelID)
+	}
+	if err := os.Remove(statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }

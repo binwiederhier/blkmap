@@ -1,0 +1,11 @@
+[Unit]
+Description=Delete the abandoned blkmap device %i
+Documentation=https://heckel.io/blkmap
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+# Only if systemd gave up on the server: a crash it restarts is recovered instead. After a
+# few seconds a restarting unit is activating or active again; a given-up one is still failed.
+ExecCondition=/bin/sh -c 'sleep 3; test "$(systemctl show -p ActiveState --value blkmap@%i.service)" = failed'
+ExecStart=/usr/bin/blkmap reap %i

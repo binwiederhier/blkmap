@@ -15,6 +15,9 @@ func TestIoctlEncoding(t *testing.T) {
 	// UBLK_U_IO_FETCH_REQ = _IOWR('u', 0x20, struct ublksrv_io_cmd)
 	assert.Equal(t, uint32(0xc0107520), ioctl(cmdFetchReq, uint32(unsafe.Sizeof(ioCmd{}))))
 	assert.Equal(t, uint32(0xc0107521), ioctl(cmdCommitAndFetchReq, uint32(unsafe.Sizeof(ioCmd{}))))
+	// The kernel matches UBLK_U_CMD_GET_FEATURES = _IOR('u', 0x13, ...) exactly
+	assert.Equal(t, uint32(0x80207513), ctrlIoctl(cmdGetFeatures))
+	assert.Equal(t, uint32(0xc0207504), ctrlIoctl(cmdAddDev))
 }
 
 func TestParamsLayout(t *testing.T) {

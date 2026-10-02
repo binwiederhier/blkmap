@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        # The root-level suites (ublk, device integration, scenarios, power cuts) need a
+        # kernel to break: they run on a throwaway VM via make test-vm
+        run: go test -race ./...
+      - name: Examples
+        run: make examples
+      - name: Package
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --snapshot --clean

@@ -20,17 +20,25 @@ const (
 	cmdStartDev   = 0x06
 	cmdStopDev    = 0x07
 	cmdSetParams  = 0x08
+	cmdGetParams  = 0x09
+	// Recovery: re-attach a new server to a device whose server died
+	cmdStartUserRecovery = 0x10
+	cmdEndUserRecovery   = 0x11
+	cmdGetFeatures       = 0x13
 	// I/O commands (nr of _IOWR('u', nr, 16)) on /dev/ublkcN
 	cmdFetchReq          = 0x20
 	cmdCommitAndFetchReq = 0x21
 	ioctlType            = 'u'
 	ioctlDirRW           = 3 // _IOC_READ | _IOC_WRITE
+	ioctlDirR            = 2 // _IOC_READ
 	ioctlSizeShift       = 16
 	ioctlTypeShift       = 8
 	ioctlDirShift        = 30
 
 	// Feature flags negotiated at ADD_DEV
-	featURingCmdCompInTask = 1 << 1
+	featURingCmdCompInTask  = 1 << 1
+	featUserRecovery        = 1 << 3 // the device outlives its server, I/O waits for a new one
+	featUserRecoveryReissue = 1 << 4 // requests in flight at the server's death are reissued
 	// Request ops in ioDesc.OpFlags bits 0..7
 	opRead        = 0
 	opWrite       = 1
@@ -47,6 +55,7 @@ const (
 
 	queueIDControl   = 0xffff // ctrlCmd.QueueID for device-level commands
 	stateLive        = 1      // devInfo.State while the device serves I/O
+	stateQuiesced    = 2      // a recoverable device whose server died
 	devIDAuto        = ^uint32(0)
 	maxQueueDepth    = 4096
 	resultAbort      = -19 // -ENODEV: the kernel is tearing the queue down
@@ -207,6 +216,16 @@ var (
 	_ [120]byte = [unsafe.Sizeof(ringParams{})]byte{}
 	_ [24]byte  = [unsafe.Sizeof(getEventsArg{})]byte{}
 )
+
+// ctrlIoctl encodes control command nr. The kernel decodes most by number alone but
+// matches GET_FEATURES, a newer command, on its exact _IOR encoding.
+func ctrlIoctl(nr uint32) uint32 {
+	op := ioctl(nr, uint32(unsafe.Sizeof(ctrlCmd{})))
+	if nr == cmdGetFeatures {
+		op = op&^(ioctlDirRW<<ioctlDirShift) | ioctlDirR<<ioctlDirShift
+	}
+	return op
+}
 
 // ioctl encodes _IOWR('u', nr, size) the way the ublk driver expects its cmd_op.
 func ioctl(nr, size uint32) uint32 {

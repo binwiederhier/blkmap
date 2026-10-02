@@ -63,3 +63,13 @@ func TestServeRejectsRequestsOutsideTheDevice(t *testing.T) {
 	assert.Equal(t, int32(0), q.serve(3))
 	assert.Equal(t, 1, m.flushes)
 }
+
+func TestDeviceStats(t *testing.T) {
+	slow, fast := &queue{}, &queue{}
+	for i := 0; i < 20; i++ {
+		slow.observe(2 * time.Millisecond)
+		fast.observe(5 * time.Microsecond)
+	}
+	d := &Device{queues: []*queue{slow, fast}}
+	assert.Equal(t, Stats{Queues: 2, Parallel: 1}, d.Stats())
+}

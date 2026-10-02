@@ -6,9 +6,10 @@ import (
 )
 
 const (
-	// NotifyReady and NotifyStopping are the sd_notify(3) states blkmap sends.
-	NotifyReady    = "READY=1"
-	NotifyStopping = "STOPPING=1"
+	// NotifyReady, NotifyReloading and NotifyStopping are the sd_notify(3) states blkmap sends.
+	NotifyReady     = "READY=1"
+	NotifyReloading = "RELOADING=1"
+	NotifyStopping  = "STOPPING=1"
 	// notifySocketEnv is set by systemd for Type=notify units.
 	notifySocketEnv = "NOTIFY_SOCKET"
 )

@@ -63,17 +63,18 @@ type queue struct {
 	efdBuf    [8]byte // target of the standing eventfd read
 	work      chan uint16
 	workers   sync.WaitGroup
-	results   []int32    // per tag, written by the worker before posting the tag
-	durations []int64    // per tag, nanoseconds the backend call took
-	completed []uint16   // tags whose backend call finished, waiting for COMMIT
-	compMu    sync.Mutex // Protects completed
-	service   int64      // smoothed backend read service time in nanoseconds (queue thread only)
-	fastRun   int        // consecutive reads under fastRead (queue thread only)
-	parallel  bool       // whether reads currently go to the workers (queue thread only)
+	results   []int32     // per tag, written by the worker before posting the tag
+	durations []int64     // per tag, nanoseconds the backend call took
+	completed []uint16    // tags whose backend call finished, waiting for COMMIT
+	compMu    sync.Mutex  // Protects completed
+	service   int64       // smoothed backend read service time in nanoseconds (queue thread only)
+	fastRun   int         // consecutive reads under fastRead (queue thread only)
+	parallel  bool        // whether reads currently go to the workers (queue thread only)
+	shown     atomic.Bool // parallel, for Stats
 }
 
 func newQueue(d *Device, id uint16) (*queue, error) {
-	fd, err := syscall.Dup(d.charFd)
+	fd, err := dupCloexec(d.charFd)
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +230,10 @@ func (q *queue) observe(d time.Duration) {
 	}
 	if !q.parallel && q.service > int64(parallelAbove) {
 		q.parallel = true
+		q.shown.Store(true)
 	} else if q.parallel && q.fastRun >= inlineAfter {
 		q.parallel, q.fastRun = false, 0
+		q.shown.Store(false)
 	}
 }
 

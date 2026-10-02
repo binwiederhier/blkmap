@@ -36,10 +36,11 @@ type control struct {
 	cmd      ctrlCmd
 	info     devInfo
 	par      params
+	feat     uint64
 }
 
 func openControl() (*control, error) {
-	fd, err := syscall.Open(controlPath, syscall.O_RDWR, 0)
+	fd, err := openCloexec(controlPath)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w (is ublk_drv loaded?)", controlPath, err)
 	}
@@ -63,14 +64,14 @@ func (c *control) close() error {
 }
 
 // addDevice registers a device and returns the id the kernel assigned.
-func (c *control) addDevice(queues, depth, maxIO int) (uint32, error) {
+func (c *control) addDevice(queues, depth, maxIO int, flags uint64) (uint32, error) {
 	c.info = devInfo{
 		NrHwQueues:    uint16(queues),
 		QueueDepth:    uint16(depth),
 		MaxIOBufBytes: uint32(maxIO),
 		DevID:         devIDAuto,
 		UblksrvPID:    int32(os.Getpid()),
-		Flags:         featURingCmdCompInTask,
+		Flags:         flags,
 		OwnerUID:      uint32(os.Getuid()),
 		OwnerGID:      uint32(os.Getgid()),
 	}
@@ -98,6 +99,39 @@ func (c *control) setParams(id uint32, p *params) error {
 	return c.run(cmdSetParams)
 }
 
+// getParams reads the kernel's parameter block of the device.
+func (c *control) getParams(id uint32) (*params, error) {
+	c.par = params{Len: uint32(unsafe.Sizeof(c.par))}
+	c.cmd = ctrlCmd{DevID: id, QueueID: queueIDControl, Len: uint16(unsafe.Sizeof(c.par)), Addr: uint64(uintptr(unsafe.Pointer(&c.par)))}
+	if err := c.run(cmdGetParams); err != nil {
+		return nil, err
+	}
+	p := c.par
+	return &p, nil
+}
+
+// features returns the kernel's supported feature flags.
+func (c *control) features() (uint64, error) {
+	c.feat = 0
+	c.cmd = ctrlCmd{DevID: devIDAuto, QueueID: queueIDControl, Len: uint16(unsafe.Sizeof(c.feat)), Addr: uint64(uintptr(unsafe.Pointer(&c.feat)))}
+	if err := c.run(cmdGetFeatures); err != nil {
+		return 0, err
+	}
+	return c.feat, nil
+}
+
+func (c *control) startUserRecovery(id uint32) error {
+	c.cmd = ctrlCmd{DevID: id, QueueID: queueIDControl}
+	return c.run(cmdStartUserRecovery)
+}
+
+// endUserRecovery completes a recovery once every queue has fetched; the kernel records
+// this process as the server and lets the waiting I/O through.
+func (c *control) endUserRecovery(id uint32) error {
+	c.cmd = ctrlCmd{DevID: id, QueueID: queueIDControl, Data: uint64(os.Getpid())}
+	return c.run(cmdEndUserRecovery)
+}
+
 func (c *control) startDevice(id uint32) error {
 	c.cmd = ctrlCmd{DevID: id, QueueID: queueIDControl, Data: uint64(os.Getpid())}
 	return c.run(cmdStartDev)
@@ -122,7 +156,7 @@ func (c *control) run(nr uint32) error {
 		return errControlPoisoned
 	}
 	c.seq++
-	if err := c.ring.prepare(ioctl(nr, uint32(unsafe.Sizeof(c.cmd))), c.seq, unsafe.Pointer(&c.cmd), unsafe.Sizeof(c.cmd)); err != nil {
+	if err := c.ring.prepare(ctrlIoctl(nr), c.seq, unsafe.Pointer(&c.cmd), unsafe.Sizeof(c.cmd)); err != nil {
 		return err
 	}
 	if err := c.ring.flush(); err != nil {
