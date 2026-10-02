@@ -39,6 +39,8 @@ const (
 	// (128 KiB) is tuned for disks; for a source that is a network round trip per request,
 	// a window of several requests lets a sequential reader keep many in flight.
 	readAheadKB = 4096
+	// slowStop is when Close says where its time went
+	slowStop = 2 * time.Second
 	// ExitDetached is the exit status after Detach; the unit restarts on it.
 	ExitDetached = 75
 	// liveBitmapExt names the live bitmap in RunDir (<id>.bitmap, see cow.Bitmap).
@@ -433,17 +435,19 @@ func (d *Device) Written() int64 {
 	return d.store.Written()
 }
 
-// Detach hands the device to a successor process: background work stops and everything
-// is made durable, then the caller must exit at once (with ExitDetached under systemd). The
-// kernel device keeps waiting I/O until the next Serve of the same ID re-attaches; writes
-// served between the flush and the exit are in the live bitmap. Requires Options.Recovery.
+// Detach hands the device to a successor process; the caller must exit or re-execute at
+// once (with ExitDetached under systemd). The kernel device keeps waiting I/O until the next
+// Serve of the same ID re-attaches. Nothing is flushed and nothing is waited for: the COW
+// file's page cache and the live bitmap outlive the process, so every write served so far
+// is the successor's, and a flush could take minutes under load while the guest waits for
+// the successor. Background work is told to stop; the exit ends whatever is in flight.
+// Requires Options.Recovery.
 func (d *Device) Detach() error {
-	defer unmarkServed(d.id)
+	unmarkServed(d.id)
 	if d.stop != nil {
 		d.stop()
-		d.bg.Wait()
 	}
-	return d.store.Flush()
+	return nil
 }
 
 // Status returns a snapshot of the device's state and counters.
@@ -510,8 +514,17 @@ func (d *Device) Close() error {
 	if at := mountPoint(d.BlockPath); at != "" {
 		log.Printf("%s: still mounted at %s; unmount it, deletion waits for it", filepath.Base(d.Path), at)
 	}
-	errs := []error{d.halt(), d.store.Close()}
-	if err := d.ublk.Delete(); errors.Is(err, ublk.ErrReowned) {
+	t0 := time.Now()
+	haltErr := d.halt()
+	t1 := time.Now()
+	errs := []error{haltErr, d.store.Close()}
+	t2 := time.Now()
+	deleteErr := d.ublk.Delete()
+	if t3 := time.Now(); t3.Sub(t0) > slowStop {
+		log.Printf("%s: stop took %s: draining I/O %s, flushing %s, deleting the kernel device %s",
+			filepath.Base(d.Path), t3.Sub(t0).Round(time.Millisecond), t1.Sub(t0).Round(time.Millisecond), t2.Sub(t1).Round(time.Millisecond), t3.Sub(t2).Round(time.Millisecond))
+	}
+	if err := deleteErr; errors.Is(err, ublk.ErrReowned) {
 		// A restarted server already owns this id, its symlink and its state file
 		log.Printf("%s: kernel device id reused by a successor, leaving its files in place", filepath.Base(d.Path))
 		return errors.Join(errs...)
@@ -533,16 +546,22 @@ func (d *Device) Close() error {
 	return errors.Join(errs...)
 }
 
+// stopBackground ends hydration and the periodic flush. The source is aborted before the
+// wait: a hydration read blocked in it would otherwise hold up the shutdown indefinitely.
+func (d *Device) stopBackground() {
+	if d.stop != nil {
+		d.stop()
+	}
+	d.store.Abort()
+	d.bg.Wait()
+}
+
 // halt ends the device's I/O without closing anything: background work stops, reads blocked in
 // the source are aborted, and STOP_DEV drains what is in flight. A group halts every device
 // before it closes any store, since a device's requests may land in a sibling's store.
 // Idempotent.
 func (d *Device) halt() error {
-	if d.stop != nil {
-		d.stop()
-		d.bg.Wait()
-	}
-	d.store.Abort()
+	d.stopBackground()
 	return d.ublk.Stop()
 }
 

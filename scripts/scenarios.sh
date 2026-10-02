@@ -173,8 +173,8 @@ hydrate:
   rate: 4M
 YML
   unit start sc-sh && wait_dev sc-sh || { bad stop_during_hydration "start"; return; }
-  sleep 2; local t0=$(date +%s); unit stop sc-sh; local t=$(( $(date +%s) - t0 ))
-  [ $t -le 5 ] && ok stop_during_hydration || bad stop_during_hydration "stop took ${t}s while hydrating"
+  sleep 2; local s=$(since) t0=$(date +%s); unit stop sc-sh; local t=$(( $(date +%s) - t0 ))
+  [ $t -le 5 ] && ok stop_during_hydration || { bad stop_during_hydration "stop took ${t}s while hydrating"; journal sc-sh "$s" | tail -4 | sed 's/^/    /'; }
 }
 sc_restart_storm_under_reads() {
   cfg sc-r <<YML

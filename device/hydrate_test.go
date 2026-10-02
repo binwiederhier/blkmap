@@ -263,3 +263,60 @@ func TestHydratorGivesUpAfterMaxPasses(t *testing.T) {
 	assert.Positive(t, last.Errors)
 	assert.LessOrEqual(t, base.failures.Load(), int32(hydrateMaxPasses*(hSize/hydrateRunBytes+1)), "bounded passes")
 }
+
+// blockedSource blocks every read until aborted.
+type blockedSource struct {
+	started, release chan struct{}
+	once, aborted    sync.Once
+}
+
+func (s *blockedSource) Size() int64 { return 65536 }
+func (s *blockedSource) ReadAt(p []byte, off int64) (int, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return 0, errors.New("aborted")
+}
+func (s *blockedSource) Abort()       { s.aborted.Do(func() { close(s.release) }) }
+func (s *blockedSource) Close() error { s.Abort(); return nil }
+
+// A hydration read blocked in the source must hold up neither a handoff nor a shutdown: the
+// handoff does not wait for it (the successor re-attaches; the exec ends the read), and
+// shutdown aborts the source before it waits.
+func TestDetachAndHaltDoNotWaitOnBlockedHydration(t *testing.T) {
+	for _, op := range []string{"detach", "halt"} {
+		t.Run(op, func(t *testing.T) {
+			dir := t.TempDir()
+			base := &blockedSource{started: make(chan struct{}), release: make(chan struct{})}
+			s, err := cow.Open(base, filepath.Join(dir, "cow"), filepath.Join(dir, "bitmap"), 65536)
+			require.NoError(t, err)
+			defer s.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			d := &Device{store: s, stop: cancel, ublk: nil}
+			h := newHydrator("t", s, base, &Hydrate{Rest: true, Concurrency: 1}, idle)
+			d.bg.Add(1)
+			go func() { defer d.bg.Done(); h.run(ctx) }()
+			select {
+			case <-base.started:
+			case <-time.After(time.Second):
+				t.Fatal("hydration did not start")
+			}
+			done := make(chan struct{})
+			go func() {
+				if op == "detach" {
+					d.Detach()
+				} else {
+					d.stopBackground()
+				}
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				base.Abort()
+				<-done
+				t.Fatalf("%s waited for a hydration read blocked in the source", op)
+			}
+			base.Abort()
+		})
+	}
+}
