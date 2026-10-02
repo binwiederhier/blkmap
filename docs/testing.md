@@ -29,7 +29,8 @@ kernel until reboot, and the power-cut test reboots the machine on purpose.
   files or the maintainer scripts: `make test-vm`. It is the only gate for crash recovery,
   durability, upgrades and systemd behaviour.
 - After a kernel or systemd upgrade on the target fleet: `make test-vm` with a template that
-  runs that kernel (`TEMPLATE=...`).
+  runs that kernel (`TEMPLATE=...`). On box11, template 9000 is Ubuntu 26.04 (kernel 7.0) and
+  9002 is Ubuntu 24.04 (kernel 6.8, systemd 255); run both before a release.
 
 ## make test-vm
 
@@ -124,7 +125,6 @@ the verdict. Clean up everything the scenario started; the leak check fails it o
 
 ## Not covered yet
 
-- Crash recovery on kernels other than 7.0 (the I/O path was verified on 6.8 earlier).
 - systemd older than 254, where `RestartMode=direct` is ignored and the reap unit relies on
   its 3 second check.
 - Long soak runs (hours to days of mixed I/O with source flaps and restarts).

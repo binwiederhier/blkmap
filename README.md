@@ -23,8 +23,8 @@ Build the Debian package with goreleaser (`make release-snapshot`) and install i
 
 Requirements: Linux with the `ublk_drv` module. On Ubuntu that module is in
 `linux-modules-extra-$(uname -r)`, which is not installed by default on minimal images.
-Everything is verified on kernel 7.0 (Ubuntu 26.04), including crash recovery and power cuts;
-the I/O path was also verified on 6.8 (Ubuntu 24.04). Crash recovery needs the kernel's ublk
+Everything, including crash recovery and power cuts, is verified on kernel 6.8 (Ubuntu
+24.04) and 7.0 (Ubuntu 26.04). Crash recovery needs the kernel's ublk
 user-recovery feature (6.0+); without it blkmap logs a warning and a crash fails I/O instead
 of pausing it.
 
