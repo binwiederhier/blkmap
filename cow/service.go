@@ -9,6 +9,7 @@ import (
 	"math/bits"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -34,6 +35,7 @@ type Store struct {
 	bitmap    *Bitmap
 	chunkSize int64
 	size      int64
+	dirty     atomic.Bool             // something changed since the last Flush
 	locks     [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 }
 
@@ -112,12 +114,19 @@ func (s *Store) Size() int64 {
 	return s.size
 }
 
-// Flush makes all completed writes durable: COW data first, then the bitmap.
+// Flush makes all completed writes durable: COW data first, then the bitmap, so a bit on
+// disk never describes data that is not.
 func (s *Store) Flush() error {
+	s.dirty.Store(false)
 	if err := s.cow.Sync(); err != nil {
+		s.dirty.Store(true)
 		return err
 	}
-	return s.bitmap.Sync()
+	if err := s.bitmap.Sync(); err != nil {
+		s.dirty.Store(true)
+		return err
+	}
+	return nil
 }
 
 // Written returns the number of chunks that live in the COW file.
@@ -152,6 +161,7 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 		return err
 	}
 	s.bitmap.Set(chunk)
+	s.dirty.Store(true)
 	return nil
 }
 
@@ -170,6 +180,7 @@ func (s *Store) Discard(off, length int64) error {
 		var err error
 		if s.bitmap.Test(chunk) {
 			err = s.punch(chunk)
+			s.dirty.Store(true)
 		}
 		mu.Unlock()
 		if err != nil {
@@ -197,6 +208,7 @@ func (s *Store) WriteZeroes(off, length int64) error {
 			mu.Lock()
 			if err = s.punch(chunk); err == nil {
 				s.bitmap.Set(chunk)
+				s.dirty.Store(true)
 			}
 			mu.Unlock()
 		} else {
@@ -270,6 +282,7 @@ func (s *Store) HydrateChunk(chunk int64, direct bool) (bool, error) {
 		return false, err
 	}
 	s.bitmap.Set(chunk)
+	s.dirty.Store(true)
 	return true, nil
 }
 
@@ -283,6 +296,7 @@ func (s *Store) MarkZero(chunk int64) bool {
 		return false
 	}
 	s.bitmap.Set(chunk)
+	s.dirty.Store(true)
 	return true
 }
 
@@ -299,21 +313,42 @@ func (s *Store) Stat() (*syscall.Stat_t, error) {
 // with the device size and chunk size the bitmap was created for. A missing bitmap is not an
 // error: complete is false.
 func Complete(bitmapPath string) (size, chunkSize int64, complete bool, err error) {
-	data, err := os.ReadFile(bitmapPath)
+	info, err := Inspect(bitmapPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, 0, false, nil
 	}
 	if err != nil {
 		return 0, 0, false, err
 	}
-	size, chunkSize, err = parseHeader(data)
+	return info.Size, info.ChunkSize, info.Written == info.Chunks, nil
+}
+
+// Info is what Inspect reads from a bitmap file.
+type Info struct {
+	Size      int64 // device size the bitmap was created for
+	ChunkSize int64
+	Chunks    int64
+	Written   int64 // chunks recorded as present in the COW file
+}
+
+// Inspect reads a bitmap file without opening the store.
+func Inspect(bitmapPath string) (*Info, error) {
+	data, err := os.ReadFile(bitmapPath)
 	if err != nil {
-		return 0, 0, false, fmt.Errorf("%w %s: %w", errBitmap, bitmapPath, err)
+		return nil, err
 	}
-	var count int64
+	size, chunkSize, err := parseHeader(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w %s: %w", errBitmap, bitmapPath, err)
+	}
+	info := &Info{Size: size, ChunkSize: chunkSize, Chunks: (size + chunkSize - 1) / chunkSize}
 	for _, b := range data[bitmapHeaderSize:] {
-		count += int64(bits.OnesCount8(b))
+		info.Written += int64(bits.OnesCount8(b))
 	}
-	chunks := (size + chunkSize - 1) / chunkSize
-	return size, chunkSize, count == chunks, nil
+	return info, nil
+}
+
+// Dirty reports whether anything changed since the last Flush.
+func (s *Store) Dirty() bool {
+	return s.dirty.Load()
 }

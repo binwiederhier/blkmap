@@ -418,3 +418,28 @@ func TestDeleteAfterServerDeath(t *testing.T) {
 	_, err = os.Stat(fmt.Sprintf("%s%d", charPrefix, id))
 	assert.True(t, os.IsNotExist(err))
 }
+
+func TestDeviceStopThenDelete(t *testing.T) {
+	requireUblk(t)
+	m := newMem(4 << 20)
+	d := createTestDevice(t, &Params{Backend: m})
+	f, err := os.OpenFile(d.BlockPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte("stop"), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	require.NoError(t, d.Stop())
+	assert.Equal(t, "stop", string(m.data[:4]))
+	_, err = os.Stat(d.BlockPath)
+	assert.True(t, os.IsNotExist(err), "the block device goes away on Stop")
+	info, err := GetInfo(d.ID)
+	require.NoError(t, err)
+	assert.False(t, info.Live)
+	require.NoError(t, d.Stop()) // idempotent
+	require.NoError(t, d.Delete())
+	_, err = GetInfo(d.ID)
+	assert.ErrorIs(t, err, syscall.ENODEV)
+	require.NoError(t, d.Delete())
+	require.NoError(t, d.Close())
+}

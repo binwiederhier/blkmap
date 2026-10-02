@@ -197,6 +197,21 @@ Run the root suites on a throwaway VM rather than your workstation: a transport 
 the kernel for good, and a scratch VM is rebooted in seconds. `scripts/remote-test.sh` builds
 here and runs there; verified on Ubuntu 24.04 (kernel 6.8) and 26.04 (kernel 7.0).
 
+### Durability and shutdown
+
+The COW file and its bitmap are kept consistent in one direction at all times: a chunk's
+bit reaches the bitmap file only after the chunk's data reached the COW file (fdatasync
+first, then the bitmap pages, then fdatasync again). That happens on every flush the guest
+issues, every 5 seconds when anything changed, and on shutdown. After a crash or power cut
+the device therefore shows, per chunk, either the write or the base, never zeros for a
+write that was acknowledged but not flushed.
+
+Shutdown order is: stop hydration and the flush timer, STOP_DEV (drains in-flight I/O),
+flush and close the store, then DEL_DEV, then remove the symlink. DEL_DEV waits for anything
+holding the block device open, so `systemctl stop` on a mounted device logs a warning and
+waits; after `TimeoutStopSec` systemd kills the daemon, which by then has everything on
+disk, and the next start deletes the dead kernel device.
+
 A crashed server leaves its kernel device behind (only DEL_DEV removes one); `serve` records
 the ublk id in `/run/blkmap/<id>` and deletes the dead predecessor on the next start. Two
 kernel 6.8 traps worth knowing: a ublk server that dies while START_DEV is scanning

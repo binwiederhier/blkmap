@@ -11,12 +11,14 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
 	"heckel.io/blkmap/config"
+	"heckel.io/blkmap/cow"
 	"heckel.io/blkmap/source"
 	"heckel.io/blkmap/ublk"
 )
@@ -385,4 +387,69 @@ func TestStartDetachedWhenFullyHydrated(t *testing.T) {
 	require.NoError(t, os.Remove(filepath.Join(dir, "det.cow.bitmap")))
 	_, err = Start(context.Background(), c, filepath.Join(dir, "dev"))
 	require.Error(t, err)
+}
+
+func TestCloseFlushesBeforeWaitingForOpeners(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	d, err := Serve(context.Background(), &Options{
+		ID:      "flush",
+		Base:    &computed{size: 4 << 20},
+		COWFile: filepath.Join(dir, "flush.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+		RunDir:  filepath.Join(dir, "run"),
+	})
+	require.NoError(t, err)
+	// A direct write reaches the daemon without any flush, so the bitmap bit is only in memory
+	f, err := os.OpenFile(d.Path, os.O_RDWR|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	raw := make([]byte, 8192)
+	data := raw[4096-int(uintptr(unsafe.Pointer(&raw[0]))%4096):][:4096]
+	copy(data, bytes.Repeat([]byte("flushed!"), 512))
+	_, err = f.WriteAt(data, 1<<20)
+	require.NoError(t, err)
+	// Close while f keeps the device open: deletion has to wait, but everything must
+	// already be on disk by then
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	time.Sleep(time.Second)
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while the device was still open: %v", err)
+	default:
+	}
+	info, err := cow.Inspect(filepath.Join(dir, "flush.cow.bitmap"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), info.Written)
+	cowData, err := os.ReadFile(filepath.Join(dir, "flush.cow"))
+	require.NoError(t, err)
+	assert.Equal(t, data, cowData[1<<20:1<<20+len(data)])
+	require.NoError(t, f.Close())
+	require.NoError(t, <-closed)
+	_, err = os.Lstat(d.Path)
+	assert.True(t, os.IsNotExist(err))
+}
+
+func TestPeriodicFlush(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	d, err := Serve(context.Background(), &Options{
+		ID:      "tick",
+		Base:    &computed{size: 4 << 20},
+		COWFile: filepath.Join(dir, "tick.cow"),
+		DevDir:  filepath.Join(dir, "dev"),
+		RunDir:  filepath.Join(dir, "run"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	f, err := os.OpenFile(d.Path, os.O_RDWR|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	buf := make([]byte, 8192)
+	_, err = f.WriteAt(buf[4096-int(uintptr(unsafe.Pointer(&buf[0]))%4096):][:4096], 2<<20)
+	require.NoError(t, err)
+	require.NoError(t, f.Close()) // no fsync anywhere
+	require.Eventually(t, func() bool {
+		info, err := cow.Inspect(filepath.Join(dir, "tick.cow.bitmap"))
+		return err == nil && info.Written == 1
+	}, 3*flushInterval, 200*time.Millisecond, "the bit should reach disk without a guest flush")
 }

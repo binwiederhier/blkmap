@@ -69,7 +69,8 @@ type Device struct {
 	charFd    int
 	queues    []*queue
 	stopping  atomic.Bool
-	closed    bool
+	stopped   bool
+	deleted   bool
 }
 
 // Create registers the device with the kernel, starts its queues, and returns once
@@ -122,14 +123,9 @@ func Create(p *Params) (*Device, error) {
 	return d, nil
 }
 
-// Close stops the device (draining in-flight I/O), joins the queue threads and deletes it.
-// Deletion waits until nothing holds the block device open any more (a mount, a process
-// with the device open), so unmount first.
+// Close is Stop followed by Delete. Deletion waits until nothing holds the block device
+// open any more (a mount, a process with the device open), so unmount first.
 func (d *Device) Close() error {
-	if d.closed {
-		return nil
-	}
-	d.closed = true
 	ctl, err := openControl()
 	if err != nil {
 		return err
@@ -138,11 +134,42 @@ func (d *Device) Close() error {
 	return d.teardown(ctl)
 }
 
-// teardown is the shutdown sequence shared by Close and a failed Create. STOP_DEV first:
-// it drains in-flight requests, which the still-running loops must serve, then aborts
-// the outstanding fetches so the loops exit. DEL_DEV last, after every char device fd is
-// closed, because it blocks while any reference remains.
+// Stop ends I/O: STOP_DEV drains in-flight requests and removes /dev/ublkbN, the queue
+// threads exit and every char device fd is closed. The backend receives no calls after
+// Stop returns, so it can be flushed and closed safely. Idempotent.
+func (d *Device) Stop() error {
+	ctl, err := openControl()
+	if err != nil {
+		return err
+	}
+	defer ctl.close()
+	return d.stop(ctl)
+}
+
+// Delete removes the kernel device (DEL_DEV). It blocks while anything still holds the
+// block device open, which is why it is separate from Stop. Idempotent.
+func (d *Device) Delete() error {
+	ctl, err := openControl()
+	if err != nil {
+		return err
+	}
+	defer ctl.close()
+	return d.delete(ctl)
+}
+
+// teardown is the shutdown sequence shared by Close and a failed Create.
 func (d *Device) teardown(ctl *control) error {
+	return errors.Join(d.stop(ctl), d.delete(ctl))
+}
+
+// stop issues STOP_DEV, which drains in-flight requests (the still-running loops serve
+// them) and then aborts the outstanding fetches so the loops exit; then it releases every
+// char device fd, which DEL_DEV later needs closed.
+func (d *Device) stop(ctl *control) error {
+	if d.stopped {
+		return nil
+	}
+	d.stopped = true
 	var errs []error
 	if err := ctl.stopDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
 		errs = append(errs, err)
@@ -157,10 +184,23 @@ func (d *Device) teardown(ctl *control) error {
 		errs = append(errs, syscall.Close(d.charFd))
 		d.charFd = -1
 	}
-	if err := ctl.deleteDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
-		errs = append(errs, err)
-	}
 	return errors.Join(errs...)
+}
+
+func (d *Device) delete(ctl *control) error {
+	if d.deleted {
+		return nil
+	}
+	if !d.stopped {
+		if err := d.stop(ctl); err != nil {
+			return err
+		}
+	}
+	d.deleted = true
+	if err := ctl.deleteDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
+		return err
+	}
+	return nil
 }
 
 // defaults fills in the zero-value parameters.

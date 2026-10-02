@@ -59,5 +59,34 @@ func TestBitmapFileSize(t *testing.T) {
 	require.NoError(t, b.Close())
 	st, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, int64(bitmapHeaderSize+2<<20), st.Size())
+	assert.Equal(t, int64(bitmapHeaderSize+2<<20), st.Size()) // 2 MiB of bits, page aligned
+}
+
+func TestBitmapPersistsOnlyOnSync(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bits")
+	b, err := OpenBitmap(path, 1000*4096, 4096)
+	require.NoError(t, err)
+	b.Set(1)
+	b.Set(999)
+	// Nothing reaches the file before Sync: a crash here must not leave a bit whose data
+	// the COW file may not have
+	other, err := OpenBitmap(path, 1000*4096, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), other.Count())
+	require.NoError(t, other.Close())
+	require.NoError(t, b.Sync())
+	other, err = OpenBitmap(path, 1000*4096, 4096)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), other.Count())
+	assert.True(t, other.Test(999))
+	require.NoError(t, other.Close())
+	// Bits set after a Sync are picked up by the next one
+	b.Set(500)
+	require.NoError(t, b.Sync())
+	info, err := Inspect(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), info.Written)
+	assert.Equal(t, int64(1000), info.Chunks)
+	require.NoError(t, b.Close())
 }

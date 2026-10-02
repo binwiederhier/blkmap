@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"heckel.io/blkmap/config"
 	"heckel.io/blkmap/cow"
@@ -28,6 +30,9 @@ const (
 	RunDir        = "/run/blkmap"
 	devDirMode    = 0755
 	stateFileMode = 0600
+	// flushInterval bounds how long a completed write can sit without reaching disk when
+	// the guest never issues a flush (raw dd, no filesystem).
+	flushInterval = 5 * time.Second
 )
 
 // Options describes a device to serve from an arbitrary read-only base. This is the library
@@ -53,8 +58,9 @@ type Device struct {
 	statePath string // RunDir/<id>, holding the ublk id
 	store     *cow.Store
 	ublk      *ublk.Device
-	stop      context.CancelFunc // ends background hydration
-	hydrated  chan struct{}      // closed when the hydrator has exited
+	stop      context.CancelFunc // ends the background goroutines (hydration, periodic flush)
+	bg        sync.WaitGroup
+	closed    bool
 }
 
 // Start opens the sources and COW store for c and serves them as a block device, publishing
@@ -149,16 +155,41 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 		d.Close()
 		return nil, err
 	}
+	bgCtx, cancel := context.WithCancel(context.Background())
+	d.stop = cancel
+	d.bg.Add(1)
+	go func() {
+		defer d.bg.Done()
+		d.flushLoop(bgCtx)
+	}()
 	if o.Hydrate != nil {
-		hctx, cancel := context.WithCancel(context.Background())
-		d.stop, d.hydrated = cancel, make(chan struct{})
 		h := newHydrator(o.ID, store, o.Base, o.Hydrate, b.busy)
+		d.bg.Add(1)
 		go func() {
-			defer close(d.hydrated)
-			h.run(hctx)
+			defer d.bg.Done()
+			h.run(bgCtx)
 		}()
 	}
 	return d, nil
+}
+
+// flushLoop makes completed writes durable every flushInterval, for guests that never
+// flush themselves; the bitmap is only ever written after the COW data (see cow.Store.Flush).
+func (d *Device) flushLoop(ctx context.Context) {
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if d.store.Dirty() {
+				if err := d.store.Flush(); err != nil {
+					log.Printf("%s: periodic flush failed: %s", filepath.Base(d.Path), err.Error())
+				}
+			}
+		}
+	}
 }
 
 // hydrateFromConfig turns the config block into a plan, reading the prefetch list.
@@ -218,24 +249,47 @@ func (d *Device) Written() int64 {
 	return d.store.Written()
 }
 
-// Close stops hydration and the device, removes the symlink and state file, and closes the
-// store and sources.
+// Close shuts the device down in an order that cannot lose data: background work stops,
+// STOP_DEV drains in-flight I/O (the store must still be open for that), the store flushes
+// the COW file and then the bitmap and closes, and only then DEL_DEV, which can wait for
+// openers of the block device. A kill during that wait finds everything already on disk.
 func (d *Device) Close() error {
+	if d.closed {
+		return nil
+	}
+	d.closed = true
 	if d.stop != nil {
 		d.stop()
-		<-d.hydrated
-		d.stop = nil
+		d.bg.Wait()
 	}
-	var errs []error
+	if at := mountPoint(d.BlockPath); at != "" {
+		log.Printf("%s: still mounted at %s; unmount it, deletion waits for it", filepath.Base(d.Path), at)
+	}
+	errs := []error{d.ublk.Stop(), d.store.Close(), d.ublk.Delete()}
 	for _, path := range []string{d.Path, d.statePath} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
-	// Stop the kernel device before the store: STOP_DEV drains in-flight I/O, which still
-	// needs the store open
-	errs = append(errs, d.ublk.Close(), d.store.Close())
 	return errors.Join(errs...)
+}
+
+// mountPoint returns where the block device is mounted, or "" if it is not.
+func mountPoint(blockPath string) string {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// ... "-" fstype source options: the source follows the separator
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "-" && i+2 < len(fields) && fields[i+2] == blockPath && len(fields) > 4 {
+				return fields[4]
+			}
+		}
+	}
+	return ""
 }
 
 // publish creates the /dev/blkmap/<id> symlink, replacing a stale one from a previous run,

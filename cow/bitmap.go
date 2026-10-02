@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+	"sync"
 	"sync/atomic"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -21,8 +20,11 @@ const (
 	bitmapOffVersion = 8
 	bitmapOffSize    = 16
 	bitmapOffChunk   = 24
-	// bitmapWordBits is the width of the atomic word the bit area is viewed as.
+	// bitmapWordBits is the width of the atomic word the bit area is made of.
 	bitmapWordBits = 32
+	bitmapWordSize = bitmapWordBits / 8
+	// bitmapPageSize is the write-out unit: Sync rewrites only pages with changed bits.
+	bitmapPageSize = 4096
 	bitmapFileMode = 0600
 )
 
@@ -30,20 +32,23 @@ var (
 	errBitmap = errors.New("bitmap")
 )
 
-// Bitmap is a persistent, mmap'd bit-per-chunk map recording which chunks live in the COW
-// file. A small header pins the geometry so a stale or foreign bitmap is rejected.
+// Bitmap is a persistent bit-per-chunk map recording which chunks live in the COW file. The
+// bits live in memory and reach the file only in Sync, which the store calls after the COW
+// data is on disk, so a bit on disk always has its data on disk. A small header pins the
+// geometry so a stale or foreign bitmap is rejected.
 type Bitmap struct {
 	f      *os.File
-	mapped []byte   // whole file mapping, header included
-	words  []uint32 // the bit area, as atomically updatable words
+	words  []uint32
 	chunks int64
+	dirty  []atomic.Bool // one per bitmapPageSize of the bit area
+	syncMu sync.Mutex    // Serializes Sync
 }
 
 // OpenBitmap opens or creates the bitmap for a device of size bytes and the given chunk size.
 func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 	chunks := (size + chunkSize - 1) / chunkSize
 	words := (chunks + bitmapWordBits - 1) / bitmapWordBits
-	fileSize := bitmapHeaderSize + words*bitmapWordBits/8
+	areaSize := (words*bitmapWordSize + bitmapPageSize - 1) / bitmapPageSize * bitmapPageSize
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, bitmapFileMode)
 	if err != nil {
 		return nil, err
@@ -54,7 +59,7 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 		return nil, err
 	}
 	if st.Size() == 0 {
-		err = writeHeader(f, fileSize, size, chunkSize)
+		err = writeHeader(f, bitmapHeaderSize+areaSize, size, chunkSize)
 	} else {
 		err = checkHeader(f, size, chunkSize)
 	}
@@ -62,18 +67,12 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 		f.Close()
 		return nil, fmt.Errorf("%w %s: %w", errBitmap, path, err)
 	}
-	mapped, err := unix.Mmap(int(f.Fd()), 0, int(fileSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
+	b := &Bitmap{f: f, words: make([]uint32, areaSize/bitmapWordSize), chunks: chunks, dirty: make([]atomic.Bool, areaSize/bitmapPageSize)}
+	if _, err := f.ReadAt(b.area(), bitmapHeaderSize); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("%w %s: mmap: %w", errBitmap, path, err)
+		return nil, fmt.Errorf("%w %s: read: %w", errBitmap, path, err)
 	}
-	area := mapped[bitmapHeaderSize:]
-	return &Bitmap{
-		f:      f,
-		mapped: mapped,
-		words:  unsafe.Slice((*uint32)(unsafe.Pointer(unsafe.SliceData(area))), words),
-		chunks: chunks,
-	}, nil
+	return b, nil
 }
 
 // Test reports whether chunk i is marked written.
@@ -81,9 +80,11 @@ func (b *Bitmap) Test(i int64) bool {
 	return atomic.LoadUint32(&b.words[i/bitmapWordBits])&(1<<(i%bitmapWordBits)) != 0
 }
 
-// Set marks chunk i as written.
+// Set marks chunk i as written. The bit is in memory until the next Sync.
 func (b *Bitmap) Set(i int64) {
-	atomic.OrUint32(&b.words[i/bitmapWordBits], 1<<(i%bitmapWordBits))
+	word := i / bitmapWordBits
+	atomic.OrUint32(&b.words[word], 1<<(i%bitmapWordBits))
+	b.dirty[word*bitmapWordSize/bitmapPageSize].Store(true)
 }
 
 // Count returns the number of chunks marked written.
@@ -100,14 +101,33 @@ func (b *Bitmap) Chunks() int64 {
 	return b.chunks
 }
 
-// Sync flushes the mapping to disk.
+// Sync writes every page with changed bits to the file and makes the file durable. Call it
+// only after the COW data those bits describe is durable.
 func (b *Bitmap) Sync() error {
-	return unix.Msync(b.mapped, unix.MS_SYNC)
+	b.syncMu.Lock()
+	defer b.syncMu.Unlock()
+	area := b.area()
+	for page := range b.dirty {
+		if !b.dirty[page].Swap(false) {
+			continue
+		}
+		start := page * bitmapPageSize
+		if _, err := b.f.WriteAt(area[start:start+bitmapPageSize], int64(bitmapHeaderSize+start)); err != nil {
+			b.dirty[page].Store(true)
+			return err
+		}
+	}
+	return b.f.Sync()
 }
 
-// Close syncs and unmaps the bitmap.
+// Close syncs and closes the bitmap.
 func (b *Bitmap) Close() error {
-	return errors.Join(b.Sync(), unix.Munmap(b.mapped), b.f.Close())
+	return errors.Join(b.Sync(), b.f.Close())
+}
+
+// area views the words as the bytes stored in the file (host byte order).
+func (b *Bitmap) area() []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(b.words))), len(b.words)*bitmapWordSize)
 }
 
 // writeHeader initializes a fresh bitmap file: header plus a zeroed (sparse) bit area.
@@ -120,7 +140,10 @@ func writeHeader(f *os.File, fileSize, size, chunkSize int64) error {
 	if _, err := f.WriteAt(header, 0); err != nil {
 		return err
 	}
-	return f.Truncate(fileSize)
+	if err := f.Truncate(fileSize); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // checkHeader verifies an existing bitmap file belongs to a device of this geometry.

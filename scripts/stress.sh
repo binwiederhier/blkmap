@@ -20,6 +20,8 @@ rm -rf $dir /var/lib/blkmap/s-*.cow /var/lib/blkmap/s-*.cow.bitmap
 mkdir -p $dir $mnt
 cd $dir # fio drops verify state files in the working directory
 echo "blkmap stress $(date -u +%FT%TZ) on $(uname -r), $(nproc) cpus" | tee $OUT
+# Journal queries are scoped to this run; the units keep their names across runs
+since="--since=@$(date +%s)"
 
 # --- sources: random images, raid5 members, range-capable http server ---
 head -c $((64<<20)) /dev/urandom > $dir/img64.img
@@ -170,14 +172,32 @@ YML
 blkmap validate s-hyd | grep -E 'Hydrate|cache' | sed 's/^/  /' | tee -a $OUT
 systemctl start blkmap@s-hyd
 cmp <(dd if=/dev/blkmap/s-hyd bs=1M skip=4 status=none) $dir/origin.img && echo "  cache fall-through content OK" | tee -a $OUT
-for i in $(seq 1 90); do journalctl -u blkmap@s-hyd --no-pager -o cat | grep -q 'hydration done' && break; sleep 1; done
-journalctl -u blkmap@s-hyd --no-pager -o cat | grep -E 'hydration (list|rest|done)' | tail -2 | sed 's/^/  /' | tee -a $OUT
+for i in $(seq 1 90); do journalctl -u blkmap@s-hyd $since --no-pager -o cat | grep -q 'hydration done' && break; sleep 1; done
+journalctl -u blkmap@s-hyd $since --no-pager -o cat | grep -E 'hydration (list|rest|done)' | tail -2 | sed 's/^/  /' | tee -a $OUT
 systemctl stop blkmap@s-hyd
 mv $dir/origin.img $dir/origin.gone; rm $dir/partial.img
 systemctl start blkmap@s-hyd
-journalctl -u blkmap@s-hyd --no-pager -o cat | grep -q 'fully hydrated' && echo "  restarted without its sources (fully hydrated)" | tee -a $OUT
+journalctl -u blkmap@s-hyd $since --no-pager -o cat | grep -q 'fully hydrated' && echo "  restarted without its sources (fully hydrated)" | tee -a $OUT
 cmp <(dd if=/dev/blkmap/s-hyd bs=1M skip=4 status=none) $dir/origin.gone && echo "  detached content OK" | tee -a $OUT
 systemctl stop blkmap@s-hyd
+
+# --- stop while mounted: data is flushed before deletion waits; the unit's stop timeout
+# kills the daemon, the next start cleans up the dead device ---
+echo "== stop while mounted (s-big)" | tee -a $OUT
+mkfs.ext4 -q -F /dev/blkmap/s-big
+mount /dev/blkmap/s-big $mnt
+head -c $((5<<20)) /dev/urandom > $mnt/keep; sha=$(sha256sum $mnt/keep | cut -d' ' -f1)
+sync -f $mnt
+t0=$(date +%s)
+systemctl stop blkmap@s-big 2>/dev/null || true
+echo "  stop with a mount in place returned after $(( $(date +%s) - t0 ))s" | tee -a $OUT
+journalctl -u blkmap@s-big $since --no-pager -o cat | grep -q 'still mounted' && echo "  daemon warned about the mount" | tee -a $OUT
+umount -l $mnt 2>/dev/null || true
+systemctl reset-failed blkmap@s-big 2>/dev/null || true
+systemctl start blkmap@s-big
+mount /dev/blkmap/s-big $mnt
+[ "$(sha256sum $mnt/keep | cut -d' ' -f1)" = "$sha" ] && echo "  file written before the forced stop is intact" | tee -a $OUT
+umount $mnt
 
 # --- many restarts and concurrent devices ---
 echo "== churn" | tee -a $OUT

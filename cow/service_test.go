@@ -339,8 +339,33 @@ func TestStoreMarkZeroAndComplete(t *testing.T) {
 	assert.True(t, complete)
 	assert.Equal(t, int64(testSize), size)
 	assert.Equal(t, int64(testChunk), chunkSize)
+	info, err := Inspect(bitmap)
+	require.NoError(t, err)
+	assert.Equal(t, &Info{Size: testSize, ChunkSize: testChunk, Chunks: 16, Written: 16}, info)
 	// Garbage is an error
 	require.NoError(t, os.WriteFile(bitmap, []byte("junk"), 0600))
 	_, _, _, err = Complete(bitmap)
 	require.Error(t, err)
+}
+
+func TestStoreDirtyAndFlushOrder(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	assert.False(t, s.Dirty())
+	_, err := s.WriteAt([]byte("x"), 0)
+	require.NoError(t, err)
+	assert.True(t, s.Dirty())
+	// Unflushed: the bit is not on disk yet
+	info, err := Inspect(filepath.Join(dir, "d.cow.bitmap"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), info.Written)
+	require.NoError(t, s.Flush())
+	assert.False(t, s.Dirty())
+	info, err = Inspect(filepath.Join(dir, "d.cow.bitmap"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), info.Written)
+	assert.True(t, s.MarkZero(3))
+	assert.True(t, s.Dirty())
+	require.NoError(t, s.Close())
 }
