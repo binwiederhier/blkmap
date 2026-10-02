@@ -26,6 +26,8 @@ verify() {
   $ssh "/root/powercut verify $dev ${spans[*]}" || { echo "FAIL: acknowledged writes lost (cycle $1)"; exit 1; }
 }
 
+# Whatever happens, leave no writer running on the host
+trap '$ssh "pkill -x powercut" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
 (cd "$me/.." && go build -o "$work/powercut" ./scripts/powercut)
 scp -q ${SSH_OPTS:-} "$work/powercut" root@$host:/root/powercut
 $ssh "systemctl stop blkmap@pc 2>/dev/null; rm -f /var/lib/blkmap/pc.cow /var/lib/blkmap/pc.cow.bitmap
@@ -44,8 +46,21 @@ for i in $(seq 1 "$cycles"); do
     up
   else
     for k in 1 2 3; do
-      $ssh 'kill -9 $(systemctl show -p MainPID --value blkmap@pc)'
-      sleep $((2 + RANDOM % 3))
+      # Kill only a running server: while systemd restarts the unit MainPID reads 0, and
+      # kill -9 0 would kill this SSH session instead
+      pid=$($ssh 'systemctl show -p MainPID --value blkmap@pc')
+      [ "${pid:-0}" -gt 0 ] || { echo "FAIL: no server to kill (cycle $i, kill $k)"; exit 1; }
+      $ssh "kill -9 $pid"
+      # The restarted server must re-attach within 30 s
+      t0=$(date +%s.%N)
+      for _ in $(seq 1 300); do
+        now=$($ssh 'systemctl show -p MainPID --value blkmap@pc; systemctl is-active blkmap@pc || true' | tr '\n' ' ')
+        case "$now" in "0 "*|"$pid "*) ;; *" active ") break ;; esac
+        sleep 0.1
+      done
+      case "$now" in *" active ") ;; *) echo "FAIL: the server did not come back within 30 s (cycle $i, kill $k)"; exit 1 ;; esac
+      echo "  kill $k: server back after $(echo "$(date +%s.%N) - $t0" | bc | cut -c1-4) s"
+      sleep $((1 + RANDOM % 3))
     done
     $ssh 'pkill -x powercut' || true
     wait $writer 2>/dev/null || true
@@ -60,4 +75,3 @@ start_device
 verify final
 $ssh "systemctl stop blkmap@pc"
 echo "OK: $cycles $mode cycles, every acknowledged write survived"
-rm -rf "$work"
