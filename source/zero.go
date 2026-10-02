@@ -20,9 +20,12 @@ func (z *Zero) Size() int64 {
 	return z.size
 }
 
-// ZeroRanges reports the whole source.
-func (z *Zero) ZeroRanges() []Range {
-	return []Range{{Offset: 0, Length: z.size}}
+// Holes reports the whole requested range.
+func (z *Zero) Holes(off, length int64) ([]Range, error) {
+	if off < 0 || off >= z.size || length <= 0 {
+		return nil, nil
+	}
+	return []Range{{Offset: off, Length: min(length, z.size-off)}}, nil
 }
 
 func (z *Zero) Close() error {

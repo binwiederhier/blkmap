@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -13,6 +16,14 @@ const (
 	httpBlockSize = 1 << 20
 	// httpCacheBlocks bounds the LRU block cache (64 MiB per HTTP source).
 	httpCacheBlocks = 64
+	// httpAttempts bounds retries of one block fetch on transient failures (network errors,
+	// 5xx, truncated bodies); the delay doubles from httpRetryDelay between attempts.
+	httpAttempts   = 3
+	httpRetryDelay = 200 * time.Millisecond
+	// httpProbeRange is the one-byte request that checks Range support and learns the size.
+	httpProbeRange   = "bytes=0-0"
+	httpContentRange = "Content-Range"
+	httpRangeUnit    = "bytes "
 )
 
 // HTTP reads a window of a URL via Range requests, through a small LRU block cache.
@@ -23,9 +34,10 @@ type HTTP struct {
 	size   int64
 	total  int64 // length of the whole resource
 
-	blocks map[int64]*list.Element // block index -> lru element holding *httpBlock
-	lru    *list.List
-	mu     sync.Mutex // Protects blocks and lru
+	blocks  map[int64]*list.Element // block index -> lru element holding *httpBlock
+	lru     *list.List
+	pending map[int64]*httpFetch // blocks being fetched, so concurrent readers share one request
+	mu      sync.Mutex           // Protects blocks, lru and pending
 }
 
 // httpBlock is one cached, resource-aligned block.
@@ -34,36 +46,34 @@ type httpBlock struct {
 	data  []byte
 }
 
+// httpFetch is an in-flight block fetch other readers can wait for.
+type httpFetch struct {
+	done  chan struct{}
+	block *httpBlock
+	err   error
+}
+
 // NewHTTP opens a window of size bytes starting at offset within the resource at url. A size
-// of 0 means everything after offset. The server must support Range requests.
+// of 0 means everything after offset. The server must support Range requests; a one-byte
+// Range request checks that up front (python's http.server, for one, answers 200 with the
+// whole body) and learns the size from Content-Range, so HEAD is never needed.
 func NewHTTP(client *http.Client, url string, offset, size int64) (*HTTP, error) {
-	resp, err := client.Head(url)
+	total, err := probe(client, url)
 	if err != nil {
 		return nil, err
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: HEAD returned %d %s", url, resp.StatusCode, http.StatusText(resp.StatusCode))
-	}
-	if resp.ContentLength < 0 {
-		return nil, fmt.Errorf("%s: server does not report a Content-Length", url)
-	}
-	if size, err = window(offset, size, resp.ContentLength); err != nil {
+	if size, err = window(offset, size, total); err != nil {
 		return nil, fmt.Errorf("%s: %w", url, err)
 	}
-	// Probe for Range support now rather than failing every read later with EIO (python's
-	// http.server, for one, answers 200 with the whole body)
-	if err := probeRange(client, url); err != nil {
-		return nil, err
-	}
 	return &HTTP{
-		client: client,
-		url:    url,
-		offset: offset,
-		size:   size,
-		total:  resp.ContentLength,
-		blocks: make(map[int64]*list.Element),
-		lru:    list.New(),
+		client:  client,
+		url:     url,
+		offset:  offset,
+		size:    size,
+		total:   total,
+		blocks:  make(map[int64]*list.Element),
+		lru:     list.New(),
+		pending: make(map[int64]*httpFetch),
 	}, nil
 }
 
@@ -92,7 +102,8 @@ func (h *HTTP) Close() error {
 	return nil
 }
 
-// block returns the cached block at index, fetching it on a miss.
+// block returns the cached block at index, fetching it on a miss. Concurrent readers of the
+// same block share one fetch.
 func (h *HTTP) block(index int64) (*httpBlock, error) {
 	h.mu.Lock()
 	if el, ok := h.blocks[index]; ok {
@@ -100,64 +111,98 @@ func (h *HTTP) block(index int64) (*httpBlock, error) {
 		h.mu.Unlock()
 		return el.Value.(*httpBlock), nil
 	}
+	if f, ok := h.pending[index]; ok {
+		h.mu.Unlock()
+		<-f.done
+		return f.block, f.err
+	}
+	f := &httpFetch{done: make(chan struct{})}
+	h.pending[index] = f
 	h.mu.Unlock()
 	data, err := h.fetch(index)
-	if err != nil {
-		return nil, err
-	}
-	block := &httpBlock{index: index, data: data}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if el, ok := h.blocks[index]; ok { // lost a race with another fetch of the same block
-		return el.Value.(*httpBlock), nil
+	delete(h.pending, index)
+	if err != nil {
+		f.err = err
+	} else {
+		f.block = &httpBlock{index: index, data: data}
+		h.blocks[index] = h.lru.PushFront(f.block)
+		for h.lru.Len() > httpCacheBlocks {
+			oldest := h.lru.Back()
+			delete(h.blocks, oldest.Value.(*httpBlock).index)
+			h.lru.Remove(oldest)
+		}
 	}
-	h.blocks[index] = h.lru.PushFront(block)
-	for h.lru.Len() > httpCacheBlocks {
-		oldest := h.lru.Back()
-		delete(h.blocks, oldest.Value.(*httpBlock).index)
-		h.lru.Remove(oldest)
-	}
-	return block, nil
+	h.mu.Unlock()
+	close(f.done)
+	return f.block, f.err
 }
 
-// probeRange requests the first byte and insists on a 206 reply.
-func probeRange(client *http.Client, url string) error {
+// probe requests the first byte, insists on a 206 reply, and returns the resource size from
+// Content-Range.
+func probe(client *http.Client, url string) (int64, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Range", httpProbeRange)
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("%s: server does not support Range requests (got %d for bytes=0-0)", url, resp.StatusCode)
+	if resp.StatusCode == http.StatusOK {
+		return 0, fmt.Errorf("%s: server does not support Range requests (got 200 for %s)", url, httpProbeRange)
 	}
-	return nil
+	if resp.StatusCode != http.StatusPartialContent {
+		return 0, fmt.Errorf("%s: got %d %s", url, resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	// Content-Range: bytes 0-0/12345
+	cr := resp.Header.Get(httpContentRange)
+	total, err := strconv.ParseInt(cr[strings.LastIndex(cr, "/")+1:], 10, 64)
+	if !strings.HasPrefix(cr, httpRangeUnit) || err != nil {
+		return 0, fmt.Errorf("%s: cannot tell the size from Content-Range %q", url, cr)
+	}
+	return total, nil
 }
 
-// fetch issues one Range request for the whole block at index.
+// fetch issues the Range request for the whole block at index, retrying transient failures.
 func (h *HTTP) fetch(index int64) ([]byte, error) {
 	start := index * httpBlockSize
 	end := min(start+httpBlockSize, h.total) - 1
+	for attempt := 0; ; attempt++ {
+		data, err, transient := h.fetchOnce(start, end)
+		if err == nil || !transient || attempt == httpAttempts-1 {
+			return data, err
+		}
+		time.Sleep(httpRetryDelay << attempt)
+	}
+}
+
+// fetchOnce is one attempt; transient says whether a retry makes sense.
+func (h *HTTP) fetchOnce(start, end int64) (data []byte, err error, transient bool) {
 	req, err := http.NewRequest(http.MethodGet, h.url, nil)
 	if err != nil {
-		return nil, err
+		return nil, err, false
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: range %d-%d: %w", h.url, start, end, err), true
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("%s: expected 206 Partial Content for range %d-%d, got %d", h.url, start, end, resp.StatusCode)
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		return nil, fmt.Errorf("%s: range %d-%d: %d: %w", h.url, start, end, resp.StatusCode, ErrNotFound), false
+	case resp.StatusCode >= 500:
+		return nil, fmt.Errorf("%s: range %d-%d: got %d", h.url, start, end, resp.StatusCode), true
+	default:
+		return nil, fmt.Errorf("%s: expected 206 Partial Content for range %d-%d, got %d", h.url, start, end, resp.StatusCode), false
 	}
-	data := make([]byte, end-start+1)
+	data = make([]byte, end-start+1)
 	if _, err := io.ReadFull(resp.Body, data); err != nil {
-		return nil, fmt.Errorf("%s: short read for range %d-%d: %w", h.url, start, end, err)
+		return nil, fmt.Errorf("%s: short read for range %d-%d: %w", h.url, start, end, err), true
 	}
-	return data, nil
+	return data, nil, false
 }

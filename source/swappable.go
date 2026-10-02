@@ -42,6 +42,12 @@ func (s *Swappable) ReadAtDirect(p []byte, off int64) (int, error) {
 	return ReadDirect(s.src, p, off)
 }
 
+func (s *Swappable) Holes(off, length int64) ([]Range, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return Holes(s.src, off, length)
+}
+
 func (s *Swappable) Size() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

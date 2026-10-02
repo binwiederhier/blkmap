@@ -3,6 +3,7 @@ package source
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // Concat stitches ordered, non-overlapping segments into one address space. Gaps between
@@ -51,23 +52,33 @@ func (c *Concat) ReadAtDirect(p []byte, off int64) (int, error) {
 	return c.readAt(p, off, true)
 }
 
-// ZeroRanges reports the gaps, the tail, and whatever the segments report, in order.
-func (c *Concat) ZeroRanges() []Range {
-	var ranges []Range
-	var pos int64
-	for _, s := range c.segments {
-		if s.Offset > pos {
-			ranges = append(ranges, Range{Offset: pos, Length: s.Offset - pos})
-		}
-		for _, r := range ZeroRanges(s.Source) {
-			ranges = append(ranges, Range{Offset: s.Offset + r.Offset, Length: r.Length})
-		}
-		pos = s.Offset + s.Source.Size()
+// Holes reports the gaps, the tail, and whatever the segments report within the range.
+func (c *Concat) Holes(off, length int64) ([]Range, error) {
+	end := min(off+length, c.size)
+	if off < 0 || off >= end {
+		return nil, nil
 	}
-	if pos < c.size {
-		ranges = append(ranges, Range{Offset: pos, Length: c.size - pos})
+	var holes []Range
+	pos := off
+	for i := c.index(off); i < len(c.segments) && c.segments[i].Offset < end; i++ {
+		s := c.segments[i]
+		if s.Offset > pos { // gap before the segment
+			holes = append(holes, Range{Offset: pos, Length: s.Offset - pos})
+		}
+		start, stop := max(pos, s.Offset), min(end, s.Offset+s.Source.Size())
+		sub, err := Holes(s.Source, start-s.Offset, stop-start)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range sub {
+			holes = append(holes, Range{Offset: s.Offset + r.Offset, Length: r.Length})
+		}
+		pos = stop
 	}
-	return ranges
+	if pos < end { // tail
+		holes = append(holes, Range{Offset: pos, Length: end - pos})
+	}
+	return holes, nil
 }
 
 func (c *Concat) readAt(p []byte, off int64, direct bool) (int, error) {
@@ -116,15 +127,21 @@ func (c *Concat) Close() error {
 }
 
 // locate finds the segment containing off, or nil and the offset where the next segment (or
-// the device) ends if off lies in a gap.
+// the device) starts if off lies in a gap.
 func (c *Concat) locate(off int64) (*Segment, int64) {
-	for _, s := range c.segments {
-		if off < s.Offset {
-			return nil, s.Offset
-		}
-		if off < s.Offset+s.Source.Size() {
-			return s, 0
-		}
+	i := c.index(off)
+	if i == len(c.segments) {
+		return nil, c.size
 	}
-	return nil, c.size
+	if s := c.segments[i]; off >= s.Offset {
+		return s, 0
+	}
+	return nil, c.segments[i].Offset
+}
+
+// index returns the first segment that ends after off (binary search; segments are sorted).
+func (c *Concat) index(off int64) int {
+	return sort.Search(len(c.segments), func(i int) bool {
+		return c.segments[i].Offset+c.segments[i].Source.Size() > off
+	})
 }

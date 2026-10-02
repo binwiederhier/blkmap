@@ -58,18 +58,24 @@ func (b *backend) Size() int64 {
 }
 
 func (b *backend) Flush() error {
+	b.enter()
+	defer b.leave()
 	err := b.store.Flush()
 	b.logError("flush", 0, 0, err)
 	return err
 }
 
 func (b *backend) Discard(off, length int64) error {
+	b.enter()
+	defer b.leave()
 	err := b.store.Discard(off, length)
 	b.logError("discard", off, int(length), err)
 	return err
 }
 
 func (b *backend) WriteZeroes(off, length int64) error {
+	b.enter()
+	defer b.leave()
 	err := b.store.WriteZeroes(off, length)
 	b.logError("write zeroes", off, int(length), err)
 	return err

@@ -2,6 +2,7 @@ package source
 
 import (
 	"errors"
+	"io"
 	"sync/atomic"
 )
 
@@ -45,12 +46,21 @@ func (c *Cache) ReadAt(p []byte, off int64) (int, error) {
 	} else {
 		c.failures.Add(1)
 	}
-	return c.slow.ReadAt(p, off)
+	read, err := c.slow.ReadAt(p[:n], off)
+	if err != nil && !(errors.Is(err, io.EOF) && read == n) {
+		return read, err
+	}
+	return n, eof
 }
 
 // ReadAtDirect reads from the slow source only.
 func (c *Cache) ReadAtDirect(p []byte, off int64) (int, error) {
 	return ReadDirect(c.slow, p, off)
+}
+
+// Holes come from the slow source, the authority on content.
+func (c *Cache) Holes(off, length int64) ([]Range, error) {
+	return Holes(c.slow, off, length)
 }
 
 func (c *Cache) Size() int64 {

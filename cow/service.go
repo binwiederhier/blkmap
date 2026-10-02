@@ -36,6 +36,7 @@ type Store struct {
 	chunkSize int64
 	size      int64
 	dirty     atomic.Bool             // something changed since the last Flush
+	bufs      sync.Pool               // chunk-sized scratch buffers for read-modify-write and hydration
 	locks     [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 }
 
@@ -63,7 +64,12 @@ func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Sto
 			return nil, fmt.Errorf("cow file %s: %w", cowPath, err)
 		}
 	}
-	return &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}, nil
+	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
+	s.bufs.New = func() any {
+		b := make([]byte, chunkSize)
+		return &b
+	}
+	return s, nil
 }
 
 func (s *Store) ReadAt(p []byte, off int64) (int, error) {
@@ -149,7 +155,9 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if !s.bitmap.Test(chunk) && int64(len(p)) < length {
-		buf := make([]byte, length)
+		scratch := s.bufs.Get().(*[]byte)
+		defer s.bufs.Put(scratch)
+		buf := (*scratch)[:length]
 		if _, err := s.base.ReadAt(buf, start); err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("copy chunk %d from base: %w", chunk, err)
 		}
@@ -258,7 +266,9 @@ func (s *Store) IsWritten(chunk int64) bool {
 // With direct, the read bypasses cache tiers. It reports whether a copy happened.
 func (s *Store) HydrateChunk(chunk int64, direct bool) (bool, error) {
 	start := chunk * s.chunkSize
-	buf := make([]byte, min(s.chunkSize, s.size-start))
+	scratch := s.bufs.Get().(*[]byte)
+	defer s.bufs.Put(scratch)
+	buf := (*scratch)[:min(s.chunkSize, s.size-start)]
 	mu := &s.locks[chunk%lockStripes]
 	mu.Lock()
 	defer mu.Unlock()

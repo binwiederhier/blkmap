@@ -27,3 +27,14 @@ func TestZero(t *testing.T) {
 	assert.Equal(t, 0, n)
 	require.NoError(t, z.Close())
 }
+
+func TestZeroHoles(t *testing.T) {
+	t.Parallel()
+	z := NewZero(1000)
+	holes, err := Holes(z, 100, 200)
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{100, 200}}, holes)
+	holes, err = Holes(z, 900, 200) // clipped to the end
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{900, 100}}, holes)
+}

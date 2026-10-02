@@ -17,6 +17,9 @@ const (
 	// hydrateBackoff is how long after the last guest request hydration stays paused.
 	hydrateBackoff = 100 * time.Millisecond
 	hydratePoll    = 50 * time.Millisecond
+	// holeWindow bounds one Holes query, so a huge sparse device does not produce one giant
+	// range list up front.
+	holeWindow = 4 << 30
 	// hydrateMaxLoggedErrors caps per-chunk error lines; the total is logged at the end.
 	hydrateMaxLoggedErrors = 20
 	phaseList              = "list"
@@ -54,7 +57,7 @@ type hydrator struct {
 	opts    *Hydrate
 	busy    func() bool
 	id      string
-	zero    map[int64]bool // chunks that read as zeros: marked, never copied
+	zero    *util.Bitset // chunks that read as zeros: marked, never copied
 	phase   atomic.Pointer[string]
 	copied  atomic.Int64
 	errors  atomic.Int64
@@ -72,12 +75,19 @@ func newHydrator(id string, store *cow.Store, base source.Source, opts *Hydrate,
 	if o.UseCache == "" {
 		o.UseCache = config.CacheAlways
 	}
-	h := &hydrator{store: store, base: base, opts: &o, busy: busy, id: id, zero: map[int64]bool{}}
-	// Chunks entirely inside a zero range need no copy
+	h := &hydrator{store: store, base: base, opts: &o, busy: busy, id: id, zero: util.NewBitset(store.Chunks())}
+	// Chunks entirely inside a hole need no copy; ask in windows to bound the range lists
 	chunkSize := store.ChunkSize()
-	for _, r := range source.ZeroRanges(base) {
-		for c := (r.Offset + chunkSize - 1) / chunkSize; c < (r.Offset+r.Length)/chunkSize; c++ {
-			h.zero[c] = true
+	for off := int64(0); off < base.Size(); off += holeWindow {
+		holes, err := source.Holes(base, off, holeWindow)
+		if err != nil {
+			log.Printf("%s: cannot query holes at %d: %s (hydrating by copying)", id, off, err.Error())
+			break
+		}
+		for _, r := range holes {
+			for c := (r.Offset + chunkSize - 1) / chunkSize; c < (r.Offset+r.Length)/chunkSize; c++ {
+				h.zero.Set(c)
+			}
 		}
 	}
 	if o.Rate > 0 {
@@ -95,26 +105,31 @@ func (h *hydrator) run(ctx context.Context) {
 		defer reports.Done()
 		h.reportLoop(reportCtx)
 	}()
-	visited := make([]bool, h.store.Chunks())
-	var list []int64
-	for _, r := range h.opts.Prefetch {
-		last := min((r.Offset+r.Length-1)/h.store.ChunkSize(), h.store.Chunks()-1)
-		for c := r.Offset / h.store.ChunkSize(); c <= last; c++ {
-			if !visited[c] {
-				visited[c] = true
-				list = append(list, c)
+	// The list phase: chunks of the prefetch ranges in order, each once
+	visited := util.NewBitset(h.store.Chunks())
+	h.process(ctx, phaseList, func(yield func(int64) bool) {
+		for _, r := range h.opts.Prefetch {
+			last := min((r.Offset+r.Length-1)/h.store.ChunkSize(), h.store.Chunks()-1)
+			for c := r.Offset / h.store.ChunkSize(); c <= last; c++ {
+				if visited.Test(c) {
+					continue
+				}
+				visited.Set(c)
+				if !yield(c) {
+					return
+				}
 			}
 		}
-	}
-	h.process(ctx, phaseList, list, nil)
+	}, nil)
+	// The rest phase: everything the list did not cover, ascending, paced
 	if h.opts.Rest && ctx.Err() == nil {
-		var rest []int64
-		for c := range visited {
-			if !visited[c] {
-				rest = append(rest, int64(c))
+		h.process(ctx, phaseRest, func(yield func(int64) bool) {
+			for c := int64(0); c < h.store.Chunks(); c++ {
+				if !visited.Test(c) && !yield(c) {
+					return
+				}
 			}
-		}
-		h.process(ctx, phaseRest, rest, h.limiter)
+		}, h.limiter)
 	}
 	stopReports()
 	reports.Wait()
@@ -129,9 +144,10 @@ func (h *hydrator) run(ctx context.Context) {
 	}
 }
 
-// process hydrates chunks in order with the configured concurrency, yielding to the guest
-// and to the rate limiter.
-func (h *hydrator) process(ctx context.Context, phase string, chunks []int64, limiter *bucket) {
+// process hydrates the chunks produced by next, in order, with the configured concurrency,
+// yielding to the guest and to the rate limiter. next is an iterator so the rest phase of a
+// huge device never materializes a list of every chunk.
+func (h *hydrator) process(ctx context.Context, phase string, next func(yield func(int64) bool), limiter *bucket) {
 	h.setPhase(phase)
 	work := make(chan int64)
 	var wg sync.WaitGroup
@@ -144,18 +160,17 @@ func (h *hydrator) process(ctx context.Context, phase string, chunks []int64, li
 			}
 		}()
 	}
-	for _, c := range chunks {
+	next(func(c int64) bool {
 		if h.store.IsWritten(c) {
-			continue
+			return true
 		}
 		select {
 		case work <- c:
+			return true
 		case <-ctx.Done():
-			close(work)
-			wg.Wait()
-			return
+			return false
 		}
-	}
+	})
 	close(work)
 	wg.Wait()
 }
@@ -164,7 +179,7 @@ func (h *hydrator) chunk(ctx context.Context, c int64, limiter *bucket) {
 	if !h.waitIdle(ctx) {
 		return
 	}
-	if h.zero[c] {
+	if h.zero.Test(c) {
 		h.store.MarkZero(c)
 		return
 	}

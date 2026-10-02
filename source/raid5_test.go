@@ -2,6 +2,7 @@ package source
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
 
@@ -171,4 +172,42 @@ func TestRAID5Direct(t *testing.T) {
 	_, err = r.ReadAt(got, 0)
 	require.NoError(t, err)
 	assert.NotEqual(t, image, got)
+}
+
+func TestRAID5NoAlloc(t *testing.T) {
+	image := pattern(4 * raidStripe * 2)
+	members := buildArray(t, image, 3, LeftSymmetric)
+	r, err := NewRAID5(members, raidStripe, LeftSymmetric, 0)
+	require.NoError(t, err)
+	p := make([]byte, 3*raidStripe)
+	assert.Zero(t, testing.AllocsPerRun(100, func() { r.ReadAt(p, 100) }))
+	members[1] = nil
+	r, err = NewRAID5(members, raidStripe, LeftSymmetric, 0)
+	require.NoError(t, err)
+	// Degraded reads reuse pooled stripe buffers rather than allocating per read
+	assert.Zero(t, testing.AllocsPerRun(100, func() { r.ReadAt(p, 100) }))
+	got := make([]byte, len(image))
+	_, err = r.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, image, got)
+}
+
+func BenchmarkRAID5ReadAt(b *testing.B) {
+	image := pattern(48 << 20) // a multiple of 3 data stripes
+	t := &testing.T{}
+	for _, degraded := range []bool{false, true} {
+		members := buildArray(t, image, 4, LeftSymmetric)
+		if degraded {
+			members[2] = nil
+		}
+		r, _ := NewRAID5(members, raidStripe, LeftSymmetric, 0)
+		p := make([]byte, 64<<10)
+		b.Run(fmt.Sprintf("degraded=%v", degraded), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(p)))
+			for i := 0; i < b.N; i++ {
+				r.ReadAt(p, int64(i*len(p))%int64(len(image)-len(p)))
+			}
+		})
+	}
 }

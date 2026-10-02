@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Layout is a RAID-5 parity rotation algorithm, named as Linux md does. Windows dynamic
@@ -25,6 +26,7 @@ type RAID5 struct {
 	stripeSize int64
 	layout     Layout
 	size       int64
+	bufs       sync.Pool // stripe-sized scratch buffers for reconstruction
 }
 
 // NewRAID5 builds the array. members are in array order; a nil entry is a missing disk. A
@@ -61,7 +63,12 @@ func NewRAID5(members []Source, stripeSize int64, layout Layout, size int64) (*R
 	if size > full {
 		return nil, fmt.Errorf("raid5 size %d exceeds the array capacity %d", size, full)
 	}
-	return &RAID5{members: members, stripeSize: stripeSize, layout: layout, size: size}, nil
+	r := &RAID5{members: members, stripeSize: stripeSize, layout: layout, size: size}
+	r.bufs.New = func() any {
+		b := make([]byte, stripeSize)
+		return &b
+	}
+	return r, nil
 }
 
 func (r *RAID5) ReadAt(p []byte, off int64) (int, error) {
@@ -159,7 +166,9 @@ func (r *RAID5) readMember(d int, p []byte, off int64, direct bool) error {
 // reconstruct rebuilds the missing member d's bytes at off by XORing every other member.
 func (r *RAID5) reconstruct(d int, p []byte, off int64, direct bool) error {
 	clear(p)
-	buf := make([]byte, len(p))
+	scratch := r.bufs.Get().(*[]byte)
+	defer r.bufs.Put(scratch)
+	buf := (*scratch)[:len(p)]
 	for i := range r.members {
 		if i == d {
 			continue

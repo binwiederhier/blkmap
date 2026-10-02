@@ -369,3 +369,80 @@ func TestStoreDirtyAndFlushOrder(t *testing.T) {
 	assert.True(t, s.Dirty())
 	require.NoError(t, s.Close())
 }
+
+func TestStoreNoAlloc(t *testing.T) {
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	p := make([]byte, 1024)
+	_, err := s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 2*testChunk) // chunk 2 written
+	require.NoError(t, err)
+	assert.Zero(t, testing.AllocsPerRun(100, func() { s.ReadAt(p, 2*testChunk+100) }), "read of a written chunk")
+	assert.Zero(t, testing.AllocsPerRun(100, func() { s.ReadAt(p, 5*testChunk+100) }), "read of a base chunk")
+	assert.Zero(t, testing.AllocsPerRun(100, func() { s.WriteAt(p, 2*testChunk+100) }), "write into a written chunk")
+	full := make([]byte, testChunk)
+	assert.Zero(t, testing.AllocsPerRun(100, func() { s.WriteAt(full, 7*testChunk) }), "whole-chunk write")
+	// The first partial write into a fresh chunk needs a chunk buffer: pooled, not allocated
+	// per call once the pool is warm
+	chunk := int64(8)
+	warm := func() {
+		s.WriteAt(p, chunk*testChunk+100)
+		chunk++
+	}
+	warm()
+	assert.LessOrEqual(t, testing.AllocsPerRun(5, warm), 0.0, "partial write into a fresh chunk")
+	require.NoError(t, s.Close())
+}
+
+func BenchmarkStore(b *testing.B) {
+	dir := b.TempDir()
+	const size = 256 << 20
+	s, err := Open(&mem{data: make([]byte, size)}, filepath.Join(dir, "b.cow"), filepath.Join(dir, "b.cow.bitmap"), 64<<10)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	p := make([]byte, 4096)
+	chunk := make([]byte, 64<<10)
+	b.Run("read-base-4k", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s.ReadAt(p, int64(i*4096)%(size/2))
+		}
+	})
+	b.Run("write-chunk-64k", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(chunk)))
+		for i := 0; i < b.N; i++ {
+			s.WriteAt(chunk, int64(i)*int64(len(chunk))%size)
+		}
+	})
+	b.Run("read-cow-4k", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s.ReadAt(p, int64(i*4096)%size)
+		}
+	})
+	b.Run("write-4k-into-written", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			s.WriteAt(p, int64(i*4096)%size)
+		}
+	})
+}
+
+func BenchmarkStorePartialWriteRMW(b *testing.B) {
+	// Every write lands in a fresh chunk: read-modify-write of a whole 64 KiB chunk
+	dir := b.TempDir()
+	size := int64(b.N+1) * (64 << 10)
+	s, err := Open(&mem{data: make([]byte, size)}, filepath.Join(dir, "b.cow"), filepath.Join(dir, "b.cow.bitmap"), 64<<10)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	p := make([]byte, 4096)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.WriteAt(p, int64(i)*(64<<10)+8192)
+	}
+}

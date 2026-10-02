@@ -120,9 +120,22 @@ hydrate:
   use-cache: never
 ```
 
-HTTP sources must support Range requests (checked when the source is opened, so `validate`
-reports a server that cannot do it). Reads fetch 1 MiB aligned blocks through a small
-per-source LRU cache.
+HTTP sources must support Range requests (a one-byte Range request at open time checks that
+and learns the size from Content-Range, so HEAD is never needed and `validate` reports a
+server that cannot do it). Reads fetch 1 MiB aligned blocks through a small per-source LRU
+cache; concurrent readers of one block share a single request, and transient failures
+(network errors, 5xx, truncated bodies) are retried twice with backoff. A 404, 410 or 416 is
+reported as `source.ErrNotFound`, which a cache tier treats as a miss.
+
+### Holes
+
+`ReadAt` cannot say "this is a hole"; a source that knows can implement `source.Sparse`,
+`Holes(off, length)`, returning ranges that read as zeros. Files and devices answer from
+`SEEK_HOLE`/`SEEK_DATA` (a reported hole always reads as zeros, so this direction is safe;
+data may contain zeros too), zero segments report themselves, and concat, cache and swappable
+sources compose their parts. HTTP has no standard for it and reports nothing. Hydration
+asks for holes in 4 GiB windows and marks hole chunks in the bitmap without copying, so a
+mostly empty image hydrates without inflating the COW file.
 
 Writes never touch the sources. They land in the COW file, a sparse raw image of the overlay
 at device offsets, and a bitmap records which chunks are there. Delete both files to reset
@@ -157,6 +170,14 @@ serves any `ublk.Backend` (ReadAt, WriteAt, Size, Flush, optionally Discard and 
 without the COW layer.
 
 ## Performance
+
+The hot paths allocate nothing per request (tests pin this with `testing.AllocsPerRun`):
+store reads and writes, concat lookups (binary search over segments), cache hits and misses,
+RAID-5 reads including parity reconstruction (pooled stripe buffers), and the COW
+read-modify-write of a fresh chunk (pooled chunk buffers). `go test -bench . -benchmem
+./source/ ./cow/` reports, on a 12 vCPU KVM guest: concat read 39 ns with one segment and
+391 ns with a thousand, RAID-5 reconstruction 2.5 GB/s, bitmap set/test 3.5 ns, a 64 KiB
+COW chunk write 37 µs.
 
 The ublk transport lives in-tree (`ublk/`, about 800 lines, derived from go-ublk): an
 ioctl-encoded control plane, a minimal SQE128/CQE32 io_uring per queue, one OS thread per

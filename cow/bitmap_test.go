@@ -90,3 +90,39 @@ func TestBitmapPersistsOnlyOnSync(t *testing.T) {
 	assert.Equal(t, int64(1000), info.Chunks)
 	require.NoError(t, b.Close())
 }
+
+func TestBitmapNoAlloc(t *testing.T) {
+	b, err := OpenBitmap(filepath.Join(t.TempDir(), "bits"), 1<<30, 64<<10)
+	require.NoError(t, err)
+	defer b.Close()
+	assert.Zero(t, testing.AllocsPerRun(100, func() { b.Set(1000); b.Test(1000) }))
+}
+
+func BenchmarkBitmap(b *testing.B) {
+	bm, err := OpenBitmap(filepath.Join(b.TempDir(), "bits"), 1<<40, 64<<10)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer bm.Close()
+	b.Run("set", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			bm.Set(int64(i) % bm.Chunks())
+		}
+	})
+	b.Run("test", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			bm.Test(int64(i) % bm.Chunks())
+		}
+	})
+	b.Run("count-1TiB", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			bm.Count()
+		}
+	})
+	b.Run("sync-dirty-page", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			bm.Set(int64(i) % bm.Chunks())
+			bm.Sync()
+		}
+	})
+}

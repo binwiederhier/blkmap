@@ -15,11 +15,15 @@ type tier struct {
 	notFound func(off int64) bool
 	fail     func(off int64) bool
 	reads    int
+	bare     bool // return ErrNotFound unwrapped (no allocation in the fixture)
 }
 
 func (t *tier) ReadAt(p []byte, off int64) (int, error) {
 	t.reads++
 	if t.notFound != nil && t.notFound(off) {
+		if t.bare {
+			return 0, ErrNotFound
+		}
 		return 0, fmt.Errorf("tier: %w", ErrNotFound)
 	}
 	if t.fail != nil && t.fail(off) {
@@ -83,4 +87,31 @@ func TestCacheSizeFollowsSlow(t *testing.T) {
 	_, err = c.ReadAt(p, 768)
 	require.NoError(t, err)
 	assert.Equal(t, pattern(4096)[768:1280], p)
+}
+
+func TestCacheHolesAndNoAlloc(t *testing.T) {
+	fast := &tier{mem: mem{data: pattern(4096)}, notFound: func(off int64) bool { return off >= 2048 }, bare: true}
+	slow := &tier{mem: mem{data: pattern(4096)}}
+	c := NewCache(fast, slow)
+	holes, err := Holes(c, 0, 4096)
+	require.NoError(t, err)
+	assert.Nil(t, holes) // mem is not sparse
+	p := make([]byte, 512)
+	assert.Zero(t, testing.AllocsPerRun(100, func() { c.ReadAt(p, 0) }))    // hit
+	assert.Zero(t, testing.AllocsPerRun(100, func() { c.ReadAt(p, 3000) })) // miss, served by slow
+}
+
+func BenchmarkCacheReadAt(b *testing.B) {
+	fast := &tier{mem: mem{data: pattern(1 << 20)}, notFound: func(off int64) bool { return off >= 512<<10 }, bare: true}
+	slow := &tier{mem: mem{data: pattern(1 << 20)}}
+	c := NewCache(fast, slow)
+	p := make([]byte, 4096)
+	for name, off := range map[string]int64{"hit": 0, "miss": 600 << 10} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				c.ReadAt(p, off)
+			}
+		})
+	}
 }

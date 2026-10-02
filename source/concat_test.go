@@ -2,6 +2,7 @@ package source
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
 
@@ -107,7 +108,7 @@ func TestConcatErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "empty")
 }
 
-func TestConcatZeroRangesAndDirect(t *testing.T) {
+func TestConcatHolesAndDirect(t *testing.T) {
 	t.Parallel()
 	fast := &tier{mem: mem{data: filled(100, 'F').data}}
 	slow := &tier{mem: mem{data: filled(100, 'S').data}}
@@ -118,8 +119,19 @@ func TestConcatZeroRangesAndDirect(t *testing.T) {
 		{Offset: 300, Source: NewZero(10)},
 	}, 400) // tail 310..400
 	require.NoError(t, err)
-	assert.Equal(t, []Range{{0, 50}, {150, 50}, {300, 10}, {310, 90}}, ZeroRanges(c))
-	assert.Nil(t, ZeroRanges(filled(10, 'x'))) // unknown for plain sources
+	holes, err := Holes(c, 0, 400)
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{0, 50}, {150, 50}, {300, 10}, {310, 90}}, holes)
+	// A window clips and skips
+	holes, err = Holes(c, 40, 120)
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{40, 10}, {150, 10}}, holes)
+	holes, err = Holes(c, 60, 50)
+	require.NoError(t, err)
+	assert.Empty(t, holes)
+	holes, err = Holes(filled(10, 'x'), 0, 10)
+	require.NoError(t, err)
+	assert.Nil(t, holes) // unknown for plain sources
 	p := make([]byte, 100)
 	_, err = c.ReadAt(p, 200)
 	require.NoError(t, err)
@@ -131,4 +143,39 @@ func TestConcatZeroRangesAndDirect(t *testing.T) {
 	_, err = ReadDirect(c, p[:50], 50)
 	require.NoError(t, err)
 	assert.Equal(t, filled(50, 'a').data, p[:50])
+}
+
+func TestConcatManySegmentsNoAlloc(t *testing.T) {
+	// 2000 tiny segments: locate must not be linear and ReadAt must not allocate
+	var segs []*Segment
+	for i := 0; i < 2000; i++ {
+		segs = append(segs, &Segment{Offset: int64(i) * 16, Source: filled(16, byte('a'+i%26))})
+	}
+	c, err := NewConcat(segs, 0)
+	require.NoError(t, err)
+	p := make([]byte, 64)
+	assert.Zero(t, testing.AllocsPerRun(100, func() {
+		if _, err := c.ReadAt(p, 31_000); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	assert.Equal(t, filled(16, byte('a'+1937%26)).data[8:], p[:8])
+}
+
+func BenchmarkConcatReadAt(b *testing.B) {
+	for _, n := range []int{1, 10, 1000} {
+		var segs []*Segment
+		for i := 0; i < n; i++ {
+			segs = append(segs, &Segment{Offset: int64(i) << 20, Source: filled(1<<20, 'x')})
+		}
+		c, _ := NewConcat(segs, 0)
+		p := make([]byte, 4096)
+		b.Run(fmt.Sprintf("segments=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(p)))
+			for i := 0; i < b.N; i++ {
+				c.ReadAt(p, int64(i%n)<<20+1234)
+			}
+		})
+	}
 }

@@ -44,10 +44,12 @@ type DirectReader interface {
 	ReadAtDirect(p []byte, off int64) (int, error)
 }
 
-// Zeroer is implemented by sources that know which of their ranges read as zeros, so a
-// hydrator can mark them without copying anything.
-type Zeroer interface {
-	ZeroRanges() []Range
+// Sparse is implemented by sources that can tell which parts of a range are holes (read
+// as zeros), so a hydrator can mark them without copying anything. Files and devices
+// answer from SEEK_HOLE; containers compose their parts; a custom source can answer from
+// whatever map it has. A hole must read as zeros; data regions may contain zeros too.
+type Sparse interface {
+	Holes(off, length int64) ([]Range, error)
 }
 
 // ReadDirect reads bypassing caches where the source supports it, else like ReadAt.
@@ -58,12 +60,13 @@ func ReadDirect(s Source, p []byte, off int64) (int, error) {
 	return s.ReadAt(p, off)
 }
 
-// ZeroRanges returns the ranges of s known to read as zeros, in ascending order.
-func ZeroRanges(s Source) []Range {
-	if z, ok := s.(Zeroer); ok {
-		return z.ZeroRanges()
+// Holes returns the holes of s within [off, off+length), ascending and non-overlapping,
+// or nil when the source cannot tell.
+func Holes(s Source, off, length int64) ([]Range, error) {
+	if sp, ok := s.(Sparse); ok {
+		return sp.Holes(off, length)
 	}
-	return nil
+	return nil, nil
 }
 
 // FromConfig opens every configured segment, resolves implicit offsets and sizes, and

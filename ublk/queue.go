@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -90,8 +91,15 @@ func (q *queue) run(ready chan<- error) {
 			if !ok {
 				break
 			}
-			if res < 0 { // the kernel is aborting the queue (device stopping)
+			if res == resultAbort { // the kernel is aborting the queue (device stopping)
 				return
+			}
+			if res < 0 {
+				// A failed FETCH/COMMIT for one tag: that tag is dead, the others keep
+				// serving. Exiting here instead would wedge every request on this queue.
+				log.Printf("ublk queue %d tag %d: command failed: %s", q.id, userData, syscall.Errno(-res).Error())
+				q.err = fmt.Errorf("queue %d tag %d: %w", q.id, userData, syscall.Errno(-res))
+				continue
 			}
 			q.handle(uint16(userData))
 		}
