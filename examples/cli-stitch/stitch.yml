@@ -1,0 +1,13 @@
+# A 64 MiB device stitched from three kinds of source. Writes go to the COW file; the image
+# and the HTTP origin are never modified. Paths match run.sh.
+size: 64M
+cow:
+  file: /var/tmp/blkmap-example-stitch/stitch.cow
+segments:
+  - type: zero            # 1 MiB of zeros, e.g. room for a partition table
+    size: 1M
+  - type: file            # a local image
+    path: /var/tmp/blkmap-example-stitch/part.img
+  - type: http            # the same image again, this time fetched over HTTP in 1 MiB blocks
+    offset: 32M
+    url: http://127.0.0.1:18100/part.img

@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+// Remote exports files of a directory on one host to blkmap on another: the size and the
+// data-extent map up front (so holes are never requested), then plain reads.
+package blkmap.remote;
+
+option go_package = "heckel.io/blkmap/examples/grpc-remote/remotepb";
+
+service Remote {
+  // Open resolves a file name and returns its size and data extents (SEEK_DATA/SEEK_HOLE).
+  rpc Open(OpenRequest) returns (OpenResponse);
+  // Read returns length bytes at offset; short at the end of the file.
+  rpc Read(ReadRequest) returns (ReadResponse);
+}
+
+message OpenRequest {
+  string name = 1;
+}
+
+message Extent {
+  int64 offset = 1;
+  int64 length = 2;
+}
+
+message OpenResponse {
+  int64 size = 1;
+  repeated Extent data = 2;
+}
+
+message ReadRequest {
+  string name = 1;
+  int64 offset = 2;
+  int64 length = 3;
+}
+
+message ReadResponse {
+  bytes data = 1;
+}

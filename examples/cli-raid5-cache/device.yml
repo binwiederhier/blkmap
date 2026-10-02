@@ -1,0 +1,28 @@
+# A Windows-style (left-symmetric, 64 KiB stripes) RAID-5 of four members, one of them
+# missing and rebuilt from parity on the fly. Each present member is behind a cache tier:
+# a partial local copy ("fast") that answers short reads for what it does not have, falling
+# through to the full copy ("slow", here served over HTTP). Background hydration copies the
+# boot area first, then everything else, bypassing the caches.
+cow:
+  file: /var/tmp/blkmap-example-raid5/raid.cow
+hydrate:
+  prefetch-list: /var/tmp/blkmap-example-raid5/prefetch
+  rest: true
+  rate: 64M
+  use-cache: never
+  report-every: 2s
+segments:
+  - type: raid5
+    stripe-size: 64K
+    layout: left-symmetric
+    members:
+      - type: cache
+        fast: {type: file, path: /var/tmp/blkmap-example-raid5/fast/member0}
+        slow: {type: http, url: http://127.0.0.1:18101/member0}
+      - missing: true
+      - type: cache
+        fast: {type: file, path: /var/tmp/blkmap-example-raid5/fast/member2}
+        slow: {type: http, url: http://127.0.0.1:18101/member2}
+      - type: cache
+        fast: {type: file, path: /var/tmp/blkmap-example-raid5/fast/member3}
+        slow: {type: http, url: http://127.0.0.1:18101/member3}

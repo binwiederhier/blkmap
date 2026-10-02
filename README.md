@@ -209,6 +209,14 @@ Random 4K writes pay for the copy-on-write chunking: the first write into a 64K 
 the chunk from the base and writes it whole. A smaller `cow.chunk-size` trades that for a
 bigger bitmap.
 
+## Examples
+
+`examples/` holds runnable examples with their own READMEs: two CLI ones (`cli-stitch`,
+`cli-raid5-cache`), two library ones (`lib-synthetic`, `lib-dircache`: a fast cache tier
+implemented as a directory of block files) and `grpc-remote`, a two-call gRPC protocol that
+exports sparse files from another host with their hole map. `make examples` vets, tests and
+builds them.
+
 ## Development
 
 ```
