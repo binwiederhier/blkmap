@@ -83,7 +83,8 @@ func OpenLiveBitmap(path, livePath string, size, chunkSize int64) (*Bitmap, erro
 		f.Close()
 		return nil, err
 	}
-	if st.Size() == 0 {
+	fresh := st.Size() == 0
+	if fresh {
 		err = writeHeader(f, bitmapHeaderSize+areaSize, size, chunkSize)
 		// Allocate the whole file now: a full cow filesystem must not stop the bitmap from
 		// recording what made it into the cow file
@@ -103,7 +104,7 @@ func OpenLiveBitmap(path, livePath string, size, chunkSize int64) (*Bitmap, erro
 		return nil, fmt.Errorf("%w %s: read: %w", errBitmap, path, err)
 	}
 	if livePath != "" {
-		if err := b.attachLive(livePath, size, chunkSize); err != nil {
+		if err := b.attachLive(livePath, size, chunkSize, fresh); err != nil {
 			f.Close()
 			return nil, fmt.Errorf("%w %s: live bitmap %s: %w", errBitmap, path, livePath, err)
 		}
@@ -113,8 +114,10 @@ func OpenLiveBitmap(path, livePath string, size, chunkSize int64) (*Bitmap, erro
 
 // attachLive moves the bits into a shared mapping of the live file, adopting the file's
 // bits if a predecessor left it with this geometry. Pages that differ from the disk file
-// are marked dirty, so the next Sync persists what the predecessor never did.
-func (b *Bitmap) attachLive(path string, size, chunkSize int64) error {
+// are marked dirty, so the next Sync persists what the predecessor never did. A freshly
+// created disk bitmap never adopts: the overlay was started over, and the live file
+// describes the old one.
+func (b *Bitmap) attachLive(path string, size, chunkSize int64, fresh bool) error {
 	fileSize := int64(bitmapHeaderSize + len(b.area()))
 	live, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, bitmapFileMode)
 	if err != nil {
@@ -125,7 +128,7 @@ func (b *Bitmap) attachLive(path string, size, chunkSize int64) error {
 		live.Close()
 		return err
 	}
-	adopt := st.Size() == fileSize && checkHeader(live, size, chunkSize) == nil
+	adopt := !fresh && st.Size() == fileSize && checkHeader(live, size, chunkSize) == nil
 	if !adopt {
 		if err := live.Truncate(0); err != nil {
 			live.Close()

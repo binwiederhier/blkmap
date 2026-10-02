@@ -48,6 +48,9 @@ for i in $(seq 1 "$cycles"); do
     for k in 1 2 3; do
       # Kill only a running server: while systemd restarts the unit MainPID reads 0, and
       # kill -9 0 would kill this SSH session instead
+      # These kills are deliberate: clear the unit's start counter, or a fast run reaches the
+      # crash-loop limit (10 starts a minute), systemd gives up and the reap fails the device
+      $ssh 'systemctl reset-failed blkmap@pc' 2>/dev/null || true
       pid=$($ssh 'systemctl show -p MainPID --value blkmap@pc')
       [ "${pid:-0}" -gt 0 ] || { echo "FAIL: no server to kill (cycle $i, kill $k)"; exit 1; }
       $ssh "kill -9 $pid"

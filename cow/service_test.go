@@ -750,3 +750,22 @@ func (b *broken) Size() int64 {
 func (b *broken) Close() error {
 	return nil
 }
+
+// Deleting the bitmap (and cow file) is how an overlay is started over; a live bitmap left in
+// /run by a crashed server of the old overlay must not bring its bits back.
+func TestLiveBitmapNotAdoptedByAFreshBitmap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.cow.bitmap"), LiveBitmap: filepath.Join(dir, "d.live"), ChunkSize: testChunk}
+	s, err := OpenWith(&mem{data: pattern(testSize)}, o)
+	require.NoError(t, err)
+	_, err = s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 0)
+	require.NoError(t, err)
+	s.abandon()
+	require.NoError(t, os.Remove(o.COWFile))
+	require.NoError(t, os.Remove(o.Bitmap))
+	s, err = OpenWith(&mem{data: pattern(testSize)}, o)
+	require.NoError(t, err, "a fresh overlay must start empty")
+	require.Zero(t, s.Written())
+	require.NoError(t, s.Close())
+}
