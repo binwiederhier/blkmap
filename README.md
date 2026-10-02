@@ -303,6 +303,9 @@ make test-vm     # everything, on a VM created for the run and destroyed after i
 make vet
 ```
 
+The test plan, what each layer covers and how to repeat a full run, is in
+[docs/testing.md](docs/testing.md); results of past runs are in `docs/test-results/`.
+
 Layout follows the ntfy conventions: `cmd/` (CLI), `config/` (YAML), `source/` (zero, file,
 http, raid5, concat), `cow/` (bitmap + COW store, discard and write-zeroes aware), `device/`
 (COW over source over ublk, symlink, crash cleanup), `ublk/` (kernel transport), `util/`.
