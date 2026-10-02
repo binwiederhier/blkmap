@@ -233,6 +233,29 @@ rate, the cache policy and an optional progress callback. One level down, `ublk.
 serves any `ublk.Backend` (ReadAt, WriteAt, Size, Flush, optionally Discard and WriteZeroes)
 without the COW layer.
 
+### Device groups
+
+`device.ServeGroup` serves several devices from one process, for sets whose members depend on
+each other (the disks of a software RAID restored from a backup that kept only the data):
+
+- **Aliases**: `Alias{Offset, Length, Target, TargetOffset}` makes a range of one device a view
+  of another device's range; reads and writes go to the target's store, so a mirror's second
+  plex needs no copy and the two stay identical. An alias must land in a range its target
+  serves itself (no chains or cycles), and a device with aliases cannot hydrate.
+- **Derived bases**: a base that implements `source.Binder` (anywhere in its tree) receives a
+  `source.Lookup` of its siblings' live views, so a parity column computed from the data
+  members sees what the guest wrote to them.
+- **Write elision** (`ElideIdenticalWrites`, or `cow.Store.SetElision`): a write equal to what
+  the device already reads is dropped, so a RAID resync after a restore costs no overlay
+  space. It compares against the base only when the base cannot change (no Binder in it),
+  otherwise only against chunks already in the COW file, and it never makes a whole-chunk
+  write depend on reading the base.
+- **Writeback** (`Device.Writeback`, `cow.Store.Writeback`) copies the overlay into a writable
+  copy of the base, for a device that was a scratch view of files. Writing back into the base
+  itself changes its identity: discard the COW file and bitmap afterwards.
+
+`Group.Close` ends every device's I/O before it closes any store.
+
 ## Performance
 
 Requests from the kernel are served by one thread per ublk queue. While the backend answers

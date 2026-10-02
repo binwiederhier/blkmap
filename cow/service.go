@@ -64,16 +64,19 @@ type Store struct {
 	bitmap    *Bitmap
 	chunkSize int64
 	size      int64
-	dirty     atomic.Bool  // something changed since the last Flush
-	elide     atomic.Bool  // drop writes whose bytes equal what the device already reads there
-	bufs      sync.Pool    // chunk-sized scratch buffers for read-modify-write
-	runBufs   sync.Pool    // MaxRunBytes buffers for hydration runs
-	srcReads  atomic.Int64 // base reads, for SourceStats
-	srcBytes  atomic.Int64
-	srcErrors atomic.Int64
-	srcNanos  atomic.Int64
-	flushMu   sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
-	locks     [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
+	dirty     atomic.Bool // something changed since the last Flush
+	elide     atomic.Bool // drop writes whose bytes equal what the device already reads there
+	// baseMutable: the base derives its bytes from other devices (a source.Binder), so it may
+	// change after a write was compared against it; elision then trusts only the COW file
+	baseMutable bool
+	bufs        sync.Pool    // chunk-sized scratch buffers for read-modify-write
+	runBufs     sync.Pool    // MaxRunBytes buffers for hydration runs
+	srcReads    atomic.Int64 // base reads, for SourceStats
+	srcBytes    atomic.Int64
+	srcErrors   atomic.Int64
+	srcNanos    atomic.Int64
+	flushMu     sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
+	locks       [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 }
 
 // Open opens or creates the COW file and bitmap for base. The Store takes ownership of base.
@@ -124,7 +127,7 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 			return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 		}
 	}
-	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
+	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size, baseMutable: derivesFromOthers(base)}
 	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
 	s.bufs.New = func() any {
 		b := make([]byte, chunkSize)
@@ -299,7 +302,9 @@ func (s *Store) Close() error {
 // overlay to a writable copy of the base: for a server whose device was a scratch view of
 // files that must end up holding the result. It flushes first and leaves the overlay as it is,
 // so the device keeps reading what it read before. Chunks that were hole-punched are written
-// as zeros.
+// as zeros; each chunk is read under its lock, so a concurrent write is either in it or not.
+// If dst is the base itself, the base's identity changes (see Options.Identity): discard the
+// COW file and bitmap afterwards, since the base now holds what they recorded.
 func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
 	if err := s.Flush(); err != nil {
 		return 0, err
@@ -312,7 +317,11 @@ func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
 		}
 		start := chunk * s.chunkSize
 		length := min(s.chunkSize, s.size-start)
-		if _, err := s.cow.ReadAt(buf[:length], start); err != nil && !errors.Is(err, io.EOF) {
+		mu := &s.locks[chunk%lockStripes]
+		mu.Lock()
+		_, err := s.cow.ReadAt(buf[:length], start)
+		mu.Unlock()
+		if err != nil && !errors.Is(err, io.EOF) {
 			return n, fmt.Errorf("read chunk %d from the cow file: %w", chunk, err)
 		}
 		if _, err := dst.WriteAt(buf[:length], start); err != nil {
@@ -342,18 +351,25 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	mu.Lock()
 	defer mu.Unlock()
 	written := s.bitmap.Test(chunk)
+	partial := int64(len(p)) < length
 	elide := s.elide.Load()
+	// Against the base only when it cannot change: over a derived base (a source.Binder) an
+	// elided write would later read as whatever the base derives then
+	elideBase := elide && !written && !s.baseMutable
 	var buf []byte // the whole chunk from base, when a copy-up or an elision check needs it
-	if !written && (int64(len(p)) < length || elide) {
+	if !written && (partial || elideBase) {
 		scratch := s.bufs.Get().(*[]byte)
 		defer s.bufs.Put(scratch)
 		buf = (*scratch)[:length]
 		if _, err := s.readBase(buf, start); err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("copy chunk %d from base: %w", chunk, err)
+			if partial {
+				return fmt.Errorf("copy chunk %d from base: %w", chunk, err)
+			}
+			elideBase = false // a whole-chunk write does not need the base: store it
 		}
 	}
-	if elide {
-		same := false
+	if elide && (written || elideBase) {
+		var same bool
 		if written {
 			scratch := s.bufs.Get().(*[]byte)
 			cur := (*scratch)[:len(p)]
@@ -367,7 +383,7 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 			return nil
 		}
 	}
-	if !written && int64(len(p)) < length {
+	if !written && partial {
 		copy(buf[off-start:], p)
 		if _, err := s.cow.WriteAt(buf, start); err != nil {
 			return err
@@ -421,7 +437,7 @@ func (s *Store) WriteZeroes(off, length int64) error {
 		if off == chunkStart && m == chunkEnd-chunkStart {
 			mu := &s.locks[chunk%lockStripes]
 			mu.Lock()
-			if s.elide.Load() && !s.bitmap.Test(chunk) && s.baseIsZero(chunkStart, m) {
+			if s.elide.Load() && !s.baseMutable && !s.bitmap.Test(chunk) && s.baseIsZero(chunkStart, m) {
 				// the base already reads as zeros there: nothing to record
 			} else if err = s.punch(chunk); err == nil {
 				s.bitmap.Set(chunk)
@@ -606,4 +622,15 @@ func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
 		mu.Unlock()
 	}
 	return copied, nil
+}
+
+// derivesFromOthers reports whether any part of base is a source.Binder.
+func derivesFromOthers(base source.Source) bool {
+	found := false
+	source.Walk(base, func(s source.Source) {
+		if _, ok := s.(source.Binder); ok {
+			found = true
+		}
+	})
+	return found
 }

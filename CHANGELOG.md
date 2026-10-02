@@ -5,6 +5,15 @@ releases are cut with `make release` from a `vX.Y.Z` tag.
 
 ## Unreleased
 
+- **Device groups** (library): `device.ServeGroup` with aliased ranges between devices
+  (mirror plexes stored once), `source.Binder` for bases derived from their siblings' live
+  views (RAID parity), write elision for identical rewrites, and overlay writeback. Review
+  fixes before merging: alias chains and cycles are refused (a cycle crashed the process),
+  elision never trusts a base that can change and never makes a whole-chunk write need the
+  base, Binders nested in a base are bound, a cancelled start touches nothing, a failed
+  publish no longer closes the base twice, a group halts all I/O before closing any store,
+  and writeback reads each chunk under its lock.
+
 Production hardening:
 
 - **Crash and restart survival**: the kernel device outlives its server. A crash or kill

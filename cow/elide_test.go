@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"heckel.io/blkmap/source"
 )
 
 // With elision on, writes that repeat what the device already reads are dropped: no chunk
@@ -72,4 +74,57 @@ func TestElideIdenticalWrites(t *testing.T) {
 	_, err = s.WriteAt(base.data[7*testChunk:7*testChunk+10], 7*testChunk)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, s.Written())
+}
+
+// derived is a base whose bytes are computed from other devices (a source.Binder): they can
+// change after a write was checked against them.
+type derived struct {
+	data []byte
+}
+
+func (d *derived) ReadAt(p []byte, off int64) (int, error) { return copy(p, d.data[off:]), nil }
+func (d *derived) Size() int64                             { return int64(len(d.data)) }
+func (d *derived) Close() error                            { return nil }
+func (d *derived) Bind(source.Lookup)                      {}
+
+// Over a base that can change, a write must not be elided against it: the guest's bytes
+// would silently turn into whatever the base derives next.
+func TestElisionNeverTrustsAChangingBase(t *testing.T) {
+	dir := t.TempDir()
+	base := &derived{data: make([]byte, testSize)}
+	s, err := Open(base, filepath.Join(dir, "cow"), filepath.Join(dir, "cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	s.SetElision(true)
+	_, err = s.WriteAt(make([]byte, testChunk), 0) // equal to what the base derives right now
+	require.NoError(t, err)
+	require.NoError(t, s.WriteZeroes(testChunk, testChunk))
+	base.data[10], base.data[testChunk+10] = 0xFF, 0xFF // a sibling changes
+	got := make([]byte, 2*testChunk)
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, make([]byte, 2*testChunk), got, "the device must keep what the guest wrote")
+	// Rewriting a stored chunk with its own bytes is still elided: that does not depend on the base
+	require.NoError(t, s.Flush())
+	_, err = s.WriteAt(make([]byte, 100), 0)
+	require.NoError(t, err)
+	require.False(t, s.Dirty())
+}
+
+// A whole-chunk write does not need the base, so elision must not make it fail when the base
+// cannot be read: the write is stored instead.
+func TestElisionSurvivesAnUnreadableBase(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(&broken{size: testSize}, filepath.Join(dir, "cow"), filepath.Join(dir, "cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	s.SetElision(true)
+	w := bytes.Repeat([]byte{0x5A}, testChunk)
+	_, err = s.WriteAt(w, testChunk)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, s.Written())
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, testChunk)
+	require.NoError(t, err)
+	require.Equal(t, w, got)
 }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"sync"
 
 	"heckel.io/blkmap/cow"
 	"heckel.io/blkmap/source"
@@ -45,6 +44,14 @@ func ServeGroup(ctx context.Context, opts []*GroupOptions) (*Group, error) {
 	if len(opts) == 0 {
 		return nil, errors.New("a group needs at least one device")
 	}
+	if err := ctx.Err(); err != nil {
+		for _, o := range opts {
+			if o.Base != nil {
+				o.Base.Close()
+			}
+		}
+		return nil, err
+	}
 	routers := make(map[string]*router, len(opts))
 	closeStores := func() {
 		for id, r := range routers {
@@ -68,21 +75,18 @@ func ServeGroup(ctx context.Context, opts []*GroupOptions) (*Group, error) {
 		store.SetElision(o.ElideIdenticalWrites)
 		routers[o.ID] = &router{id: o.ID, store: store, pred: pred}
 	}
-	for _, o := range opts {
-		if err := routers[o.ID].setAliases(o.Aliases, routers); err != nil {
-			closeStores()
-			return nil, fmt.Errorf("%s: %w", o.ID, err)
-		}
+	if err := setAllAliases(opts, routers); err != nil {
+		closeStores()
+		return nil, err
 	}
-	lookup := source.Lookup(func(id string) (io.ReaderAt, bool) {
+	bases := make([]source.Source, len(opts))
+	for i, o := range opts {
+		bases[i] = o.Base
+	}
+	bindAll(bases, func(id string) (io.ReaderAt, bool) {
 		r, ok := routers[id]
 		return r, ok
 	})
-	for _, o := range opts {
-		if b, ok := o.Base.(source.Binder); ok {
-			b.Bind(lookup)
-		}
-	}
 	g := &Group{Devices: make(map[string]*Device, len(opts))}
 	for _, o := range opts {
 		d, err := serveStore(ctx, &o.Options, routers[o.ID].store, routers[o.ID].pred, routers[o.ID])
@@ -101,9 +105,14 @@ func ServeGroup(ctx context.Context, opts []*GroupOptions) (*Group, error) {
 	return g, nil
 }
 
-// Close shuts the devices down in reverse order of creation.
+// Close shuts the devices down: first every device's I/O ends (an aliased request or a derived
+// base reads a sibling's store, so no store may close while any device still serves), then
+// the devices close in reverse order of creation.
 func (g *Group) Close() error {
 	var errs []error
+	for _, id := range g.order {
+		errs = append(errs, g.Devices[id].halt())
+	}
 	for i := len(g.order) - 1; i >= 0; i-- {
 		if d := g.Devices[g.order[i]]; d != nil {
 			errs = append(errs, d.Close())
@@ -120,7 +129,6 @@ type router struct {
 	pred    *predecessor // the kernel device a previous server left for recovery, until serveStore takes it
 	aliases []alias
 	targets []*router // every distinct alias target, for Flush
-	mu      sync.Mutex
 }
 
 type alias struct {
@@ -269,4 +277,37 @@ func (r *router) WriteZeroes(off, length int64) error {
 		}
 	}
 	return nil
+}
+
+// setAllAliases validates and installs every device's aliases. An alias must land in a range
+// of its target that the target serves itself: following aliases further (a chain, or two
+// devices aliasing each other) is refused rather than forwarded.
+func setAllAliases(opts []*GroupOptions, routers map[string]*router) error {
+	for _, o := range opts {
+		if err := routers[o.ID].setAliases(o.Aliases, routers); err != nil {
+			return fmt.Errorf("%s: %w", o.ID, err)
+		}
+	}
+	for _, o := range opts {
+		for _, a := range routers[o.ID].aliases {
+			for _, t := range a.target.aliases {
+				if a.TargetOffset < t.Offset+t.Length && t.Offset < a.TargetOffset+a.Length {
+					return fmt.Errorf("%s: alias [%d, %d) lands in %s's own alias [%d, %d); aliases cannot be chained", o.ID, a.Offset, a.Offset+a.Length, a.Target, t.Offset, t.Offset+t.Length)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// bindAll hands lookup to every Binder among the bases, however deep in a base's tree (a
+// config always stitches its segments into a Concat).
+func bindAll(bases []source.Source, lookup source.Lookup) {
+	for _, base := range bases {
+		source.Walk(base, func(s source.Source) {
+			if b, ok := s.(source.Binder); ok {
+				b.Bind(lookup)
+			}
+		})
+	}
 }

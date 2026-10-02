@@ -30,8 +30,8 @@ const (
 	// RunDir holds per-device runtime state (ublk id and server pid, the live bitmap, the
 	// status socket), so a restarted server can re-attach to the device it left behind.
 	RunDir        = "/run/blkmap"
-	devDirMode    = 0o755
-	stateFileMode = 0o600
+	devDirMode    = 0755
+	stateFileMode = 0600
 	// flushInterval bounds how long a completed write can sit without reaching disk when
 	// the guest never issues a flush (raw dd, no filesystem).
 	flushInterval = 5 * time.Second
@@ -144,6 +144,13 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 // from here on, even when it fails. The context only guards setup; the device lives until
 // Close.
 func Serve(ctx context.Context, o *Options) (*Device, error) {
+	// Before anything is opened: a cancelled start must not touch a predecessor
+	if err := ctx.Err(); err != nil {
+		if o.Base != nil {
+			o.Base.Close()
+		}
+		return nil, err
+	}
 	store, pred, err := openStore(o)
 	if err != nil {
 		return nil, err
@@ -238,7 +245,11 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
 	}
 	if err := d.publish(o.DevDir); err != nil {
-		d.Close()
+		// The caller still owns the store: tear down only what serveStore created
+		if d.ownsLink() {
+			os.Remove(d.Path)
+		}
+		dev.Close()
 		return nil, err
 	}
 	if err := announce(dev.BlockPath); err != nil {
@@ -377,6 +388,7 @@ func (p *predecessor) recover(id string, params *ublk.Params) (*ublk.Device, err
 	}
 	dev, err := ublk.Recover(p.id, params)
 	if err == nil {
+		p.valid = false // the device is ours now: nothing left to drop
 		log.Printf("%s: re-attached to ublk device %d; I/O resumes", id, p.id)
 		return dev, nil
 	}
@@ -495,15 +507,10 @@ func (d *Device) Close() error {
 	if d.status != nil {
 		d.status.Close()
 	}
-	if d.stop != nil {
-		d.stop()
-		d.bg.Wait()
-	}
 	if at := mountPoint(d.BlockPath); at != "" {
 		log.Printf("%s: still mounted at %s; unmount it, deletion waits for it", filepath.Base(d.Path), at)
 	}
-	d.store.Abort()
-	errs := []error{d.ublk.Stop(), d.store.Close()}
+	errs := []error{d.halt(), d.store.Close()}
 	if err := d.ublk.Delete(); errors.Is(err, ublk.ErrReowned) {
 		// A restarted server already owns this id, its symlink and its state file
 		log.Printf("%s: kernel device id reused by a successor, leaving its files in place", filepath.Base(d.Path))
@@ -524,6 +531,19 @@ func (d *Device) Close() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// halt ends the device's I/O without closing anything: background work stops, reads blocked in
+// the source are aborted, and STOP_DEV drains what is in flight. A group halts every device
+// before it closes any store, since a device's requests may land in a sibling's store.
+// Idempotent.
+func (d *Device) halt() error {
+	if d.stop != nil {
+		d.stop()
+		d.bg.Wait()
+	}
+	d.store.Abort()
+	return d.ublk.Stop()
 }
 
 // mountPoint returns where the block device is mounted, or "" if it is not.
