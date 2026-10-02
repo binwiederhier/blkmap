@@ -177,32 +177,44 @@ type piece struct {
 	targetOff   int64
 }
 
-// split cuts [off, off+length) into pieces at alias boundaries.
-func (r *router) split(off, length int64) []piece {
-	var pieces []piece
+// pieces walks [off, off+length) in pieces cut at alias boundaries, without allocating: a
+// group device sends every guest request through it.
+type pieces struct {
+	r        *router
+	off, end int64
+	i        int // index of the next alias that can intersect
+}
+
+func (r *router) pieces(off, length int64) pieces {
 	i := sort.Search(len(r.aliases), func(i int) bool { return r.aliases[i].Offset+r.aliases[i].Length > off })
-	for length > 0 {
-		if i >= len(r.aliases) || r.aliases[i].Offset >= off+length {
-			pieces = append(pieces, piece{off: off, length: length})
-			break
-		}
-		a := r.aliases[i]
-		if a.Offset > off {
-			n := a.Offset - off
-			pieces = append(pieces, piece{off: off, length: n})
-			off, length = off+n, length-n
-		}
-		n := min(length, a.Offset+a.Length-off)
-		pieces = append(pieces, piece{off: off, length: n, target: a.target, targetOff: a.TargetOffset + (off - a.Offset)})
-		off, length = off+n, length-n
-		i++
+	return pieces{r: r, off: off, end: off + length, i: i}
+}
+
+// next returns the next piece; ok is false when the range is exhausted.
+func (it *pieces) next() (pc piece, ok bool) {
+	if it.off >= it.end {
+		return piece{}, false
 	}
-	return pieces
+	aliases := it.r.aliases
+	if it.i >= len(aliases) || aliases[it.i].Offset >= it.end {
+		pc = piece{off: it.off, length: it.end - it.off}
+	} else if a := aliases[it.i]; a.Offset > it.off {
+		pc = piece{off: it.off, length: a.Offset - it.off}
+	} else {
+		pc = piece{off: it.off, length: min(it.end, a.Offset+a.Length) - it.off, target: a.target, targetOff: a.TargetOffset + (it.off - a.Offset)}
+		it.i++
+	}
+	it.off += pc.length
+	return pc, true
 }
 
 func (r *router) ReadAt(p []byte, off int64) (int, error) {
 	n := 0
-	for _, pc := range r.split(off, int64(len(p))) {
+	for it := r.pieces(off, int64(len(p))); ; {
+		pc, ok := it.next()
+		if !ok {
+			return n, nil
+		}
 		buf := p[pc.off-off : pc.off-off+pc.length]
 		var m int
 		var err error
@@ -216,12 +228,15 @@ func (r *router) ReadAt(p []byte, off int64) (int, error) {
 			return n, err
 		}
 	}
-	return n, nil
 }
 
 func (r *router) WriteAt(p []byte, off int64) (int, error) {
 	n := 0
-	for _, pc := range r.split(off, int64(len(p))) {
+	for it := r.pieces(off, int64(len(p))); ; {
+		pc, ok := it.next()
+		if !ok {
+			return n, nil
+		}
 		buf := p[pc.off-off : pc.off-off+pc.length]
 		var m int
 		var err error
@@ -235,7 +250,6 @@ func (r *router) WriteAt(p []byte, off int64) (int, error) {
 			return n, err
 		}
 	}
-	return n, nil
 }
 
 func (r *router) Size() int64 { return r.store.Size() }
@@ -250,7 +264,11 @@ func (r *router) Flush() error {
 }
 
 func (r *router) Discard(off, length int64) error {
-	for _, pc := range r.split(off, length) {
+	for it := r.pieces(off, length); ; {
+		pc, ok := it.next()
+		if !ok {
+			return nil
+		}
 		var err error
 		if pc.target != nil {
 			err = pc.target.Discard(pc.targetOff, pc.length)
@@ -261,11 +279,14 @@ func (r *router) Discard(off, length int64) error {
 			return err
 		}
 	}
-	return nil
 }
 
 func (r *router) WriteZeroes(off, length int64) error {
-	for _, pc := range r.split(off, length) {
+	for it := r.pieces(off, length); ; {
+		pc, ok := it.next()
+		if !ok {
+			return nil
+		}
 		var err error
 		if pc.target != nil {
 			err = pc.target.WriteZeroes(pc.targetOff, pc.length)
@@ -276,7 +297,6 @@ func (r *router) WriteZeroes(off, length int64) error {
 			return err
 		}
 	}
-	return nil
 }
 
 // setAllAliases validates and installs every device's aliases. An alias must land in a range

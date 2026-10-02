@@ -274,3 +274,23 @@ func TestServeFailedPublishClosesOnce(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, 1, base.closes)
 }
+
+// Requests through a router allocate nothing, like the single-device hot path: a group
+// device serves every guest request through it.
+func TestRouterNoAlloc(t *testing.T) {
+	dir := t.TempDir()
+	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
+	b := openTestStore(t, dir, "b", seeded(8*groupChunk, 2))
+	ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
+	routers := map[string]*router{"a": ra, "b": rb}
+	require.NoError(t, setAllAliases([]*GroupOptions{
+		{Options: Options{ID: "a"}},
+		{Options: Options{ID: "b"}, Aliases: []Alias{{Offset: groupChunk, Length: 2 * groupChunk, Target: "a", TargetOffset: 4 * groupChunk}}},
+	}, routers))
+	p := make([]byte, 4*groupChunk) // own range, alias, own range
+	_, err := rb.WriteAt(p, 0)      // first writes copy chunks up; measure steady state
+	require.NoError(t, err)
+	require.Zero(t, testing.AllocsPerRun(100, func() { rb.ReadAt(p, 0) }), "read")
+	require.Zero(t, testing.AllocsPerRun(100, func() { rb.WriteAt(p, 0) }), "write")
+	require.Zero(t, testing.AllocsPerRun(100, func() { rb.WriteZeroes(0, 4*groupChunk) }), "write zeroes")
+}
