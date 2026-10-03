@@ -73,6 +73,9 @@ type Store struct {
 	runBufs     sync.Pool    // MaxRunBytes buffers for hydration runs
 	srcReads    atomic.Int64 // base reads, for SourceStats
 	srcBytes    atomic.Int64
+	demandReads atomic.Int64 // of srcReads, those on the guest read path
+	demandBytes atomic.Int64
+	onDemand    func(first, count int64) // see OnDemandRead; nil if unset
 	srcErrors   atomic.Int64
 	srcNanos    atomic.Int64
 	flushMu     sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
@@ -142,15 +145,25 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 
 // SourceStats counts the reads a store made from its base source.
 type SourceStats struct {
-	Reads    int64
-	Bytes    int64
-	Errors   int64
-	Duration time.Duration // total time spent in base reads
+	Reads       int64
+	Bytes       int64
+	Errors      int64
+	Duration    time.Duration // total time spent in base reads
+	DemandReads int64         // of Reads, those a guest request needed (the chunks were not in the COW file)
+	DemandBytes int64
+}
+
+// OnDemandRead installs fn, called for every run of chunks a guest read had to fetch from
+// the base (first chunk and count) because they were not in the COW file. A hydrator uses it
+// to count the listed chunks it was late for. Set before the device serves I/O.
+func (s *Store) OnDemandRead(fn func(first, count int64)) {
+	s.onDemand = fn
 }
 
 // SourceStats returns the base read counters.
 func (s *Store) SourceStats() SourceStats {
-	return SourceStats{Reads: s.srcReads.Load(), Bytes: s.srcBytes.Load(), Errors: s.srcErrors.Load(), Duration: time.Duration(s.srcNanos.Load())}
+	return SourceStats{Reads: s.srcReads.Load(), Bytes: s.srcBytes.Load(), Errors: s.srcErrors.Load(), Duration: time.Duration(s.srcNanos.Load()),
+		DemandReads: s.demandReads.Load(), DemandBytes: s.demandBytes.Load()}
 }
 
 // readBase reads from the base source, counting the read.
@@ -224,6 +237,11 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 			read, err = s.cow.ReadAt(p[:m], off)
 		} else {
 			read, err = s.readBase(p[:m], off)
+			s.demandReads.Add(1)
+			s.demandBytes.Add(int64(read))
+			if s.onDemand != nil {
+				s.onDemand(chunk, (end-1)/s.chunkSize-chunk+1)
+			}
 		}
 		if err := fullRead(read, m, err); err != nil {
 			return n - len(p) + read, err

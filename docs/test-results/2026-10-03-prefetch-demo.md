@@ -40,7 +40,11 @@ over a sparse copy holding every 1 MiB block the first 20 s of the recording tou
 | 20 s cache + HDD | recorded list | 47.2 s, 44.6 s | 11,280 |
 
 With cache and list, hydration ran up to 17 s ahead of the recording and completed the list
-1 to 2 s before the recording needed its last chunk.
+1 to 2 s before the recording needed its last chunk. A later run with the demand counters
+(47.1 s): of 92,000 guest reads, 249 (16 MiB) went to the source on demand and 439 listed
+chunks (27 MiB) were read before hydration reached them, 71 of those in the first second. The
+guest's exposure to the slow path is that small; the 2 to 5 s over the local boot is within
+the run-to-run noise of this nested VM (about 3 s).
 
 ## Earlier rounds (short 20 s boot workload, 291 MiB)
 

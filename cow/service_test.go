@@ -805,3 +805,27 @@ func TestWriteChunkRefusesShortBaseRead(t *testing.T) {
 	assert.Error(t, err, "a copy-up from an incomplete base must not publish the chunk")
 	assert.Equal(t, int64(0), s.Written())
 }
+
+func TestStoreCountsDemandReads(t *testing.T) {
+	dir := t.TempDir()
+	base := &mem{data: pattern(testSize)}
+	s, err := Open(base, filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	var runs [][2]int64
+	s.OnDemandRead(func(first, count int64) { runs = append(runs, [2]int64{first, count}) })
+	// Hydration reads are not demand
+	_, err = s.HydrateRun(0, 2, false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), s.SourceStats().DemandReads)
+	// A guest read over chunks 1 (hydrated), 2, 3 (not) and a hydrated run again
+	buf := make([]byte, 3*testChunk)
+	_, err = s.ReadAt(buf, testChunk)
+	require.NoError(t, err)
+	st := s.SourceStats()
+	assert.Equal(t, int64(1), st.DemandReads, "one base read for the unwritten run")
+	assert.Equal(t, int64(2*testChunk), st.DemandBytes)
+	assert.Equal(t, int64(2), st.Reads, "the hydration read and the demand read; the hydrated chunk came from the cow file")
+	assert.Equal(t, [][2]int64{{2, 2}}, runs)
+	assert.Zero(t, testing.AllocsPerRun(50, func() { s.ReadAt(buf, testChunk) }))
+}

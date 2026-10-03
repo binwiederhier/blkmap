@@ -227,9 +227,11 @@ vm: hydration rest: 8958/57344 chunks (15%), 311360K copied; prefetch list compl
 ```
 
 `blkmap status` shows the same as a `prefetch:` line, and metrics as
-`blkmap_hydration_lead_seconds` and `blkmap_hydration_behind_chunks`. Chunks the guest read
-on demand count as behind until hydration copies them, since demand reads do not land in the
-COW file.
+`blkmap_hydration_lead_seconds` and `blkmap_hydration_behind_chunks`. The cost of being
+behind is counted directly: "listed chunks read on demand" is how many chunks of the list the
+guest had to fetch from the source itself before hydration got there
+(`blkmap_hydration_late_chunks_total`), and the source line of `blkmap status` separates
+reads a guest request needed from hydration's own (`blkmap_source_demand_reads_total`).
 
 A recording file is never overwritten, so a restarted or reloaded server does not clobber
 it; delete it to record again. Recording costs about 1.5 MiB of memory and a few tens of

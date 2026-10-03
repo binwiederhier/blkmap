@@ -38,9 +38,9 @@ func TestPrefetchStats(t *testing.T) {
 	require.NoError(t, app.Run([]string{"blkmap", "prefetch", "--stats", path}))
 	out := stdout.String()
 	assert.Contains(t, out, "requests:  6 (5 reads, 1 writes) over 2.5s")
-	assert.Contains(t, out, "unique:    1216K read, in 3 ranges")
+	assert.Contains(t, out, "unique:    1.2M read, in 3 ranges")
 	assert.Contains(t, out, "by 1s     128K")
-	assert.Contains(t, out, "by 5s     1216K")
+	assert.Contains(t, out, "by 5s     1.2M")
 	// 1152K by 1.5 s is the steepest point after the first second: 768K/s keeps ahead
 	assert.Contains(t, out, "rate:      768K/s from the start keeps ahead of the reads after the first second")
 }

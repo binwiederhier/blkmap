@@ -83,7 +83,7 @@ func printPrefetchStats(w io.Writer, accesses, compact []source.Access) {
 		unique += a.Length
 	}
 	fmt.Fprintf(w, "requests:  %d (%d reads, %d writes) over %s\n", len(accesses), reads, writes, duration)
-	fmt.Fprintf(w, "unique:    %s read, in %d ranges\n", util.FormatSize(unique), len(compact))
+	fmt.Fprintf(w, "unique:    %s read, in %d ranges\n", util.FormatSizeApprox(unique), len(compact))
 	fmt.Fprintf(w, "needed:\n")
 	for _, mark := range prefetchMarks {
 		var needed int64
@@ -92,7 +92,7 @@ func printPrefetchStats(w io.Writer, accesses, compact []source.Access) {
 				needed += a.Length
 			}
 		}
-		fmt.Fprintf(w, "  by %-6s %s\n", formatMark(mark), util.FormatSize(needed))
+		fmt.Fprintf(w, "  by %-6s %s\n", formatMark(mark), util.FormatSizeApprox(needed))
 		if mark >= duration {
 			break
 		}
@@ -109,8 +109,7 @@ func printPrefetchStats(w io.Writer, accesses, compact []source.Access) {
 		fmt.Fprintf(w, "rate:      everything was read within the first second\n")
 		return
 	}
-	perSecond := (int64(rate) + 1023) / 1024 * 1024 // whole KiB, so the size prints with a suffix
-	fmt.Fprintf(w, "rate:      %s/s from the start keeps ahead of the reads after the first second\n", util.FormatSize(perSecond))
+	fmt.Fprintf(w, "rate:      %s/s from the start keeps ahead of the reads after the first second\n", util.FormatSizeApprox(int64(rate)))
 }
 
 // formatMark prints a mark the way a person writes it: 1s, 30s, 2m.

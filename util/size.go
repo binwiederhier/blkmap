@@ -64,6 +64,22 @@ func ParseSize(s string) (int64, error) {
 }
 
 // FormatSize renders a byte count with the largest exact binary suffix, e.g. 65536 -> "64K".
+// FormatSizeApprox prints a size the way a person reads one: the largest unit that gives
+// a number of at least 1, one decimal below 10 (1.7G, 51M, 4.0K). FormatSize is exact and is
+// for sizes that are configuration (chunk sizes, offsets); this is for reports.
+func FormatSizeApprox(n int64) string {
+	for _, u := range sizeFormatUnits {
+		if n >= u.unit {
+			v := float64(n) / float64(u.unit)
+			if v < 10 {
+				return fmt.Sprintf("%.1f%s", v, u.suffix)
+			}
+			return fmt.Sprintf("%.0f%s", v, u.suffix)
+		}
+	}
+	return strconv.FormatInt(n, 10)
+}
+
 func FormatSize(n int64) string {
 	for _, u := range sizeFormatUnits {
 		if n != 0 && n%u.unit == 0 {

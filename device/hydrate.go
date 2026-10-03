@@ -61,6 +61,7 @@ type Progress struct {
 	Total    int64  // chunks in the device
 	Copied   int64  // bytes copied by this run so far
 	Errors   int64  // failed background reads so far (each is retried in a later pass)
+	Late     int64  // listed chunks the guest read from the source before hydration copied them
 	Done     bool
 	Schedule *Schedule `json:"schedule,omitempty"` // nil without a timed prefetch list
 }
@@ -105,6 +106,8 @@ type hydrator struct {
 	start        time.Time        // when the device came up, the recording's time zero
 	now          func() time.Time // time.Now, or a test clock
 	listDoneLead atomic.Pointer[time.Duration]
+	listed       *util.Bitset // chunks of the prefetch list, for counting late demand reads
+	late         atomic.Int64
 	inflight     atomic.Int64 // copies running now
 	behindAt     atomic.Int64 // unix nanos of the last behind() check
 	isBehind     atomic.Bool
@@ -133,7 +136,30 @@ func newHydrator(id string, store *cow.Store, base source.Source, opts *Hydrate,
 	if o.Rate > 0 {
 		h.limiter = newBucket(o.Rate, max(hydrateRunBytes, store.ChunkSize()))
 	}
+	if len(o.Prefetch) > 0 {
+		h.listed = util.NewBitset(store.Chunks())
+		for _, r := range o.Prefetch {
+			for c := r.Offset / store.ChunkSize(); c <= min((r.Offset+r.Length-1)/store.ChunkSize(), store.Chunks()-1); c++ {
+				h.listed.Set(c)
+			}
+		}
+		store.OnDemandRead(h.demandRead)
+	}
 	return h
+}
+
+// demandRead counts the listed chunks a guest read fetched from the source itself: the ones
+// hydration was late for, each costing the guest a slow read it should not have had.
+func (h *hydrator) demandRead(first, count int64) {
+	var late int64
+	for c := first; c < first+count; c++ {
+		if h.listed.Test(c) {
+			late++
+		}
+	}
+	if late > 0 {
+		h.late.Add(late)
+	}
 }
 
 // run hydrates until everything requested is in the COW file or ctx is cancelled. Runs
@@ -167,7 +193,7 @@ func (h *hydrator) run(ctx context.Context) {
 	}
 	h.setPhase(phaseDone)
 	p := h.progress()
-	log.Printf("%s: hydration done: %d/%d chunks in the cow file, %s copied, %d errors", h.id, p.Hydrated, p.Total, util.FormatSize(p.Copied), p.Errors)
+	log.Printf("%s: hydration done: %d/%d chunks in the cow file, %s copied, %d errors, %d listed chunks read on demand", h.id, p.Hydrated, p.Total, util.FormatSize(p.Copied), p.Errors, p.Late)
 	if h.opts.OnProgress != nil {
 		h.opts.OnProgress(p)
 	}
@@ -352,6 +378,9 @@ func (h *hydrator) reportLoop(ctx context.Context) {
 			if p.Schedule != nil {
 				line += "; " + p.Schedule.String()
 			}
+			if p.Late > 0 {
+				line += fmt.Sprintf(", %d listed chunks read on demand", p.Late)
+			}
 			log.Print(line)
 			if h.opts.OnProgress != nil {
 				h.opts.OnProgress(p)
@@ -362,7 +391,7 @@ func (h *hydrator) reportLoop(ctx context.Context) {
 
 func (h *hydrator) progress() Progress {
 	phase := h.phase.Load()
-	p := Progress{Hydrated: h.store.Written(), Total: h.store.Chunks(), Copied: h.copied.Load(), Errors: h.errors.Load()}
+	p := Progress{Hydrated: h.store.Written(), Total: h.store.Chunks(), Copied: h.copied.Load(), Errors: h.errors.Load(), Late: h.late.Load()}
 	if phase != nil {
 		p.Phase = *phase
 	}

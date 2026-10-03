@@ -431,3 +431,21 @@ func TestHydratorShare(t *testing.T) {
 		})
 	}
 }
+
+func TestHydratorCountsLateReads(t *testing.T) {
+	t.Parallel()
+	base := &recorder{data: pat(hSize)}
+	s := newHydrateStore(t, base)
+	h := newHydrator("h", s, base, &Hydrate{Prefetch: []source.Range{{Offset: 0, Length: 8 * hChunk}}, Rest: false}, idle)
+	// Before hydration runs, the guest reads chunks 2..5 (listed) and 20 (not listed)
+	buf := make([]byte, 4*hChunk)
+	_, err := s.ReadAt(buf, 2*hChunk)
+	require.NoError(t, err)
+	_, err = s.ReadAt(buf[:hChunk], 20*hChunk)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), h.progress().Late, "listed chunks the guest had to read from the source itself")
+	h.run(context.Background())
+	_, err = s.ReadAt(buf, 2*hChunk)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), h.progress().Late, "hydrated chunks are no longer late")
+}

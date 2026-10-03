@@ -94,12 +94,12 @@ func printStatus(w io.Writer, st *device.Status) {
 	r := st.IO
 	fmt.Fprintf(w, "  io: %d reads (%s), %d writes (%s), %d flushes, %d errors, %d in flight\n",
 		r.Reads, util.FormatSize(r.ReadBytes), r.Writes, util.FormatSize(r.WriteBytes), r.Flushes, r.Errors, r.Inflight)
-	fmt.Fprintf(w, "  source: %d reads (%s), %d errors, %s reading\n", st.Source.Reads, util.FormatSize(st.Source.Bytes), st.Source.Errors, st.Source.Duration.Round(time.Millisecond))
+	fmt.Fprintf(w, "  source: %d reads (%s), %d on demand (%s), %d errors, %s reading\n", st.Source.Reads, util.FormatSize(st.Source.Bytes), st.Source.DemandReads, util.FormatSize(st.Source.DemandBytes), st.Source.Errors, st.Source.Duration.Round(time.Millisecond))
 	if c := st.Cache; c != nil {
 		fmt.Fprintf(w, "  cache: %d hits, %d misses, %d failures\n", c.Hits, c.Misses, c.Failures)
 	}
 	if h := st.Hydration; h != nil {
-		fmt.Fprintf(w, "  hydration %s: %d/%d chunks, %s copied, %d errors\n", h.Phase, h.Hydrated, h.Total, util.FormatSize(h.Copied), h.Errors)
+		fmt.Fprintf(w, "  hydration %s: %d/%d chunks, %s copied, %d errors, %d listed chunks read on demand\n", h.Phase, h.Hydrated, h.Total, util.FormatSize(h.Copied), h.Errors, h.Late)
 		if h.Schedule != nil {
 			fmt.Fprintf(w, "  prefetch: %s\n", h.Schedule.String())
 		}

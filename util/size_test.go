@@ -58,3 +58,16 @@ func TestFormatSize(t *testing.T) {
 	assert.Equal(t, "1536K", FormatSize(1536*1024))
 	assert.Equal(t, "4097", FormatSize(4097))
 }
+
+func TestFormatSizeApprox(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "0", FormatSizeApprox(0))
+	assert.Equal(t, "900", FormatSizeApprox(900))
+	assert.Equal(t, "4.0K", FormatSizeApprox(4096))
+	assert.Equal(t, "1.5M", FormatSizeApprox(1536*1024))
+	assert.Equal(t, "50M", FormatSizeApprox(51520*1024))
+	assert.Equal(t, "291M", FormatSizeApprox(298368*1024))
+	assert.Equal(t, "1.7G", FormatSizeApprox(1764288*1024))
+	assert.Equal(t, "10G", FormatSizeApprox(10<<30))
+	assert.Equal(t, "2.0T", FormatSizeApprox(2<<40))
+}

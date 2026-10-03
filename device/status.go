@@ -144,6 +144,17 @@ var metrics = []metric{
 			emit("", float64(st.Hydration.Copied))
 		}
 	}},
+	{"blkmap_source_demand_reads_total", "counter", "Reads from the base source that a guest request needed (chunks not in the COW file).", func(st *Status, emit func(string, float64)) {
+		emit("", float64(st.Source.DemandReads))
+	}},
+	{"blkmap_source_demand_read_bytes_total", "counter", "Bytes a guest request needed from the base source.", func(st *Status, emit func(string, float64)) {
+		emit("", float64(st.Source.DemandBytes))
+	}},
+	{"blkmap_hydration_late_chunks_total", "counter", "Listed chunks the guest read from the source before hydration copied them.", func(st *Status, emit func(string, float64)) {
+		if st.Hydration != nil {
+			emit("", float64(st.Hydration.Late))
+		}
+	}},
 	{"blkmap_hydration_errors_total", "counter", "Failed hydration reads (retried in later passes).", func(st *Status, emit func(string, float64)) {
 		if st.Hydration != nil {
 			emit("", float64(st.Hydration.Errors))
