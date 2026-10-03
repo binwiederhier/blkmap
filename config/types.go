@@ -39,6 +39,7 @@ type Config struct {
 	COW       *COW
 	Segments  []*Segment
 	Hydrate   *Hydrate // nil: no background hydration
+	Record    *Record  // nil: no recording
 }
 
 // Hydrate configures background copying of the base into the COW file.
@@ -49,6 +50,13 @@ type Hydrate struct {
 	UseCache     string        // CacheAlways or CacheNever
 	Concurrency  int           // parallel background reads
 	ReportEvery  time.Duration // progress log interval
+}
+
+// Record configures a recording of guest I/O, the raw material of a prefetch list.
+type Record struct {
+	File        string
+	MaxDuration time.Duration
+	MaxSize     int64
 }
 
 // COW describes where writes are stored.
@@ -96,6 +104,13 @@ type rawConfig struct {
 	COW       *rawCOW       `yaml:"cow"`
 	Segments  []*rawSegment `yaml:"segments"`
 	Hydrate   *rawHydrate   `yaml:"hydrate"`
+	Record    *rawRecord    `yaml:"record"`
+}
+
+type rawRecord struct {
+	File        string `yaml:"file"`
+	MaxDuration string `yaml:"max-duration"`
+	MaxSize     string `yaml:"max-size"`
 }
 
 type rawHydrate struct {

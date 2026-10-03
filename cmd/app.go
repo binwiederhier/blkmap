@@ -17,6 +17,7 @@ func New(version, commit, date string) *cli.App {
 			cmdServe,
 			cmdValidate,
 			cmdMap,
+			cmdPrefetch,
 			cmdUdevName,
 			cmdReap,
 			cmdPin,

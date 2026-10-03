@@ -355,3 +355,17 @@ segments:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "map is not valid for raid5")
 }
+
+func TestParseRecord(t *testing.T) {
+	t.Parallel()
+	c, err := Parse("d", []byte("segments:\n  - {type: zero, size: 1M}\nrecord:\n  file: /var/lib/blkmap/d.rec\n  max-duration: 30s\n  max-size: 10M\n"))
+	require.NoError(t, err)
+	assert.Equal(t, &Record{File: "/var/lib/blkmap/d.rec", MaxDuration: 30 * time.Second, MaxSize: 10 << 20}, c.Record)
+	c, err = Parse("d", []byte("segments:\n  - {type: zero, size: 1M}\nrecord:\n  file: /x.rec\n"))
+	require.NoError(t, err)
+	assert.Equal(t, &Record{File: "/x.rec", MaxSize: DefaultRecordMaxSize}, c.Record, "no duration limit by default")
+	for _, bad := range []string{"record: {max-size: 1M}", "record: {file: /x, max-duration: -1s}", "record: {file: /x, max-duration: soon}", "record: {file: /x, max-size: 0}"} {
+		_, err := Parse("d", []byte("segments:\n  - {type: zero, size: 1M}\n"+bad+"\n"))
+		assert.Error(t, err, bad)
+	}
+}

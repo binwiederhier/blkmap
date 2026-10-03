@@ -725,3 +725,48 @@ func TestWriteback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, bytes.Repeat([]byte{7}, groupChunk), got)
 }
+
+func TestServeRecordsGuestIO(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	rec := filepath.Join(dir, "rec.rec")
+	serve := func() *Device {
+		d, err := Serve(context.Background(), &Options{
+			ID: "rec", Base: &computed{size: 8 << 20}, COWFile: filepath.Join(dir, "rec.cow"),
+			DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run"), Record: &Record{File: rec},
+		})
+		require.NoError(t, err)
+		return d
+	}
+	d := serve()
+	f, err := os.OpenFile(d.BlockPath, os.O_RDWR|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	_, err = f.ReadAt(alignedBuf(65536), 1<<20)
+	require.NoError(t, err)
+	_, err = f.WriteAt(alignedBuf(4096), 2<<20)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	st := d.Status()
+	require.NotNil(t, st.Recording)
+	assert.True(t, st.Recording.Active)
+	require.NoError(t, d.Close())
+	data, err := os.ReadFile(rec)
+	require.NoError(t, err)
+	accesses, err := source.ParseRecording(bytes.NewReader(data))
+	require.NoError(t, err)
+	var sawRead, sawWrite bool
+	for _, a := range accesses {
+		sawRead = sawRead || (!a.Write && a.Offset == 1<<20 && a.Length == 65536)
+		sawWrite = sawWrite || (a.Write && a.Offset == 2<<20 && a.Length == 4096)
+	}
+	assert.True(t, sawRead, "the guest read is recorded: %s", data)
+	assert.True(t, sawWrite, "the guest write is recorded: %s", data)
+	assert.Contains(t, string(data), "# stopped:")
+	// A restart leaves the finished recording alone
+	d = serve()
+	assert.Nil(t, d.Status().Recording)
+	require.NoError(t, d.Close())
+	again, err := os.ReadFile(rec)
+	require.NoError(t, err)
+	assert.Equal(t, data, again)
+}

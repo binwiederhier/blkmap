@@ -179,6 +179,45 @@ hydrate:
   use-cache: never
 ```
 
+### Recording a prefetch list
+
+The best prefetch list is the order a real workload first reads the device. A `record` block
+writes every guest request to a file, one `millis R|W offset length` line each, starting at
+0 when the device comes up (the kernel's partition scan included):
+
+```yaml
+record:
+  file: /var/lib/blkmap/img1.rec
+  max-duration: 60s     # stop after this; default: until the device stops
+  max-size: 16M         # stop when the file reaches this (default 16M)
+```
+
+Boot the workload once, then compact the recording into a list (reads only, each chunk once
+at its first read, chunk-aligned, consecutive chunks merged; each range keeps its first
+timestamp) and point `prefetch-list` at it:
+
+```
+$ blkmap prefetch /var/lib/blkmap/img1.rec > /etc/blkmap/img1.prefetch
+$ blkmap prefetch --stats /var/lib/blkmap/img1.rec
+requests:  46 (45 reads, 1 writes) over 27ms
+unique:    4352K read, in 21 ranges
+needed:
+  by 1s     4352K
+rate:      everything was read within the first second
+```
+
+`--stats` answers whether hydration can keep up: the list phase runs uncapped, and if the
+source delivers at least that rate the workload never waits for a chunk that is still on the
+way. A raw recording also works as a prefetch list as it is (writes skipped), just larger.
+`--chunk-size` must match the device's `cow.chunk-size` if that is not 64K.
+
+A recording file is never overwritten, so a restarted or reloaded server does not clobber
+it; delete it to record again. Recording costs about 1.5 MiB of memory and a few tens of
+nanoseconds per request while it runs, and nothing once it has stopped: requests go into a
+fixed in-memory buffer that a background goroutine writes out every second, and a burst the
+buffer cannot hold is dropped and counted (in the file's last line and `blkmap status`)
+rather than slowing the guest.
+
 HTTP sources must support Range requests (a one-byte Range request at open time checks that
 and learns the size from Content-Range, so HEAD is never needed and `validate` reports a
 server that cannot do it). Reads fetch 1 MiB aligned blocks through a small per-source LRU
@@ -322,7 +361,7 @@ builds them.
 make test        # unit tests (no root)
 make test-root   # ublk and device integration tests; needs root and ublk_drv loaded
 make stress      # e2e + fio verify workloads, ext4/xfs/btrfs, fstrim, SIGKILL under load, restarts
-make scenarios   # 36 real-life scenarios: origins that die or hang, SIGKILL mid-write and
+make scenarios   # 37 real-life scenarios: origins that die or hang, SIGKILL mid-write and
                  # mid-hydration, reloads and package upgrades under load, crash loops,
                  # changed sources, lost cow/bitmap, full disk, 8 TiB device, ...
 make test-remote HOST=ip SUITE=all       # all of the above on a scratch VM

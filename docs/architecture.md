@@ -331,6 +331,16 @@ apart. Progress every `report-every` (default 30 s):
 
 The jump from 4% to 50% is the hole scan: a 1 GiB file with 80 MiB of data.
 
+**Recording a prefetch list.** With a `record` block, `device.backend` hands every read and
+write (device offset, length, start time) to an `ioRecorder`: an append to a fixed 64K-entry
+buffer under a mutex, no allocation. A goroutine swaps the buffer every second and writes
+`millis R|W offset length` lines; a full buffer drops and counts. `max-duration`,
+`max-size` or device stop end the recording, after which the backend is back to a nil check.
+The file is created with `O_EXCL`, so restarts never clobber it. `blkmap prefetch` compacts it
+(`source.CompactRecording`: reads only, first touch per chunk, merged), `--stats` reports the
+unique bytes needed by 1/5/10/30 s and the constant rate that stays ahead, and
+`ParsePrefetch` accepts both the two-field and the four-field form.
+
 ## Device groups
 
 `device.ServeGroup` serves several devices from one process. A *router* sits in front of each
@@ -603,7 +613,7 @@ the device instead of timing out.
 | Second server on the same COW file | start refused ("in use") | nothing |
 | Config changes geometry | start refused ("chunk size mismatch" / "device size mismatch") | revert |
 
-**Testing.** `make test`, `make test-root`, `make stress`, `make scenarios` (36 scenarios with
+**Testing.** `make test`, `make test-root`, `make stress`, `make scenarios` (37 scenarios with
 leak checks), `make powercut`, `make soak` (2 h chaos), `make test-vm` (everything on a
 throwaway Proxmox VM). 0.1.1 passed `make test-vm` on Ubuntu 26.04 (7.0), 24.04 (6.8) and
 22.04 (6.8 HWE, systemd 249) and two 2 h soaks; see `docs/testing.md` and

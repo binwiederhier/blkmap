@@ -33,6 +33,14 @@ hydrate:
   concurrency: 4        # parallel background reads
   report-every: 30s     # progress line in the journal
 
+# Optional: record every guest request ("millis R|W offset length" per line) to build a
+# prefetch list from a real workload: blkmap prefetch FILE > list. Never overwritten; delete
+# the file to record again.
+#record:
+#  file: /var/lib/blkmap/example.rec
+#  max-duration: 60s    # default: until the device stops
+#  max-size: 16M        # default 16M
+
 # Segments in device order. "offset" is optional and defaults to the end of the previous
 # segment; gaps read as zeros, overlaps are an error. "size" is required for zero segments
 # and otherwise defaults to the rest of the source after "source-offset".

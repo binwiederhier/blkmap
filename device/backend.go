@@ -51,6 +51,7 @@ type backend struct {
 	errors     atomic.Int64
 	readLat    latency
 	writeLat   latency
+	rec        atomic.Pointer[ioRecorder] // nil unless a recording is running
 }
 
 // latency is a histogram over latencyBuckets, one bucket more for the overflow.
@@ -80,6 +81,7 @@ func (b *backend) ReadAt(p []byte, off int64) (int, error) {
 	start := time.Now()
 	n, err := b.store.ReadAt(p, off)
 	b.readLat.observe(time.Since(start))
+	b.record(false, off, int64(len(p)), start)
 	b.reads.Add(1)
 	b.count(&b.readBytes, n, err)
 	b.logError("read", off, len(p), err)
@@ -92,6 +94,7 @@ func (b *backend) WriteAt(p []byte, off int64) (int, error) {
 	start := time.Now()
 	n, err := b.store.WriteAt(p, off)
 	b.writeLat.observe(time.Since(start))
+	b.record(true, off, int64(len(p)), start)
 	b.writes.Add(1)
 	b.count(&b.writeBytes, n, err)
 	b.logError("write", off, len(p), err)

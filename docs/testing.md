@@ -82,7 +82,7 @@ load; cache tiers and hydration with a prefetch list; a sparse image with a map 
 (checks only the data is transferred); stop while mounted; restart churn. Results go to
 `/var/tmp/blkmap-stress/results.txt` on the VM.
 
-**scenarios** (`scripts/scenarios.sh`, 36): each runs in a subshell with a 300 s limit, asserts
+**scenarios** (`scripts/scenarios.sh`, 37): each runs in a subshell with a 300 s limit, asserts
 its outcome, and is followed by a leak check (no ublk device, `blkmap serve` process, mount or
 active unit left behind). Run a subset with `scripts/scenarios.sh NAME...` on the VM.
 

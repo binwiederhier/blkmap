@@ -25,7 +25,7 @@ journal() { journalctl -u blkmap@$1 $2 --no-pager -o cat; }
 # logged UNIT SINCE PATTERN: journald stores a dying process's last lines a moment later
 # (a here-string, not a pipe: grep -q exiting early SIGPIPEs journalctl, which pipefail reports)
 logged() { for i in $(seq 1 30); do grep -qi "$3" <<<"$(journal $1 "$2")" && return 0; sleep 0.2; done; return 1; }
-cfg() { cat > /etc/blkmap/$1.yml; rm -f /var/lib/blkmap/$1.cow /var/lib/blkmap/$1.cow.bitmap; }
+cfg() { cat > /etc/blkmap/$1.yml; rm -f /var/lib/blkmap/$1.cow /var/lib/blkmap/$1.cow.bitmap /var/lib/blkmap/$1.rec; }
 origin() { # origin PORT [args]: (re)start the http origin on PORT serving $dir
   fuser -k $1/tcp >/dev/null 2>&1 || true; sleep 0.2
   local p=$1; shift; "$rangehttpd" $dir 127.0.0.1:$p "$@" >/dev/null 2>&1 & sleep 0.3
@@ -444,6 +444,43 @@ YML
   [ "$(systemctl is-active blkmap@sc-st)" = inactive ] && ! [ -e /dev/blkmap/sc-st ] && ok sigterm_twice || bad sigterm_twice "did not exit cleanly on double SIGTERM"
   systemctl reset-failed blkmap@sc-st 2>/dev/null
 }
+sc_record_then_prefetch() {
+  # Record a workload, compact it, and hydrate exactly that on a fresh device
+  cfg sc-rec <<YML
+segments:
+  - type: file
+    path: $dir/img64
+record:
+  file: /var/lib/blkmap/sc-rec.rec
+  max-duration: 4s
+YML
+  local s=$(since); unit start sc-rec && wait_dev sc-rec || { bad record_then_prefetch "start"; return; }
+  for off in 10 30 50; do dd if=/dev/blkmap/sc-rec of=/dev/null bs=1M count=1 skip=$off iflag=direct status=none; done
+  dd if=/dev/zero of=/dev/blkmap/sc-rec bs=4k count=1 seek=1280 oflag=direct status=none
+  for i in $(seq 1 15); do logged sc-rec "$s" 'recording to .* ended' && break; sleep 1; done
+  logged sc-rec "$s" 'recording to .* ended (max-duration reached)' || { bad record_then_prefetch "recording did not end at max-duration"; unit stop sc-rec; return; }
+  blkmap status sc-rec | grep -q 'recording done' || { bad record_then_prefetch "status does not show the finished recording"; unit stop sc-rec; return; }
+  unit stop sc-rec
+  blkmap prefetch /var/lib/blkmap/sc-rec.rec > $dir/sc-rec.prefetch || { bad record_then_prefetch "compaction failed"; return; }
+  blkmap prefetch --stats /var/lib/blkmap/sc-rec.rec | sed 's/^/    /'
+  for want in 10485760 31457280 52428800; do grep -q " R $want " $dir/sc-rec.prefetch || { bad record_then_prefetch "read at $want missing from the list"; return; }; done
+  grep -q ' W ' $dir/sc-rec.prefetch && { bad record_then_prefetch "writes in the compacted list"; return; }
+  grep -q ' W 5242880 4096' /var/lib/blkmap/sc-rec.rec || { bad record_then_prefetch "the write is missing from the raw recording"; return; }
+  local chunks=$(awk '{n += $4} END {print n / 65536}' $dir/sc-rec.prefetch)
+  cfg sc-rec2 <<YML
+segments:
+  - type: file
+    path: $dir/img64
+hydrate:
+  prefetch-list: $dir/sc-rec.prefetch
+  rest: false
+YML
+  s=$(since); unit start sc-rec2 && wait_dev sc-rec2 || { bad record_then_prefetch "second start"; return; }
+  for i in $(seq 1 30); do logged sc-rec2 "$s" 'hydration done' && break; sleep 1; done
+  log "$(journal sc-rec2 "$s" | grep 'hydration done') (list has $chunks chunks)"
+  grep -q "hydration done: $chunks/1024 chunks.* 0 errors" <<<"$(journal sc-rec2 "$s")" && cmp <(dd if=/dev/blkmap/sc-rec2 bs=1M skip=30 count=1 status=none) <(dd if=$dir/img64 bs=1M skip=30 count=1 status=none) && ok record_then_prefetch || bad record_then_prefetch "hydration did not copy exactly the recorded chunks"
+  unit stop sc-rec2; rm -f /var/lib/blkmap/sc-rec.rec
+}
 sc_prefetch_beyond_end() {
   printf '60M 100M\n200M 1M\n' > $dir/pf
   cfg sc-pf <<YML
@@ -609,7 +646,7 @@ mkdir -p $dir $mnt /etc/blkmap
 [ -f $dir/img32 ] || head -c 32M /dev/urandom > $dir/img32
 baseline=$(ls /sys/class/ublk-char | wc -l)
 origin $port
-all="start_stop_cycles missing_source origin_down_at_start origin_dies_mid_flight origin_hangs_then_stop kill9_under_write_load kill9_during_hydration stop_during_hydration restart_storm_under_reads two_devices_one_cow geometry_change_refused cow_file_lost bitmap_lost cow_disk_full read_only_device bad_configs_rejected many_devices huge_device unprivileged partition_table_survives_restart fstab_mount_dependency hydration_survives_origin_outage hydration_vs_guest_writes detached_after_sources_gone stop_while_mounted rapid_restart_reuses_id sigterm_twice prefetch_beyond_end cache_tier_vanishes discard_reclaims_space reload_handoff_under_load package_upgrade_under_load origin_down_across_crash crash_loop_reaps source_changed_refused status_and_metrics"
+all="start_stop_cycles missing_source origin_down_at_start origin_dies_mid_flight origin_hangs_then_stop kill9_under_write_load kill9_during_hydration stop_during_hydration restart_storm_under_reads two_devices_one_cow geometry_change_refused cow_file_lost bitmap_lost cow_disk_full read_only_device bad_configs_rejected many_devices huge_device unprivileged partition_table_survives_restart fstab_mount_dependency hydration_survives_origin_outage hydration_vs_guest_writes detached_after_sources_gone stop_while_mounted rapid_restart_reuses_id sigterm_twice prefetch_beyond_end record_then_prefetch cache_tier_vanishes discard_reclaims_space reload_handoff_under_load package_upgrade_under_load origin_down_across_crash crash_loop_reaps source_changed_refused status_and_metrics"
 for name in ${@:-$all}; do run $name; done
 echo; echo "passed $pass, failed $fail"
 for f in "${failed[@]:-}"; do [ -n "$f" ] && echo "  $f"; done

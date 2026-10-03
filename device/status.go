@@ -55,6 +55,7 @@ type Status struct {
 	Source         cow.SourceStats    `json:"source"`
 	Cache          *source.CacheStats `json:"cache,omitempty"`
 	Hydration      *Progress          `json:"hydration,omitempty"`
+	Recording      *RecordStatus      `json:"recording,omitempty"`
 }
 
 // IOStats counts guest requests.

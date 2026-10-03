@@ -101,5 +101,12 @@ func printStatus(w io.Writer, st *device.Status) {
 	if h := st.Hydration; h != nil {
 		fmt.Fprintf(w, "  hydration %s: %d/%d chunks, %s copied, %d errors\n", h.Phase, h.Hydrated, h.Total, util.FormatSize(h.Copied), h.Errors)
 	}
+	if r := st.Recording; r != nil {
+		state := "done"
+		if r.Active {
+			state = "active"
+		}
+		fmt.Fprintf(w, "  recording %s to %s: %d requests, %d dropped\n", state, r.File, r.Requests, r.Dropped)
+	}
 	fmt.Fprintf(w, "  queues: %d (%d handing reads to workers)\n", st.Queues, st.ParallelQueues)
 }

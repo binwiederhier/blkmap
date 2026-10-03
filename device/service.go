@@ -69,6 +69,7 @@ type Options struct {
 	DevDir    string   // defaults to DevDir
 	RunDir    string   // where the ublk id is recorded; defaults to RunDir
 	Hydrate   *Hydrate // background copy of the base into the COW file; nil = off
+	Record    *Record  // recording of guest I/O for a prefetch list; nil = off
 	// Identity fingerprints the base's content; once the COW file holds writes, Serve
 	// refuses a base with another one (see cow.Options). Start fills it in from the sources;
 	// empty skips the check.
@@ -92,7 +93,8 @@ type Device struct {
 	id        string
 	base      source.Source
 	backend   *backend
-	hydrator  *hydrator // nil without hydration
+	hydrator  *hydrator   // nil without hydration
+	recorder  *ioRecorder // nil without a recording
 	started   time.Time
 	recovered bool      // re-attached to a running device
 	status    io.Closer // the status socket; nil if it could not be opened
@@ -107,6 +109,14 @@ func Start(ctx context.Context, c *config.Config, devDir string) (*Device, error
 		return nil, err
 	}
 	return startWithHydrate(ctx, c, devDir, RunDir, hydrate)
+}
+
+// recordFromConfig turns the config block into recording options.
+func recordFromConfig(r *config.Record) *Record {
+	if r == nil {
+		return nil
+	}
+	return &Record{File: r.File, MaxDuration: r.MaxDuration, MaxSize: r.MaxSize}
 }
 
 // startWithHydrate is Start with an explicit run directory and hydration plan.
@@ -137,6 +147,7 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 		DevDir:    devDir,
 		RunDir:    runDir,
 		Hydrate:   hydrate,
+		Record:    recordFromConfig(c.Record),
 		Identity:  identity,
 		Recovery:  true, // the systemd unit restarts the server
 	})
@@ -232,6 +243,8 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 	}
 	statePath := filepath.Join(o.RunDir, o.ID)
 	b := &backend{store: io, id: o.ID}
+	// The recording starts before the kernel device, so it includes the partition scan
+	rec := startRecording(o, b)
 	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery}
 	dev, err := pred.recover(o.ID, params)
 	recovered := dev != nil
@@ -239,10 +252,13 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		dev, err = ublk.Create(params)
 	}
 	if err != nil {
+		if rec != nil {
+			rec.abandon()
+		}
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
 	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev,
-		id: o.ID, base: o.Base, backend: b, started: time.Now(), recovered: recovered}
+		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered}
 	if err := os.WriteFile(filepath.Join("/sys/block", filepath.Base(dev.BlockPath), "queue", "read_ahead_kb"), []byte(strconv.Itoa(readAheadKB)), 0); err != nil {
 		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
 	}
@@ -252,6 +268,9 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 			os.Remove(d.Path)
 		}
 		dev.Close()
+		if rec != nil {
+			rec.abandon()
+		}
 		return nil, err
 	}
 	if err := announce(dev.BlockPath); err != nil {
@@ -267,6 +286,13 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		defer d.bg.Done()
 		d.flushLoop(bgCtx)
 	}()
+	if rec != nil {
+		d.bg.Add(1)
+		go func() {
+			defer d.bg.Done()
+			rec.run(bgCtx, b)
+		}()
+	}
 	if o.Hydrate != nil {
 		h := newHydrator(o.ID, store, o.Base, o.Hydrate, b.busy)
 		d.hydrator = h
@@ -277,6 +303,26 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		}()
 	}
 	return d, nil
+}
+
+// startRecording opens the recording file and attaches it to b. A file that exists is a
+// recording made earlier (or by this device before a restart) and is left alone; failures
+// only cost the recording, never the device.
+func startRecording(o *Options, b *backend) *ioRecorder {
+	if o.Record == nil {
+		return nil
+	}
+	r, err := newRecorder(o.ID, o.Record.File, o.Record, time.Now(), recordBuffer)
+	if errors.Is(err, os.ErrExist) {
+		log.Printf("%s: recording %s exists, not recording again (delete it to record anew)", o.ID, o.Record.File)
+		return nil
+	} else if err != nil {
+		log.Printf("%s: cannot record to %s: %s", o.ID, o.Record.File, err.Error())
+		return nil
+	}
+	log.Printf("%s: recording guest I/O to %s", o.ID, o.Record.File)
+	b.rec.Store(r)
+	return r
 }
 
 // defaults fills in the zero-value options.
@@ -482,6 +528,10 @@ func (d *Device) Status() *Status {
 	if d.hydrator != nil {
 		p := d.hydrator.progress()
 		st.Hydration = &p
+	}
+	if d.recorder != nil {
+		rs := d.recorder.status()
+		st.Recording = &rs
 	}
 	return st
 }

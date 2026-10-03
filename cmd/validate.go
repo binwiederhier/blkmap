@@ -46,6 +46,13 @@ func execValidate(c *cli.Context) error {
 		}
 		fmt.Fprintf(c.App.Writer, "Hydrate: %s\n", line)
 	}
+	if r := conf.Record; r != nil {
+		limit := "until stopped"
+		if r.MaxDuration > 0 {
+			limit = "for " + r.MaxDuration.String()
+		}
+		fmt.Fprintf(c.App.Writer, "Record:  %s, %s, at most %s\n", r.File, limit, util.FormatSize(r.MaxSize))
+	}
 	fmt.Fprintf(c.App.Writer, "Layout:\n")
 	w := tabwriter.NewWriter(c.App.Writer, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "  OFFSET\tSIZE\tSOURCE\n")

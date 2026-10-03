@@ -102,6 +102,9 @@ func Parse(id string, content []byte) (*Config, error) {
 	if c.Hydrate, err = parseHydrate(raw.Hydrate); err != nil {
 		return nil, err
 	}
+	if c.Record, err = parseRecord(raw.Record); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -321,6 +324,35 @@ func parseHydrate(raw *rawHydrate) (*Hydrate, error) {
 	return h, nil
 }
 
+// parseRecord applies the defaults and validates the record block; nil means off.
+func parseRecord(raw *rawRecord) (*Record, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if raw.File == "" {
+		return nil, fmt.Errorf("%w: record.file is required", errConfig)
+	}
+	r := &Record{File: raw.File}
+	if raw.MaxDuration != "" {
+		d, err := time.ParseDuration(raw.MaxDuration)
+		if err != nil {
+			return nil, fmt.Errorf("%w: record.max-duration: %w", errConfig, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("%w: record.max-duration must be positive", errConfig)
+		}
+		r.MaxDuration = d
+	}
+	var err error
+	if r.MaxSize, err = parseSize("record.max-size", raw.MaxSize, DefaultRecordMaxSize); err != nil {
+		return nil, err
+	}
+	if r.MaxSize <= 0 {
+		return nil, fmt.Errorf("%w: record.max-size must be positive", errConfig)
+	}
+	return r, nil
+}
+
 // parseSize parses an optional size field, falling back to def when the field is empty.
 func parseSize(field, value string, def int64) (int64, error) {
 	if value == "" {
@@ -340,4 +372,6 @@ const (
 	DefaultHydrateConcurrency = 4
 	// DefaultHydrateReport is how often hydration progress is logged.
 	DefaultHydrateReport = 30 * time.Second
+	// DefaultRecordMaxSize bounds a recording file.
+	DefaultRecordMaxSize = 16 << 20
 )
