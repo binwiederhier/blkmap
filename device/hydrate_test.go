@@ -175,25 +175,7 @@ func TestHydratorRateAndBusy(t *testing.T) {
 	assert.Greater(t, time.Since(start), 1200*time.Millisecond)
 	assert.Less(t, time.Since(start), 3*time.Second)
 	assert.Equal(t, s.Chunks(), s.Written())
-	// Busy guest: nothing happens until it goes idle
-	base2 := &recorder{data: pat(hSize)}
-	s2 := newHydrateStore(t, base2)
-	var busy atomic.Bool
-	busy.Store(true)
-	done := make(chan struct{})
-	go func() {
-		newHydrator("h", s2, base2, &Hydrate{Rest: true}, busy.Load).run(context.Background())
-		close(done)
-	}()
-	time.Sleep(200 * time.Millisecond)
-	assert.Equal(t, int64(0), s2.Written())
-	busy.Store(false)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("hydration did not resume after the guest went idle")
-	}
-	assert.Equal(t, s2.Chunks(), s2.Written())
+	// A busy guest slows hydration down but never stops it: TestHydratorShare
 }
 
 func TestHydratorCancel(t *testing.T) {
@@ -383,4 +365,69 @@ func TestHydratorDoesNotRetryAfterCancel(t *testing.T) {
 	h.retryDelay = time.Millisecond
 	h.run(ctx)
 	assert.NotContains(t, out.String(), "retrying", "reads failing because the device stops are not a pass to retry")
+}
+
+// gauge is a base that tracks how many reads run at once.
+type gauge struct {
+	recorder
+	cur, peak atomic.Int32
+}
+
+func (g *gauge) ReadAt(p []byte, off int64) (int, error) {
+	n := g.cur.Add(1)
+	for p := g.peak.Load(); n > p && !g.peak.CompareAndSwap(p, n); p = g.peak.Load() {
+	}
+	time.Sleep(20 * time.Millisecond)
+	g.cur.Add(-1)
+	return g.recorder.ReadAt(p, off)
+}
+
+// TestHydratorShare: an idle guest gets hydration at full concurrency; a busy guest leaves it
+// one read in flight (never zero, so it always finishes), or half its workers while the
+// prefetch list is behind the recording.
+func TestHydratorShare(t *testing.T) {
+	t.Parallel()
+	// Every other chunk listed: separate batches, so concurrency is observable
+	var list []source.Range
+	for c := int64(0); c < 64; c += 2 {
+		list = append(list, source.Range{Offset: c * hChunk, Length: hChunk})
+	}
+	at := func(d time.Duration) []time.Duration {
+		out := make([]time.Duration, len(list))
+		for i := range out {
+			out[i] = d
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name     string
+		busy     bool
+		at       []time.Duration
+		wantPeak int32
+	}{
+		{"idle guest: all workers", false, nil, 4},
+		{"busy guest, untimed list: one", true, nil, 1},
+		{"busy guest, list ahead: one", true, at(time.Hour), 1},
+		{"busy guest, list behind: half", true, at(0), 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := &gauge{recorder: recorder{data: pat(hSize)}}
+			s := newHydrateStore(t, base)
+			busy := func() bool { return tc.busy }
+			h := newHydrator("h", s, base, &Hydrate{Prefetch: list, PrefetchAt: tc.at, Rest: true, Concurrency: 4}, busy)
+			done := make(chan struct{})
+			go func() {
+				h.run(context.Background())
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(20 * time.Second):
+				t.Fatal("hydration starved")
+			}
+			assert.Equal(t, s.Chunks(), s.Written(), "everything is hydrated even with a busy guest")
+			assert.Equal(t, tc.wantPeak, base.peak.Load())
+		})
+	}
 }

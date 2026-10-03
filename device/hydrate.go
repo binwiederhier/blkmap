@@ -15,9 +15,11 @@ import (
 )
 
 const (
-	// hydrateBackoff is how long after the last guest request hydration stays paused.
+	// hydrateBackoff is how long after its last request the guest still counts as active.
 	hydrateBackoff = 100 * time.Millisecond
-	hydratePoll    = 50 * time.Millisecond
+	hydratePoll    = 10 * time.Millisecond
+	// behindCheck is how often the share re-checks whether the prefetch list is behind.
+	behindCheck = 250 * time.Millisecond
 	// holeWindow bounds one Holes query, so a huge sparse device does not produce one giant
 	// range list up front.
 	holeWindow = 4 << 30
@@ -34,8 +36,9 @@ const (
 )
 
 // Hydrate configures background copying of the base into the COW file, so the device
-// eventually needs no source at all. Guest I/O always has priority: hydration pauses while
-// requests are in flight or arrived in the last hydrateBackoff.
+// eventually needs no source at all. Guest I/O has priority without starving hydration: while
+// the guest is active (requests in flight or within hydrateBackoff) hydration keeps one copy
+// running, or half its workers while a timed prefetch list is behind the recording.
 type Hydrate struct {
 	Prefetch []source.Range // hydrated first, in order, as fast as possible
 	// PrefetchAt is when the recorded workload first read each Prefetch range (from a
@@ -102,6 +105,9 @@ type hydrator struct {
 	start        time.Time        // when the device came up, the recording's time zero
 	now          func() time.Time // time.Now, or a test clock
 	listDoneLead atomic.Pointer[time.Duration]
+	inflight     atomic.Int64 // copies running now
+	behindAt     atomic.Int64 // unix nanos of the last behind() check
+	isBehind     atomic.Bool
 }
 
 // batch is a run of consecutive chunks handed to a worker: zero chunks are marked, unwritten
@@ -227,7 +233,7 @@ func (h *hydrator) process(ctx context.Context, phase string, next func(yield fu
 		go func() {
 			defer wg.Done()
 			for b := range work {
-				h.handle(ctx, b, limiter)
+				h.handle(ctx, b, limiter, phase)
 			}
 		}()
 	}
@@ -266,10 +272,9 @@ func (h *hydrator) process(ctx context.Context, phase string, next func(yield fu
 	wg.Wait()
 }
 
-func (h *hydrator) handle(ctx context.Context, b batch, limiter *bucket) {
-	if !h.waitIdle(ctx) {
-		return
-	}
+// handle hydrates one batch: zero runs are marked at once, copies wait for a slot in the
+// share the guest leaves to hydration (see share).
+func (h *hydrator) handle(ctx context.Context, b batch, limiter *bucket, phase string) {
 	if b.zero {
 		for c := b.first; c < b.first+b.count; c++ {
 			h.store.MarkZero(c)
@@ -279,6 +284,10 @@ func (h *hydrator) handle(ctx context.Context, b batch, limiter *bucket) {
 	if limiter != nil && !limiter.wait(ctx, b.count*h.store.ChunkSize()) {
 		return
 	}
+	if !h.admit(ctx, phase) {
+		return
+	}
+	defer h.inflight.Add(-1)
 	copied, err := h.store.HydrateRun(b.first, b.count, h.opts.UseCache == config.CacheNever)
 	h.copied.Add(copied)
 	if err != nil {
@@ -288,16 +297,46 @@ func (h *hydrator) handle(ctx context.Context, b batch, limiter *bucket) {
 	}
 }
 
-// waitIdle blocks while the guest is active; it returns false if ctx ended meanwhile.
-func (h *hydrator) waitIdle(ctx context.Context) bool {
-	for h.busy() {
+// share is how many copies may be in flight now. Guest requests come first, but hydration
+// never stops: an idle guest leaves it all its workers, a busy one leaves it one, or half of
+// them while the prefetch list is behind the recording, since those chunks are the guest's
+// own next reads and every one hydration is late for becomes a slow on-demand read.
+func (h *hydrator) share(phase string) int64 {
+	n := int64(h.opts.Concurrency)
+	switch {
+	case !h.busy():
+		return n
+	case phase == phaseList && h.behind():
+		return max(n/2, 1)
+	default:
+		return 1
+	}
+}
+
+// admit waits for a slot in the share; it returns false if ctx ended first.
+func (h *hydrator) admit(ctx context.Context, phase string) bool {
+	for {
+		n := h.inflight.Load()
+		if n < h.share(phase) && h.inflight.CompareAndSwap(n, n+1) {
+			return true
+		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-time.After(hydratePoll):
 		}
 	}
-	return true
+}
+
+// behind reports whether the timed prefetch list is behind the recording, re-checked at most
+// every behindCheck (it walks the whole list).
+func (h *hydrator) behind() bool {
+	now := h.now().UnixNano()
+	if last := h.behindAt.Load(); now-last >= int64(behindCheck) && h.behindAt.CompareAndSwap(last, now) {
+		s := h.schedule()
+		h.isBehind.Store(s != nil && s.Behind > 0)
+	}
+	return h.isBehind.Load()
 }
 
 func (h *hydrator) reportLoop(ctx context.Context) {

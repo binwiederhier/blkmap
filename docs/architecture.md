@@ -317,8 +317,10 @@ chunks the guest wrote meanwhile.
 List phase (prefetch ranges, in order, full speed), then rest phase (everything else,
 ascending, paced by `rate` with a token bucket) unless `rest: false`. A hole scan in 4 GiB
 windows marks hole chunks with `MarkZero` first. Consecutive same-kind chunks form batches of
-up to 1 MiB handed to `concurrency` workers (default 4). A worker waits while any guest
-request is in flight or finished within the last 100 ms; a chunk the guest wrote is skipped.
+up to 1 MiB handed to `concurrency` workers (default 4). Guest requests come first without starving
+hydration: while the guest is active (a request in flight or within 100 ms) at most one copy
+runs, or half the workers while a timed list is behind the recording; an idle guest gets all
+of them (`hydrator.share`/`admit`). A chunk the guest wrote is skipped.
 `use-cache: never` reads around cache tiers. Failed runs are retried in up to 5 passes 10 s
 apart. Progress every `report-every` (default 30 s):
 

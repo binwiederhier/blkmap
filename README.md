@@ -163,10 +163,15 @@ segments:
 
 With a `hydrate` block, blkmap copies the base into the COW file in the background, so the
 device eventually serves everything locally and, once every chunk is there, no longer opens
-its sources on start. Guest I/O always has priority: hydration pauses while requests are in
-flight or arrived in the last 100 ms. A prefetch list (`offset length` per line, highest
-priority first) is copied at full speed; the rest follows at the configured rate, or not at
-all with `rest: false`. `use-cache: never` sends background reads straight to the slow tier.
+its sources on start. A prefetch list (`offset length` per line, highest priority first) is
+copied first, the rest follows at the configured rate, or not at all with `rest: false`.
+
+Guest requests come first, but hydration is never starved: while the guest is active (a
+request in flight or within the last 100 ms) hydration keeps one copy running, and half of
+its workers while a timed prefetch list is behind the recording, since those chunks are the
+guest's own next reads. An idle guest leaves hydration all its workers. Measured on a
+recorded Ubuntu boot from a 10 MB/s mirror, pausing hydration entirely took 86 s, this share
+73 s; from a 60 MB/s mirror it stays within noise of the 20 s local boot. `use-cache: never` sends background reads straight to the slow tier.
 Ranges known to be zeros (zero segments, gaps) are marked without being copied. Background
 reads run `concurrency` at a time (default 4; more helps a high-latency source). Progress
 goes to the journal every `report-every` (default 30s).
