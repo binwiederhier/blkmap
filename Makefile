@@ -1,7 +1,7 @@
 MAKEFLAGS := --jobs=1
 VERSION := $(shell git describe --tag 2>/dev/null || echo dev)
 
-.PHONY: help build test test-root stress scenarios test-remote powercut test-vm examples vet fmt release release-snapshot install-deb clean
+.PHONY: help build test test-root stress scenarios test-remote powercut soak test-vm examples vet fmt release release-snapshot install-deb clean
 
 help:
 	@echo "blkmap"
@@ -12,6 +12,7 @@ help:
 	@echo "  make scenarios        - real-life scenarios: crashes, outages, restarts, bad configs (root, deb, fio)"
 	@echo "  make test-remote HOST=ip [SUITE=stress|scenarios|all] - root suites (+workloads) on a scratch VM"
 	@echo "  make powercut HOST=ip [CYCLES=10] [MODE=power|kill]  - power-cut or daemon-kill cycles on a scratch VM"
+	@echo "  make soak HOST=ip [MINUTES=120]  - verified I/O under chaos for hours, with leak sampling"
 	@echo "  make test-vm          - everything above on a throwaway Proxmox VM (PROXMOX=root@box11 TEMPLATE=9000)"
 	@echo "  make examples         - vet, test and build everything under examples/"
 	@echo "  make release-snapshot - Build debs/rpms/tarballs into dist/ via goreleaser (no tag needed)"
@@ -48,6 +49,10 @@ test-remote:
 # Power-loss (sysrq reboot) or daemon-kill cycles under write load (HOST=... ; reboots it)
 powercut:
 	scripts/powercut.sh $(HOST) $(or $(CYCLES),10) $(or $(MODE),power)
+
+# Verified I/O under chaos (kills, reloads, origin outages) for MINUTES, with leak sampling
+soak:
+	scripts/soak.sh $(HOST) $(or $(MINUTES),120)
 
 # The full root-level suite on a VM created for the run and destroyed after it
 test-vm:

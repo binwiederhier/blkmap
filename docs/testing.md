@@ -17,6 +17,7 @@ the COW store, device lifecycle, packaging or the unit files, and record the out
 | Real-life scenarios | `make test-remote HOST=ip SUITE=scenarios` | same | 6 min |
 | Daemon kills under a verifying writer | `make powercut HOST=ip MODE=kill CYCLES=5` | same | 2 min |
 | Power cuts under a verifying writer | `make powercut HOST=ip MODE=power CYCLES=10` | same; reboots the VM | 4 min |
+| Soak: verified I/O under chaos for hours | `make soak HOST=ip MINUTES=120` | same | 2 h |
 
 Never run the root-level layers on a workstation. A bug in the ublk transport can wedge a
 kernel until reboot, and the power-cut test reboots the machine on purpose.
@@ -28,6 +29,8 @@ kernel until reboot, and the power-cut test reboots the machine on purpose.
 - Before merging anything that touches `ublk/`, `cow/`, `device/`, `cmd/serve.go`, the unit
   files or the maintainer scripts: `make test-vm`. It is the only gate for crash recovery,
   durability, upgrades and systemd behaviour.
+- Before a release, and after changes to recovery, handoff or hydration: `make soak` for two
+  hours on each kernel, one VM at a time or at least never alongside `make test-vm`.
 - After a kernel or systemd upgrade on the target fleet: `make test-vm` with a template that
   runs that kernel (`TEMPLATE=...`). On box11, template 9000 is Ubuntu 26.04 (kernel 7.0) and
   9002 is Ubuntu 24.04 (kernel 6.8, systemd 255); run both before a release.
@@ -103,6 +106,19 @@ mapped to it, and that only slots with an unacknowledged write in flight may be 
 mode the daemon is SIGKILLed three times per cycle while the writer runs; the writer must
 never see an error, and the same verification runs.
 
+**soak** (`scripts/soak.sh`, `scripts/soak-vm.sh`): four devices for the whole run.
+`sk-fs` (ext4) and `sk-raw` (file base) take fio random writes with continuous verification,
+`sk-http` hydrates from an HTTP origin while a reader checks random blocks against the image,
+and `sk-leak` takes the same steady load but is never disturbed. Every one to three minutes a
+chaos action hits one of the first three: SIGKILL of the server, `systemctl reload`, an origin
+outage of 15 to 40 s, or a page cache drop; after each, every device must be served again
+within a minute. Every minute the servers' memory, descriptors and threads are sampled into
+`metrics.csv`. It fails on any verify error, a wrong byte, a device not served after chaos, an
+unclean fsck at the end, or `sk-leak` growing past 1.5x its memory at 10 minutes (plus 20 MB),
+10 descriptors or 20 threads. The fio writers are capped at 150 IOPS each: the soak is about
+time and chaos, and uncapped random writes into fresh chunks amplify through copy-up enough to
+saturate a shared host disk, which then measures the host.
+
 ## Adding a scenario
 
 Add a `sc_<name>` function to `scripts/scenarios.sh` before `# --- main` and its name to the
@@ -127,6 +143,6 @@ the verdict. Clean up everything the scenario started; the leak check fails it o
 
 - systemd older than 254, where `RestartMode=direct` is ignored and the reap unit relies on
   its 3 second check.
-- Long soak runs (hours to days of mixed I/O with source flaps and restarts).
+- Soak runs longer than two hours (days).
 - Fuzzing of the config, map and range parsers and of HTTP replies.
 - RAID-5 against a real Windows dynamic disk set.

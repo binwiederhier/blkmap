@@ -322,6 +322,7 @@ make scenarios   # 36 real-life scenarios: origins that die or hang, SIGKILL mid
                  # changed sources, lost cow/bitmap, full disk, 8 TiB device, ...
 make test-remote HOST=ip SUITE=all       # all of the above on a scratch VM
 make powercut HOST=ip MODE=power|kill    # power cuts / daemon kills under a verifying writer
+make soak HOST=ip MINUTES=120            # hours of verified I/O under kills, reloads, outages
 make test-vm     # everything, on a VM created for the run and destroyed after it
 make vet
 ```
