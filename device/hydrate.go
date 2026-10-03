@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -36,7 +37,11 @@ const (
 // eventually needs no source at all. Guest I/O always has priority: hydration pauses while
 // requests are in flight or arrived in the last hydrateBackoff.
 type Hydrate struct {
-	Prefetch    []source.Range // hydrated first, in order, as fast as possible
+	Prefetch []source.Range // hydrated first, in order, as fast as possible
+	// PrefetchAt is when the recorded workload first read each Prefetch range (from a
+	// recording's timestamps), so progress can say whether hydration is ahead of the
+	// workload or behind it; empty for an untimed list.
+	PrefetchAt  []time.Duration
 	Rest        bool           // then everything else, paced by Rate
 	Rate        int64          // bytes/s for the rest phase; 0 = unlimited
 	UseCache    string         // config.CacheAlways (default) or config.CacheNever for the background reads
@@ -54,22 +59,49 @@ type Progress struct {
 	Copied   int64  // bytes copied by this run so far
 	Errors   int64  // failed background reads so far (each is retried in a later pass)
 	Done     bool
+	Schedule *Schedule `json:"schedule,omitempty"` // nil without a timed prefetch list
+}
+
+// Schedule compares hydration with a timed prefetch list: the list says when the recorded
+// workload first read each range, counted from when the device came up, and hydration is
+// behind when a range that was due is not in the COW file yet.
+type Schedule struct {
+	Behind   int64         // listed chunks due by now but not in the COW file
+	Lead     time.Duration // ahead (> 0) or behind (< 0) the recording; frozen once the list is complete
+	ListDone bool          // every listed chunk is in the COW file
+}
+
+func (s *Schedule) String() string {
+	lead := s.Lead.Round(100 * time.Millisecond)
+	switch {
+	case s.ListDone && lead >= 0:
+		return fmt.Sprintf("prefetch list complete, %s before the recording needed the last of it", lead)
+	case s.ListDone:
+		return fmt.Sprintf("prefetch list complete, %s after the recording needed the last of it", -lead)
+	case s.Behind > 0:
+		return fmt.Sprintf("behind the recording by %s (%d chunks due)", -lead, s.Behind)
+	default:
+		return fmt.Sprintf("%s ahead of the recording", lead)
+	}
 }
 
 // hydrator runs the background copy. It is driven entirely by the Store's chunk primitives
 // and a busy predicate, so it can be tested without a kernel device.
 type hydrator struct {
-	store      *cow.Store
-	base       source.Source
-	opts       *Hydrate
-	busy       func() bool
-	id         string
-	zero       *util.Bitset // chunks that read as zeros: marked, never copied
-	phase      atomic.Pointer[string]
-	copied     atomic.Int64
-	errors     atomic.Int64
-	limiter    *bucket
-	retryDelay time.Duration
+	store        *cow.Store
+	base         source.Source
+	opts         *Hydrate
+	busy         func() bool
+	id           string
+	zero         *util.Bitset // chunks that read as zeros: marked, never copied
+	phase        atomic.Pointer[string]
+	copied       atomic.Int64
+	errors       atomic.Int64
+	limiter      *bucket
+	retryDelay   time.Duration
+	start        time.Time        // when the device came up, the recording's time zero
+	now          func() time.Time // time.Now, or a test clock
+	listDoneLead atomic.Pointer[time.Duration]
 }
 
 // batch is a run of consecutive chunks handed to a worker: zero chunks are marked, unwritten
@@ -90,7 +122,8 @@ func newHydrator(id string, store *cow.Store, base source.Source, opts *Hydrate,
 	if o.UseCache == "" {
 		o.UseCache = config.CacheAlways
 	}
-	h := &hydrator{store: store, base: base, opts: &o, busy: busy, id: id, zero: util.NewBitset(store.Chunks()), retryDelay: hydrateRetryDelay}
+	h := &hydrator{store: store, base: base, opts: &o, busy: busy, id: id, zero: util.NewBitset(store.Chunks()), retryDelay: hydrateRetryDelay,
+		start: time.Now(), now: time.Now}
 	if o.Rate > 0 {
 		h.limiter = newBucket(o.Rate, max(hydrateRunBytes, store.ChunkSize()))
 	}
@@ -112,7 +145,7 @@ func (h *hydrator) run(ctx context.Context) {
 		before := h.errors.Load()
 		h.pass(ctx)
 		failed := h.errors.Load() - before
-		if failed == 0 || pass == hydrateMaxPasses {
+		if failed == 0 || pass == hydrateMaxPasses || ctx.Err() != nil {
 			break
 		}
 		log.Printf("%s: hydration pass %d: %d reads failed, retrying in %s", h.id, pass, failed, h.retryDelay)
@@ -276,7 +309,11 @@ func (h *hydrator) reportLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			p := h.progress()
-			log.Printf("%s: hydration %s: %d/%d chunks (%d%%), %s copied", h.id, p.Phase, p.Hydrated, p.Total, 100*p.Hydrated/max(p.Total, 1), util.FormatSize(p.Copied))
+			line := fmt.Sprintf("%s: hydration %s: %d/%d chunks (%d%%), %s copied", h.id, p.Phase, p.Hydrated, p.Total, 100*p.Hydrated/max(p.Total, 1), util.FormatSize(p.Copied))
+			if p.Schedule != nil {
+				line += "; " + p.Schedule.String()
+			}
+			log.Print(line)
 			if h.opts.OnProgress != nil {
 				h.opts.OnProgress(p)
 			}
@@ -291,7 +328,53 @@ func (h *hydrator) progress() Progress {
 		p.Phase = *phase
 	}
 	p.Done = p.Phase == phaseDone
+	p.Schedule = h.schedule()
 	return p
+}
+
+// schedule compares the listed chunks in the COW file with when the recording read them;
+// nil without a timed list. It walks the whole list, which is cheap next to a report.
+func (h *hydrator) schedule() *Schedule {
+	at := h.opts.PrefetchAt
+	if len(at) == 0 || len(at) != len(h.opts.Prefetch) {
+		return nil
+	}
+	if done := h.listDoneLead.Load(); done != nil {
+		return &Schedule{Lead: *done, ListDone: true}
+	}
+	elapsed := h.now().Sub(h.start)
+	chunkSize, chunks := h.store.ChunkSize(), h.store.Chunks()
+	s := &Schedule{}
+	oldest, next, last := time.Duration(-1), time.Duration(-1), time.Duration(0)
+	for i, r := range h.opts.Prefetch {
+		last = max(last, at[i])
+		var missing int64
+		for c := r.Offset / chunkSize; c <= min((r.Offset+r.Length-1)/chunkSize, chunks-1); c++ {
+			if !h.store.IsWritten(c) {
+				missing++
+			}
+		}
+		switch {
+		case missing == 0:
+		case at[i] <= elapsed:
+			s.Behind += missing
+			if oldest < 0 || at[i] < oldest {
+				oldest = at[i]
+			}
+		case next < 0 || at[i] < next:
+			next = at[i]
+		}
+	}
+	switch {
+	case s.Behind > 0:
+		s.Lead = oldest - elapsed
+	case next >= 0:
+		s.Lead = next - elapsed
+	default:
+		s.ListDone, s.Lead = true, last-elapsed
+		h.listDoneLead.CompareAndSwap(nil, &s.Lead)
+	}
+	return s
 }
 
 func (h *hydrator) setPhase(phase string) {

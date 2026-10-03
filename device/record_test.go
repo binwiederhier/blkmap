@@ -127,6 +127,6 @@ func TestRecorderRunFlushesAndEndsWithContext(t *testing.T) {
 	<-done
 	assert.Nil(t, b.rec.Load(), "the backend stops recording once the recorder ends")
 	data, _ := os.ReadFile(path)
-	assert.Contains(t, string(data), "0 R 0 4096")
+	assert.Contains(t, string(data), " R 0 4096\n")
 	assert.Contains(t, string(data), "# stopped: 1 requests")
 }

@@ -149,6 +149,16 @@ var metrics = []metric{
 			emit("", float64(st.Hydration.Errors))
 		}
 	}},
+	{"blkmap_hydration_lead_seconds", "gauge", "How far hydration is ahead of (> 0) or behind (< 0) a timed prefetch list.", func(st *Status, emit func(string, float64)) {
+		if st.Hydration != nil && st.Hydration.Schedule != nil {
+			emit("", st.Hydration.Schedule.Lead.Seconds())
+		}
+	}},
+	{"blkmap_hydration_behind_chunks", "gauge", "Listed chunks the recording had read by now that hydration has not copied yet.", func(st *Status, emit func(string, float64)) {
+		if st.Hydration != nil && st.Hydration.Schedule != nil {
+			emit("", float64(st.Hydration.Schedule.Behind))
+		}
+	}},
 	{"blkmap_hydration_done", "gauge", "Hydration has ended.", func(st *Status, emit func(string, float64)) {
 		if st.Hydration != nil {
 			emit("", boolValue(st.Hydration.Done))

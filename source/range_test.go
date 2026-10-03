@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -104,4 +105,16 @@ func TestAppendAccess(t *testing.T) {
 	assert.Equal(t, "12 R 4096 65536\n13 W 0 512\n", string(b))
 	buf := make([]byte, 0, 64)
 	assert.Zero(t, testing.AllocsPerRun(100, func() { AppendAccess(buf[:0], Access{Millis: 1, Offset: 2, Length: 3}) }))
+}
+
+func TestParsePrefetchTimed(t *testing.T) {
+	t.Parallel()
+	ranges, at, err := ParsePrefetchTimed(strings.NewReader("0 R 0 4096\n3 W 8192 4096\n1500 R 1M 64K\n"))
+	require.NoError(t, err)
+	assert.Equal(t, []Range{{0, 4096}, {1 << 20, 64 << 10}}, ranges)
+	assert.Equal(t, []time.Duration{0, 1500 * time.Millisecond}, at, "a recording's timestamps come along")
+	ranges, at, err = ParsePrefetchTimed(strings.NewReader("0 4096\n100 R 1M 64K\n"))
+	require.NoError(t, err)
+	assert.Len(t, ranges, 2)
+	assert.Nil(t, at, "one untimed line makes the whole list untimed")
 }

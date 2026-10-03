@@ -377,7 +377,7 @@ func hydrateFromConfig(h *config.Hydrate) (*Hydrate, error) {
 	plan := &Hydrate{Rest: h.Rest, Rate: h.Rate, UseCache: h.UseCache, Concurrency: h.Concurrency, Report: h.ReportEvery}
 	if h.PrefetchList != "" {
 		var err error
-		if plan.Prefetch, err = source.ParsePrefetchFile(h.PrefetchList); err != nil {
+		if plan.Prefetch, plan.PrefetchAt, err = source.ParsePrefetchFileTimed(h.PrefetchList); err != nil {
 			return nil, err
 		}
 	}

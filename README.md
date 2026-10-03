@@ -211,6 +211,21 @@ source delivers at least that rate the workload never waits for a chunk that is 
 way. A raw recording also works as a prefetch list as it is (writes skipped), just larger.
 `--chunk-size` must match the device's `cow.chunk-size` if that is not 64K.
 
+A recording, raw or compacted, carries timestamps, so hydration from it can tell whether it
+keeps up. Each progress line compares the COW file with when the recorded workload first
+read each listed chunk, counted from when the device came up:
+
+```
+vm: hydration list: 1275/57344 chunks (2%), 77696K copied; 1.8s ahead of the recording
+vm: hydration list: 2494/57344 chunks (4%), 150720K copied; behind the recording by 1.6s (623 chunks due)
+vm: hydration rest: 8958/57344 chunks (15%), 311360K copied; prefetch list complete, 1.2s after the recording needed the last of it
+```
+
+`blkmap status` shows the same as a `prefetch:` line, and metrics as
+`blkmap_hydration_lead_seconds` and `blkmap_hydration_behind_chunks`. Chunks the guest read
+on demand count as behind until hydration copies them, since demand reads do not land in the
+COW file.
+
 A recording file is never overwritten, so a restarted or reloaded server does not clobber
 it; delete it to record again. Recording costs about 1.5 MiB of memory and a few tens of
 nanoseconds per request while it runs, and nothing once it has stopped: requests go into a

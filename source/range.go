@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"heckel.io/blkmap/util"
 )
@@ -31,7 +32,17 @@ type Range struct {
 // offset length", see ParseRecording) are accepted too, reads only, so a recording works
 // as a prefetch list as it is; hydration copies each chunk once anyway.
 func ParsePrefetch(r io.Reader) ([]Range, error) {
+	ranges, _, err := ParsePrefetchTimed(r)
+	return ranges, err
+}
+
+// ParsePrefetchTimed is ParsePrefetch that also returns when the recorded workload first
+// read each range, when every line carries a timestamp (a recording, raw or compacted);
+// otherwise the times are nil.
+func ParsePrefetchTimed(r io.Reader) ([]Range, []time.Duration, error) {
 	var ranges []Range
+	var at []time.Duration
+	timed := true
 	err := scanLines(r, "prefetch list", func(fields []string) error {
 		switch len(fields) {
 		case 2:
@@ -40,6 +51,7 @@ func ParsePrefetch(r io.Reader) ([]Range, error) {
 				return err
 			}
 			ranges = append(ranges, rg)
+			timed = false
 		case 4:
 			a, err := parseAccess(fields)
 			if err != nil {
@@ -47,6 +59,7 @@ func ParsePrefetch(r io.Reader) ([]Range, error) {
 			}
 			if !a.Write {
 				ranges = append(ranges, Range{Offset: a.Offset, Length: a.Length})
+				at = append(at, time.Duration(a.Millis)*time.Millisecond)
 			}
 		default:
 			return errors.New(`expected "offset length" or "millis R|W offset length"`)
@@ -56,7 +69,13 @@ func ParsePrefetch(r io.Reader) ([]Range, error) {
 		}
 		return nil
 	})
-	return ranges, err
+	if err != nil {
+		return nil, nil, err
+	}
+	if !timed {
+		at = nil
+	}
+	return ranges, at, nil
 }
 
 // parseRanges reads "offset length" lines; what names the file kind in errors.
@@ -133,6 +152,20 @@ func parseAccess(fields []string) (Access, error) {
 		return Access{}, err
 	}
 	return Access{Millis: millis, Write: write, Offset: rg.Offset, Length: rg.Length}, nil
+}
+
+// ParsePrefetchFileTimed is ParsePrefetchTimed on a file.
+func ParsePrefetchFileTimed(path string) ([]Range, []time.Duration, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	ranges, at, err := ParsePrefetchTimed(f)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return ranges, at, nil
 }
 
 // ParsePrefetchFile is ParsePrefetch on a file.

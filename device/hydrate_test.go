@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -319,4 +321,66 @@ func TestDetachAndHaltDoNotWaitOnBlockedHydration(t *testing.T) {
 			base.Abort()
 		})
 	}
+}
+
+func TestHydratorSchedule(t *testing.T) {
+	t.Parallel()
+	base := &recorder{data: pat(hSize)}
+	s := newHydrateStore(t, base)
+	start := time.Now()
+	now := start
+	h := newHydrator("h", s, base, &Hydrate{
+		Prefetch:   []source.Range{{Offset: 0, Length: hChunk}, {Offset: hChunk, Length: 2 * hChunk}, {Offset: 5 * hChunk, Length: hChunk}},
+		PrefetchAt: []time.Duration{0, time.Second, 3 * time.Second},
+	}, idle)
+	h.start, h.now = start, func() time.Time { return now }
+	_, err := s.HydrateRun(0, 1, false)
+	require.NoError(t, err)
+	// At 2 s, chunks 1 and 2 were needed a second ago and are not there yet
+	now = start.Add(2 * time.Second)
+	sch := h.progress().Schedule
+	require.NotNil(t, sch)
+	assert.Equal(t, int64(2), sch.Behind)
+	assert.Equal(t, -time.Second, sch.Lead)
+	assert.Equal(t, "behind the recording by 1s (2 chunks due)", sch.String())
+	// Copied: the next range is due at 3 s, a second away
+	_, err = s.HydrateRun(1, 2, false)
+	require.NoError(t, err)
+	sch = h.progress().Schedule
+	assert.Equal(t, int64(0), sch.Behind)
+	assert.Equal(t, time.Second, sch.Lead)
+	assert.Equal(t, "1s ahead of the recording", sch.String())
+	// Everything listed is there
+	_, err = s.HydrateRun(5, 1, false)
+	require.NoError(t, err)
+	sch = h.progress().Schedule
+	assert.True(t, sch.ListDone)
+	assert.Equal(t, "prefetch list complete, 1s before the recording needed the last of it", sch.String())
+	// An untimed list has no schedule
+	h2 := newHydrator("h", s, base, &Hydrate{Prefetch: []source.Range{{Offset: 0, Length: hChunk}}}, idle)
+	assert.Nil(t, h2.progress().Schedule)
+}
+
+// cancelling is a base whose reads fail and cancel the hydration, as a shutdown's abort does.
+type cancelling struct {
+	recorder
+	cancel context.CancelFunc
+}
+
+func (c *cancelling) ReadAt(p []byte, off int64) (int, error) {
+	c.cancel()
+	return 0, errors.New("aborted")
+}
+
+func TestHydratorDoesNotRetryAfterCancel(t *testing.T) {
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	ctx, cancel := context.WithCancel(context.Background())
+	base := &cancelling{recorder: recorder{data: pat(hSize)}, cancel: cancel}
+	s := newHydrateStore(t, base)
+	h := newHydrator("h", s, base, &Hydrate{Rest: true, Concurrency: 1}, idle)
+	h.retryDelay = time.Millisecond
+	h.run(ctx)
+	assert.NotContains(t, out.String(), "retrying", "reads failing because the device stops are not a pass to retry")
 }

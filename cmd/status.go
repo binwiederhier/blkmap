@@ -100,6 +100,9 @@ func printStatus(w io.Writer, st *device.Status) {
 	}
 	if h := st.Hydration; h != nil {
 		fmt.Fprintf(w, "  hydration %s: %d/%d chunks, %s copied, %d errors\n", h.Phase, h.Hydrated, h.Total, util.FormatSize(h.Copied), h.Errors)
+		if h.Schedule != nil {
+			fmt.Fprintf(w, "  prefetch: %s\n", h.Schedule.String())
+		}
 	}
 	if r := st.Recording; r != nil {
 		state := "done"
