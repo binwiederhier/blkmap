@@ -70,7 +70,10 @@ end=$(( $(date +%s) + duration ))
 fio_loop() { # NAME ARGS...: back-to-back 5 minute verified runs
   local name=$1; shift
   while [ $(date +%s) -lt $end ] && [ ! -e $dir/failed ]; do
-    fio --name=$name --ioengine=io_uring --iodepth=8 --bs=4k --rw=randwrite --runtime=300 --time_based \
+    # A steady, realistic rate: the soak is about time and chaos, not throughput (stress
+    # covers that), and an unthrottled writer starves a shared host's disk until the VM
+    # itself stalls, which then measures the host instead of blkmap
+    fio --name=$name --ioengine=io_uring --iodepth=8 --bs=4k --rw=randwrite --runtime=300 --time_based --rate_iops=150 \
       --verify=crc32c --verify_backlog=256 --verify_fatal=1 "$@" --output=$dir/fio-$name.out >/dev/null 2>&1 \
       || { [ $(date +%s) -lt $end ] && fail "fio $name: $(grep -m1 -iE 'verify|error' $dir/fio-$name.out)"; }
   done
