@@ -59,3 +59,10 @@ Local boot 19.9 s. Pausing hydration for guest I/O starved the prefetch list on 
 mirror (copied nothing for 70 s); never yielding slowed fast-mirror boots once the uncapped
 rest phase competed with the guest; the fair share (one copy while the guest is busy, half the
 workers while the list is behind) is what shipped.
+
+## The cache as a plain sparse file (after the Present change)
+
+Same run with the fast tier as `{type: file, path: /srv/demo/cache/rec20.img}` (the sparse
+1,055 MiB copy, no HTTP in front, no map): 49.5 s; 31 reads (384 KiB) reached the disk on
+demand, 27 listed chunks were read before hydration copied them, 6,804 cache hits, 4,444
+misses (hydration past the cached 20 s), 0 failures.
