@@ -705,3 +705,23 @@ func TestServeRefusesSameIDTwiceInProcess(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already served by this process")
 }
+
+func TestWriteback(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := openTestStore(t, dir, "wb", make([]byte, 4*groupChunk))
+	_, err := s.WriteAt(bytes.Repeat([]byte{7}, groupChunk), groupChunk)
+	require.NoError(t, err)
+	dst, err := os.Create(filepath.Join(dir, "base-copy"))
+	require.NoError(t, err)
+	defer dst.Close()
+	require.NoError(t, dst.Truncate(4*groupChunk))
+	d := &Device{store: s}
+	n, err := d.Writeback(dst)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n, "one written chunk copied")
+	got := make([]byte, groupChunk)
+	_, err = dst.ReadAt(got, groupChunk)
+	require.NoError(t, err)
+	assert.Equal(t, bytes.Repeat([]byte{7}, groupChunk), got)
+}

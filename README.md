@@ -37,7 +37,7 @@ size: 10G             # optional; defaults to the end of the last segment
 block-size: 512       # 512 (default) or 4096
 read-only: false
 cow:
-  file: /var/lib/blkmap/disk1.cow     # default; bitmap lives next to it as .bitmap
+  file: /var/lib/blkmap/disk1.cow     # default; the bitmap is <file>.bitmap unless "bitmap:" says otherwise
   chunk-size: 64K                     # bitmap granularity
 segments:             # in device order; "offset" defaults to the previous segment's end
   - type: zero
@@ -167,8 +167,9 @@ its sources on start. Guest I/O always has priority: hydration pauses while requ
 flight or arrived in the last 100 ms. A prefetch list (`offset length` per line, highest
 priority first) is copied at full speed; the rest follows at the configured rate, or not at
 all with `rest: false`. `use-cache: never` sends background reads straight to the slow tier.
-Ranges known to be zeros (zero segments, gaps) are marked without being copied. Progress
-goes to the journal every 30 seconds by default.
+Ranges known to be zeros (zero segments, gaps) are marked without being copied. Background
+reads run `concurrency` at a time (default 4; more helps a high-latency source). Progress
+goes to the journal every `report-every` (default 30s).
 
 ```yaml
 hydrate:
@@ -230,7 +231,8 @@ dev, err := device.Serve(ctx, &device.Options{
 `source.Zero` are ordinary Sources and compose, so one segment of an otherwise ordinary
 layout can come from your code. `source.NewSwappable` wraps a Source whose target can be
 replaced while the device is live. A config-driven program can supply one segment as
-`type: custom` after `source.Register("name", constructor)`. A fast tier of your own signals a
+`type: custom` after `source.Register("name", constructor)`; the segment's `name` picks the
+constructor and its `params` (a string map) and `size` are passed to it. A fast tier of your own signals a
 miss with `source.ErrNotFound`. Hydration from code takes `device.Hydrate` with ranges, a
 rate, the cache policy and an optional progress callback. One level down, `ublk.Create`
 serves any `ublk.Backend` (ReadAt, WriteAt, Size, Flush, optionally Discard and WriteZeroes)

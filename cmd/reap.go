@@ -12,7 +12,7 @@ var (
 		Usage:     "Delete the kernel device a dead server of ID left waiting (fails its I/O)",
 		ArgsUsage: "ID",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "run-dir", Value: device.RunDir, Hidden: true},
+			runDirFlag,
 		},
 		Action: execReap,
 	}

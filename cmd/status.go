@@ -14,13 +14,15 @@ import (
 )
 
 var (
-	cmdStatus = &cli.Command{
+	// runDirFlag is the hidden test seam of the commands that read /run/blkmap.
+	runDirFlag = &cli.StringFlag{Name: "run-dir", Value: device.RunDir, Hidden: true}
+	cmdStatus  = &cli.Command{
 		Name:      "status",
 		Usage:     "Show the state of running devices",
 		ArgsUsage: "[ID]",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json", Usage: "print JSON"},
-			&cli.StringFlag{Name: "run-dir", Value: device.RunDir, Hidden: true},
+			runDirFlag,
 		},
 		Action: execStatus,
 	}
@@ -28,7 +30,7 @@ var (
 		Name:  "metrics",
 		Usage: "Print metrics of all running devices in the Prometheus text format",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "run-dir", Value: device.RunDir, Hidden: true},
+			runDirFlag,
 		},
 		Action: execMetrics,
 	}

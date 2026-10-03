@@ -15,7 +15,7 @@ var (
 		ArgsUsage: "KERNEL-NAME",
 		Hidden:    true,
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "run-dir", Value: device.RunDir, Hidden: true},
+			runDirFlag,
 		},
 		Action: execUdevName,
 	}
