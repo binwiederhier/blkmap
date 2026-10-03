@@ -29,8 +29,8 @@ const (
 	// source: milliseconds, where only concurrency fills the pipe). The queue returns to
 	// inline only after inlineAfter consecutive reads under fastRead: a mean would flip
 	// back on a run of cache hits and then stall every request behind the next slow read.
-	// Writes, flushes and discards always run inline: they go to the local COW file, where
-	// parallel read-modify-writes only contend on the inode lock.
+	// Writes follow reads (a first partial write reads its chunk from the base); flushes
+	// and discards always run inline.
 	parallelAbove = 250 * time.Microsecond
 	fastRead      = 100 * time.Microsecond
 	inlineAfter   = 1024
@@ -164,7 +164,7 @@ func (q *queue) run(ready chan<- error) {
 				// A failed FETCH/COMMIT for one tag: that tag is dead, the others keep
 				// serving. Exiting here instead would wedge every request on this queue.
 				log.Printf("ublk queue %d tag %d: command failed: %s", q.id, userData, syscall.Errno(-res).Error())
-			case q.parallel && q.op(uint16(userData)) == opRead:
+			case q.parallel && isData(q.op(uint16(userData))):
 				busy++
 				q.work <- uint16(userData) // never blocks: at most depth tags are outstanding
 			default:
@@ -210,7 +210,9 @@ func (q *queue) commitCompleted() int {
 	q.compMu.Lock()
 	defer q.compMu.Unlock()
 	for _, tag := range q.completed {
-		q.observe(time.Duration(q.durations[tag]))
+		if q.op(tag) == opRead {
+			q.observe(time.Duration(q.durations[tag]))
+		}
 		if err := q.prepare(cmdCommitAndFetchReq, tag, q.results[tag]); err != nil {
 			q.err = err
 		}
@@ -235,6 +237,13 @@ func (q *queue) observe(d time.Duration) {
 		q.parallel, q.fastRun = false, 0
 		q.shown.Store(false)
 	}
+}
+
+// isData reports whether op moves data: reads and writes are dispatched to the workers in
+// parallel mode (a first partial write copies its chunk from the base, a slow source round
+// trip that must not stall the queue); flushes, discards and zeroing stay inline.
+func isData(op uint32) bool {
+	return op == opRead || op == opWrite
 }
 
 // op returns the request operation of tag.

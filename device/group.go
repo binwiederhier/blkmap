@@ -255,10 +255,20 @@ func (r *router) WriteAt(p []byte, off int64) (int, error) {
 func (r *router) Size() int64 { return r.store.Size() }
 
 // Flush makes the own store and every alias target durable.
+// Flush flushes this store and every alias target's. Reciprocal aliases make the target
+// graph cyclic while the byte routing stays acyclic, so each router is flushed once.
 func (r *router) Flush() error {
+	return r.flush(map[*router]bool{})
+}
+
+func (r *router) flush(visited map[*router]bool) error {
+	if visited[r] {
+		return nil
+	}
+	visited[r] = true
 	errs := []error{r.store.Flush()}
 	for _, t := range r.targets {
-		errs = append(errs, t.Flush())
+		errs = append(errs, t.flush(visited))
 	}
 	return errors.Join(errs...)
 }

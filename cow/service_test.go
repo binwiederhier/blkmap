@@ -769,3 +769,39 @@ func TestLiveBitmapNotAdoptedByAFreshBitmap(t *testing.T) {
 	require.Zero(t, s.Written())
 	require.NoError(t, s.Close())
 }
+
+// truncated is a base that claims size bytes but holds fewer, like a file truncated after
+// opening or a remote source cut short.
+type truncated struct {
+	mem
+	size int64
+}
+
+func (b *truncated) Size() int64 {
+	return b.size
+}
+
+func TestReadAtRefusesShortBaseRead(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := &truncated{mem: mem{data: bytes.Repeat([]byte{0x42}, 512)}, size: 2 * testChunk}
+	s, err := Open(base, filepath.Join(dir, "c.cow"), filepath.Join(dir, "c.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	buf := bytes.Repeat([]byte{0xaa}, testChunk)
+	n, err := s.ReadAt(buf, 0)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF, "a short base read must not be reported as data")
+	assert.Less(t, n, testChunk)
+}
+
+func TestWriteChunkRefusesShortBaseRead(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := &truncated{mem: mem{data: bytes.Repeat([]byte{0x42}, 512)}, size: 2 * testChunk}
+	s, err := Open(base, filepath.Join(dir, "c.cow"), filepath.Join(dir, "c.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	_, err = s.WriteAt([]byte{0x99}, 0)
+	assert.Error(t, err, "a copy-up from an incomplete base must not publish the chunk")
+	assert.Equal(t, int64(0), s.Written())
+}

@@ -163,8 +163,8 @@ func (h *HTTP) fetchOnce(start, end int64) (data []byte, err error, transient bo
 	default:
 		return nil, fmt.Errorf("%s: expected 206 Partial Content for range %d-%d, got %d", h.name, start, end, resp.StatusCode), false
 	}
-	if etag := resp.Header.Get(httpETag); h.etag != "" && etag != "" && etag != h.etag {
-		return nil, fmt.Errorf("%s changed on the origin (ETag %s, was %s); refusing to mix its blocks with the old ones", h.name, etag, h.etag), false
+	if err := h.sameVersion(resp); err != nil {
+		return nil, err, false
 	}
 	if gotStart, gotEnd, total, err := parseContentRange(resp.Header.Get(httpContentRange)); err != nil || gotStart != start || gotEnd != end || total != h.total {
 		return nil, fmt.Errorf("%s: asked for range %d-%d of %d, got Content-Range %q", h.name, start, end, h.total, resp.Header.Get(httpContentRange)), false
@@ -174,6 +174,24 @@ func (h *HTTP) fetchOnce(start, end int64) (data []byte, err error, transient bo
 		return nil, fmt.Errorf("%s: short read for range %d-%d: %w", h.name, start, end, err), true
 	}
 	return data, nil, false
+}
+
+// sameVersion checks that a block reply comes from the object version seen at open: the
+// ETag when the origin sent one, else Last-Modified. A changed or missing validator is an
+// error, since mixing blocks of two versions corrupts the device. An origin that sends
+// neither cannot be checked; its objects must be immutable.
+func (h *HTTP) sameVersion(resp *http.Response) error {
+	switch {
+	case h.etag != "":
+		if etag := resp.Header.Get(httpETag); etag != h.etag {
+			return fmt.Errorf("%s changed on the origin (ETag %q, was %q); refusing to mix its blocks with the old ones", h.name, etag, h.etag)
+		}
+	case h.modified != "":
+		if modified := resp.Header.Get(httpLastModified); modified != h.modified {
+			return fmt.Errorf("%s changed on the origin (Last-Modified %q, was %q); refusing to mix its blocks with the old ones", h.name, modified, h.modified)
+		}
+	}
+	return nil
 }
 
 // parseContentRange reads "bytes START-END/TOTAL" with a known, positive total.

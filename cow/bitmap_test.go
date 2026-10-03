@@ -3,6 +3,7 @@ package cow
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -139,4 +140,24 @@ func TestOpenBitmapPreallocates(t *testing.T) {
 	var st unix.Stat_t
 	require.NoError(t, unix.Stat(path, &st))
 	assert.GreaterOrEqual(t, st.Blocks*512, st.Size)
+}
+
+// TestSnapshotConcurrentSet is for the race detector: Set uses atomics, Snapshot must too.
+func TestSnapshotConcurrentSet(t *testing.T) {
+	t.Parallel()
+	b, err := OpenBitmap(filepath.Join(t.TempDir(), "b"), 4096*65536, 4096)
+	require.NoError(t, err)
+	defer b.Close()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50000; i++ {
+			b.Set(int64(i % 65536))
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		b.Snapshot()
+	}
+	wg.Wait()
 }

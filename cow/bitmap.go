@@ -290,13 +290,17 @@ type page struct {
 // afterwards stay dirty for the next snapshot.
 func (b *Bitmap) Snapshot() []page {
 	var pages []page
-	area := b.area()
 	for i := range b.dirty {
 		if !b.dirty[i].Swap(false) {
 			continue
 		}
-		start := i * bitmapPageSize
-		pages = append(pages, page{index: i, data: append([]byte(nil), area[start:start+bitmapPageSize]...)})
+		// Word by word with atomic loads: Set runs concurrently and uses atomics
+		data := make([]byte, bitmapPageSize)
+		first := i * bitmapPageSize / bitmapWordSize
+		for w := 0; w < bitmapPageSize/bitmapWordSize; w++ {
+			binary.LittleEndian.PutUint32(data[w*bitmapWordSize:], atomic.LoadUint32(&b.words[first+w]))
+		}
+		pages = append(pages, page{index: i, data: data})
 	}
 	return pages
 }

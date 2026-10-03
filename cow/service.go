@@ -218,19 +218,33 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 			end += s.chunkSize
 		}
 		m := int(min(int64(len(p)), end-off))
+		var read int
 		var err error
 		if written {
-			_, err = s.cow.ReadAt(p[:m], off)
+			read, err = s.cow.ReadAt(p[:m], off)
 		} else {
-			_, err = s.readBase(p[:m], off)
+			read, err = s.readBase(p[:m], off)
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return n - len(p), err
+		if err := fullRead(read, m, err); err != nil {
+			return n - len(p) + read, err
 		}
 		p = p[m:]
 		off += int64(m)
 	}
 	return n, eof
+}
+
+// fullRead turns a ReadAt outcome into an error unless every requested byte arrived: a
+// base cut short (a truncated file, a remote source ending early) must never be served as
+// data or copied into the overlay, which HydrateRun, ReadAt and writeChunk all rely on.
+func fullRead(n, want int, err error) error {
+	if n == want && (err == nil || errors.Is(err, io.EOF)) {
+		return nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return io.ErrUnexpectedEOF
 }
 
 func (s *Store) WriteAt(p []byte, off int64) (int, error) {
@@ -319,9 +333,9 @@ func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
 		length := min(s.chunkSize, s.size-start)
 		mu := &s.locks[chunk%lockStripes]
 		mu.Lock()
-		_, err := s.cow.ReadAt(buf[:length], start)
+		read, err := s.cow.ReadAt(buf[:length], start)
 		mu.Unlock()
-		if err != nil && !errors.Is(err, io.EOF) {
+		if err := fullRead(read, int(length), err); err != nil {
 			return n, fmt.Errorf("read chunk %d from the cow file: %w", chunk, err)
 		}
 		if _, err := dst.WriteAt(buf[:length], start); err != nil {
@@ -361,9 +375,9 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 		scratch := s.bufs.Get().(*[]byte)
 		defer s.bufs.Put(scratch)
 		buf = (*scratch)[:length]
-		if _, err := s.readBase(buf, start); err != nil && !errors.Is(err, io.EOF) {
+		if read, err := s.readBase(buf, start); fullRead(read, int(length), err) != nil {
 			if partial {
-				return fmt.Errorf("copy chunk %d from base: %w", chunk, err)
+				return fmt.Errorf("copy chunk %d from base: %w", chunk, fullRead(read, int(length), err))
 			}
 			elideBase = false // a whole-chunk write does not need the base: store it
 		}
@@ -373,8 +387,8 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 		if written {
 			scratch := s.bufs.Get().(*[]byte)
 			cur := (*scratch)[:len(p)]
-			_, err := s.cow.ReadAt(cur, off)
-			same = err == nil && bytes.Equal(cur, p)
+			read, err := s.cow.ReadAt(cur, off)
+			same = fullRead(read, len(p), err) == nil && bytes.Equal(cur, p)
 			s.bufs.Put(scratch)
 		} else {
 			same = bytes.Equal(buf[off-start:off-start+int64(len(p))], p)

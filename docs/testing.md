@@ -139,10 +139,26 @@ the verdict. Clean up everything the scenario started; the leak check fails it o
 - `pkill -f PATTERN` kills the calling shell if PATTERN appears in its own command line.
 - fio needs `--ioengine=io_uring` for queue depth to mean anything (psync ignores it).
 
+## Fuzzing
+
+Native fuzz targets cover the config parser (`config.FuzzParse`), size parsing
+(`util.FuzzParseSize`), prefetch lists and maps (`source.FuzzParseRanges`), Content-Range
+(`source.FuzzParseContentRange`) and arbitrary HTTP block replies (`source.FuzzHTTPReply`).
+`go test` runs their seeds; to fuzz, `go test -run xxx -fuzz '^FuzzParse$' -fuzztime 60s ./config`
+(one target per invocation). The first run found a nil-pointer crash on a YAML list entry
+with nothing under it (`segments:\n  -`), fixed 2026-10-03.
+
+## Older systemd
+
+Template 9003 on box11 is Ubuntu 22.04 with the HWE kernel 6.8 and systemd 249, where
+`RestartMode=direct` is ignored and the reap unit's 3 second check carries recovery.
+`TEMPLATE=9003 make test-vm` passed everything on 2026-10-03 (36/36 scenarios, kills, power
+cuts). Building such a template: resize the cloud image first (`qemu-img create 8G` and
+`virt-resize --expand /dev/sda1`), or `virt-customize --install` of a kernel fails on disk
+space without saying so; check with `virt-ls -a img /boot`.
+
 ## Not covered yet
 
-- systemd older than 254, where `RestartMode=direct` is ignored and the reap unit relies on
-  its 3 second check.
 - Soak runs longer than two hours (days).
-- Fuzzing of the config, map and range parsers and of HTTP replies.
-- RAID-5 against a real Windows dynamic disk set.
+- A device group (aliases) under chaos: groups are covered by unit tests and one
+  kernel-level test only.

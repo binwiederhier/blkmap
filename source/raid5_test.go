@@ -211,3 +211,28 @@ func BenchmarkRAID5ReadAt(b *testing.B) {
 		})
 	}
 }
+
+// identMember is a member with a content identity, like a file.
+type identMember struct {
+	mem
+	ident string
+}
+
+func (m *identMember) Identity() string {
+	return m.ident
+}
+
+func TestRAID5IdentityOrdersMembers(t *testing.T) {
+	t.Parallel()
+	a := &identMember{mem: mem{data: bytes.Repeat([]byte{1}, 8192)}, ident: "a"}
+	b := &identMember{mem: mem{data: bytes.Repeat([]byte{2}, 8192)}, ident: "b"}
+	c := &identMember{mem: mem{data: bytes.Repeat([]byte{3}, 8192)}, ident: "c"}
+	x, err := NewRAID5([]Source{a, b, c}, 4096, LeftSymmetric, 0)
+	require.NoError(t, err)
+	y, err := NewRAID5([]Source{b, a, c}, 4096, LeftSymmetric, 0)
+	require.NoError(t, err)
+	assert.NotEqual(t, Identity(x), Identity(y), "swapping members changes the content, so the identity")
+	z, err := NewRAID5([]Source{a, nil, c}, 4096, LeftSymmetric, 0)
+	require.NoError(t, err)
+	assert.NotEqual(t, Identity(x), Identity(z), "a degraded array is a different identity (pin it to accept)")
+}

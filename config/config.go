@@ -162,6 +162,9 @@ func parseCOW(id string, raw *rawCOW, blockSize int) (*COW, error) {
 // parseSegment parses a top-level segment, or a nested source (raid5 member, cache tier) when
 // nested is set; where is the position used in error messages.
 func parseSegment(where string, raw *rawSegment, blockSize int, nested bool) (*Segment, error) {
+	if raw == nil {
+		return nil, fmt.Errorf("%w: %s is empty", errConfig, where)
+	}
 	s := &Segment{Type: SourceType(raw.Type), Offset: -1, Path: raw.Path, URL: raw.URL, Layout: raw.Layout, Missing: raw.Missing, Name: raw.Name, Params: raw.Params, Map: raw.Map}
 	var err error
 	if raw.Offset != "" {

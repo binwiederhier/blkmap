@@ -381,3 +381,38 @@ func TestHTTPDetectsOriginChange(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "changed")
 }
+
+// TestHTTPVersionChange: the validator seen at open (ETag, else Last-Modified) is required
+// on every fetch; an origin that changes the object, or stops sending the validator, must
+// not have its new blocks mixed with the cached old ones.
+func TestHTTPVersionChange(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"last_modified", "etag_disappears", "etag_changes"} {
+		t.Run(mode, func(t *testing.T) {
+			var version atomic.Int32
+			version.Store(1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var a, b int64
+				fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &a, &b)
+				v := version.Load()
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, b, 8<<20))
+				w.Header().Set("Last-Modified", time.Date(2026, 10, int(v), 0, 0, 0, 0, time.UTC).Format(http.TimeFormat))
+				if mode == "etag_changes" || (mode == "etag_disappears" && v == 1) {
+					w.Header().Set("ETag", fmt.Sprintf(`"v%d"`, v))
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				w.Write(bytes.Repeat([]byte{byte(v)}, int(b-a+1)))
+			}))
+			defer srv.Close()
+			h, err := NewHTTP(srv.Client(), srv.URL, 0, 0)
+			require.NoError(t, err)
+			defer h.Close()
+			old := make([]byte, 512)
+			_, err = h.ReadAt(old, 0)
+			require.NoError(t, err)
+			version.Store(2)
+			_, err = h.ReadAt(make([]byte, 512), 4<<20)
+			assert.Error(t, err, "blocks of a changed object were accepted")
+		})
+	}
+}

@@ -5,7 +5,10 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -293,4 +296,44 @@ func TestRouterNoAlloc(t *testing.T) {
 	require.Zero(t, testing.AllocsPerRun(100, func() { rb.ReadAt(p, 0) }), "read")
 	require.Zero(t, testing.AllocsPerRun(100, func() { rb.WriteAt(p, 0) }), "write")
 	require.Zero(t, testing.AllocsPerRun(100, func() { rb.WriteZeroes(0, 4*groupChunk) }), "write zeroes")
+}
+
+// TestReciprocalMirrorFlush: two mirrors with opposite primaries alias each other's
+// ranges; the byte routing is acyclic but the device graph is not, and Flush must not
+// recurse forever. The flush runs in a child with a small stack so an overflow is a
+// clean failure rather than a crash of the whole test binary.
+func TestReciprocalMirrorFlush(t *testing.T) {
+	if os.Getenv("BLKMAP_TEST_FLUSH_CHILD") == "1" {
+		debug.SetMaxStack(128 << 10)
+		dir := t.TempDir()
+		a := openTestStore(t, dir, "a", make([]byte, 4*groupChunk))
+		b := openTestStore(t, dir, "b", make([]byte, 4*groupChunk))
+		ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
+		routers := map[string]*router{"a": ra, "b": rb}
+		require.NoError(t, setAllAliases([]*GroupOptions{
+			{Options: Options{ID: "a"}, Aliases: []Alias{{Offset: groupChunk, Length: groupChunk, Target: "b", TargetOffset: groupChunk}}},
+			{Options: Options{ID: "b"}, Aliases: []Alias{{Offset: 0, Length: groupChunk, Target: "a", TargetOffset: 0}}},
+		}, routers))
+		_, err := ra.WriteAt([]byte{0x42}, groupChunk)
+		require.NoError(t, err)
+		got := make([]byte, 1)
+		_, err = rb.ReadAt(got, groupChunk)
+		require.NoError(t, err)
+		require.Equal(t, byte(0x42), got[0])
+		require.NoError(t, ra.Flush())
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReciprocalMirrorFlush$", "-test.timeout=10s")
+	cmd.Env = append(os.Environ(), "BLKMAP_TEST_FLUSH_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "flush of reciprocal aliases failed (stack overflow: %v): %s", bytes.Contains(out, []byte("stack overflow")), lastLines(out, 5))
+}
+
+// lastLines returns the last n lines of out, for a readable failure message.
+func lastLines(out []byte, n int) string {
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

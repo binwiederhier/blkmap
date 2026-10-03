@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+const (
+	missingMember = "missing"
+)
+
 // Identifier is implemented by sources that can fingerprint the version of their content:
 // the same string means the same bytes. The COW store records it and refuses a base whose
 // fingerprint changed, since overlaying old writes on new content corrupts the device.
@@ -51,10 +55,18 @@ func (c *Cache) Identity() string {
 	return Identity(c.slow)
 }
 
-// Identity is the array's geometry: which members are present does not change the content,
-// and members are usually devices, which cannot tell their version anyway.
+// Identity is the geometry plus the ordered members: swapping two members changes the
+// content with the same geometry. A degraded array therefore has its own identity, and an
+// overlay made over the full array needs `blkmap pin` to be accepted over it.
 func (r *RAID5) Identity() string {
-	return fmt.Sprintf("raid5:%d:%d:%d:%d", len(r.members), r.stripeSize, r.layout, r.size)
+	parts := make([]string, len(r.members))
+	for i, m := range r.members {
+		parts[i] = missingMember
+		if m != nil {
+			parts[i] = Identity(m)
+		}
+	}
+	return fmt.Sprintf("raid5:%d:%d:%d:%d(%s)", len(r.members), r.stripeSize, r.layout, r.size, strings.Join(parts, ";"))
 }
 
 func (d *Mapped) Identity() string {

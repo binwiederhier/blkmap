@@ -80,7 +80,13 @@ func TestIdentityComposites(t *testing.T) {
 	require.NoError(t, err)
 	r2, err := NewRAID5([]Source{NewZero(1 << 20), NewZero(1 << 20), NewZero(1 << 20)}, 65536, LeftSymmetric, 0)
 	require.NoError(t, err)
-	assert.Equal(t, Identity(r1), Identity(r2), "a missing member does not change the content")
+	// The members are part of the identity (reordering them changes the content), so a
+	// degraded array is a different identity: an overlay made over the full array needs
+	// `blkmap pin` to be used over it
+	assert.NotEqual(t, Identity(r1), Identity(r2))
+	r3, err := NewRAID5([]Source{NewZero(1 << 20), NewZero(1 << 20), NewZero(1 << 20)}, 65536, LeftSymmetric, 0)
+	require.NoError(t, err)
+	assert.Equal(t, Identity(r2), Identity(r3))
 	// A source that cannot tell its version still has a stable identity
 	assert.Equal(t, Identity(&mem{data: make([]byte, 10)}), Identity(&mem{data: make([]byte, 10)}))
 }
