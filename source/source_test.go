@@ -239,3 +239,40 @@ func TestWalk(t *testing.T) {
 	assert.Contains(t, seen, Source(inner))
 	assert.Len(t, seen, 7)
 }
+
+// TestFromConfigMappedFastTier: a dense partial copy with a map as the fast tier, through the
+// config: only the mapped part is served from it, the rest comes from the slow tier.
+func TestFromConfigMappedFastTier(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	data := pattern(4 << 20)
+	stale := append([]byte(nil), data...)
+	for i := 1 << 20; i < 3<<20; i++ {
+		stale[i] = 0xee // the copy's unmapped middle holds garbage
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "slow.img"), data, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fast.img"), stale, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fast.map"), []byte("0 1M\n3M 1M\n"), 0600))
+	c, err := config.Parse("d", []byte(fmt.Sprintf(`segments:
+  - type: cache
+    fast: {type: file, path: %s/fast.img, map: %s/fast.map}
+    slow: {type: file, path: %s/slow.img}
+`, dir, dir, dir)))
+	require.NoError(t, err)
+	src, err := FromConfig(c)
+	require.NoError(t, err)
+	defer src.Close()
+	got := make([]byte, 4<<20)
+	_, err = src.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
+	var cache *Cache
+	Walk(src, func(s Source) {
+		if cc, ok := s.(*Cache); ok {
+			cache = cc
+		}
+	})
+	require.NotNil(t, cache)
+	assert.Equal(t, int64(1), cache.Stats().Misses, "the unmapped middle was one miss")
+	assert.Equal(t, int64(0), cache.Stats().Failures)
+}
