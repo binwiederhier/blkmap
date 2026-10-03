@@ -334,6 +334,8 @@ make vet
 
 The test plan, what each layer covers and how to repeat a full run, is in
 [docs/testing.md](docs/testing.md); results of past runs are in `docs/test-results/`.
+How the pieces fit together, with sequence diagrams and real output, is in
+[docs/architecture.md](docs/architecture.md).
 
 Layout follows the ntfy conventions: `cmd/` (CLI), `config/` (YAML), `source/` (zero, file,
 http, raid5, concat), `cow/` (bitmap + COW store, discard and write-zeroes aware), `device/`
