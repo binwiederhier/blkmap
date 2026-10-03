@@ -288,16 +288,16 @@ queue, and per-tag buffers sized to the 1 MiB maximum request, so large I/O is n
 Defaults are 4 queues (fewer on smaller machines) at depth 64, which costs at most 256 MiB of
 request buffers per device, touched lazily.
 
-Measured on a 12 vCPU KVM guest (kernel 6.8), zero-backed 4 GiB device, direct I/O with
-fio's io_uring engine (the psync engine ignores iodepth and understates everything), 4 jobs
-at queue depth 32:
+Measured 2026-10-03 on a 12 vCPU KVM guest (kernel 6.8), zero-backed 4 GiB device, direct
+I/O with fio's io_uring engine (the psync engine ignores iodepth and understates
+everything), 4 jobs at queue depth 32, cow file on the guest's virtio root disk:
 
 | workload | result |
 |---|---|
-| 4K random read | 1.2M IOPS |
-| 64K random read | 370k IOPS, 23 GB/s |
-| 1M sequential read, one job at depth 16 | 5.3 GB/s |
-| 4K random write (COW, 64K chunks) | 86k IOPS |
+| 4K random read | 1.19M IOPS |
+| 64K random read | 388k IOPS, 24 GB/s |
+| 1M sequential read, one job at depth 16 | 10.5 GB/s |
+| 4K random write (COW, 64K chunks) | 195k IOPS (515k with the cow file on tmpfs) |
 
 Random 4K writes pay for the copy-on-write chunking: the first write into a 64K chunk copies
 the chunk from the base and writes it whole. A smaller `cow.chunk-size` trades that for a
