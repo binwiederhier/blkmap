@@ -197,3 +197,17 @@ func TestMapHasData(t *testing.T) {
 	assert.False(t, m.HasData(1010, 1<<40))
 	assert.Zero(t, testing.AllocsPerRun(100, func() { m.HasData(0, 2000) }))
 }
+
+func TestMapCovers(t *testing.T) {
+	m, err := NewMap([]Range{{Offset: 100, Length: 50}, {Offset: 150, Length: 50}, {Offset: 1000, Length: 10}})
+	require.NoError(t, err)
+	assert.True(t, m.Covers(100, 100), "adjacent extents were merged")
+	assert.True(t, m.Covers(120, 10))
+	assert.False(t, m.Covers(99, 10))
+	assert.False(t, m.Covers(150, 100))
+	assert.False(t, m.Covers(0, 10))
+	assert.Zero(t, testing.AllocsPerRun(100, func() { m.Covers(100, 100) }))
+	w := WithMap(&mem{data: make([]byte, 2000)}, m, 0)
+	assert.True(t, w.Present(100, 100))
+	assert.False(t, w.Present(200, 10))
+}

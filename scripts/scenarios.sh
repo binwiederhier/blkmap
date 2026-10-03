@@ -510,6 +510,22 @@ YML
   cmp <(dd if=/dev/blkmap/sc-ct bs=1M skip=16 count=8 iflag=direct status=none) <(dd if=$dir/img64 bs=1M skip=16 count=8 status=none) && ok cache_tier_vanishes || bad cache_tier_vanishes "reads did not fall through to the slow tier"
   unit stop sc-ct; rm -f $dir/fast64
 }
+sc_partial_cache_file() {
+  # A sparse local copy is the fast tier with no map: what it holds is served from it, what it
+  # lacks (holes) comes from the slow tier, never zeros
+  cp --sparse=never $dir/img64 $dir/partial64; for o in 8 24 40 56; do fallocate -p -o ${o}M -l 8M $dir/partial64; done
+  cfg sc-pc <<YML
+segments:
+  - type: cache
+    fast: {type: file, path: $dir/partial64}
+    slow: {type: file, path: $dir/img64}
+YML
+  unit start sc-pc && wait_dev sc-pc || { bad partial_cache_file "start"; return; }
+  cmp <(dd if=/dev/blkmap/sc-pc bs=1M iflag=direct status=none) $dir/img64 || { bad partial_cache_file "content differs from the image (holes served as zeros?)"; unit stop sc-pc; return; }
+  local st=$(blkmap status sc-pc | grep cache:); log "$st"
+  grep -qE "cache: [1-9][0-9]* hits, [1-9][0-9]* misses, 0 failures" <<<"$st" && ok partial_cache_file || bad partial_cache_file "expected hits and misses: $st"
+  unit stop sc-pc; rm -f $dir/partial64
+}
 sc_discard_reclaims_space() {
   cfg sc-ds <<YML
 size: 256M
@@ -646,7 +662,7 @@ mkdir -p $dir $mnt /etc/blkmap
 [ -f $dir/img32 ] || head -c 32M /dev/urandom > $dir/img32
 baseline=$(ls /sys/class/ublk-char | wc -l)
 origin $port
-all="start_stop_cycles missing_source origin_down_at_start origin_dies_mid_flight origin_hangs_then_stop kill9_under_write_load kill9_during_hydration stop_during_hydration restart_storm_under_reads two_devices_one_cow geometry_change_refused cow_file_lost bitmap_lost cow_disk_full read_only_device bad_configs_rejected many_devices huge_device unprivileged partition_table_survives_restart fstab_mount_dependency hydration_survives_origin_outage hydration_vs_guest_writes detached_after_sources_gone stop_while_mounted rapid_restart_reuses_id sigterm_twice prefetch_beyond_end record_then_prefetch cache_tier_vanishes discard_reclaims_space reload_handoff_under_load package_upgrade_under_load origin_down_across_crash crash_loop_reaps source_changed_refused status_and_metrics"
+all="start_stop_cycles missing_source origin_down_at_start origin_dies_mid_flight origin_hangs_then_stop kill9_under_write_load kill9_during_hydration stop_during_hydration restart_storm_under_reads two_devices_one_cow geometry_change_refused cow_file_lost bitmap_lost cow_disk_full read_only_device bad_configs_rejected many_devices huge_device unprivileged partition_table_survives_restart fstab_mount_dependency hydration_survives_origin_outage hydration_vs_guest_writes detached_after_sources_gone stop_while_mounted rapid_restart_reuses_id sigterm_twice prefetch_beyond_end record_then_prefetch cache_tier_vanishes partial_cache_file discard_reclaims_space reload_handoff_under_load package_upgrade_under_load origin_down_across_crash crash_loop_reaps source_changed_refused status_and_metrics"
 for name in ${@:-$all}; do run $name; done
 echo; echo "passed $pass, failed $fail"
 for f in "${failed[@]:-}"; do [ -n "$f" ] && echo "  $f"; done

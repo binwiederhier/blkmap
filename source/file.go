@@ -94,6 +94,29 @@ func (f *File) Holes(off, length int64) ([]Range, error) {
 	return holes, nil
 }
 
+// Present reports whether [off, off+length) lies entirely in data of the file (no hole),
+// by SEEK_DATA/SEEK_HOLE; on a filesystem without hole support everything is data.
+func (f *File) Present(off, length int64) bool {
+	if off < 0 || length <= 0 || off+length > f.size {
+		return false
+	}
+	start := f.offset + off
+	f.seekMu.Lock()
+	defer f.seekMu.Unlock()
+	fd := int(f.f.Fd())
+	data, err := unix.Seek(fd, start, unix.SEEK_DATA)
+	if errors.Is(err, unix.ENXIO) {
+		return false // start is in the hole that runs to the end
+	} else if err != nil {
+		return true // no hole support here: a file without holes is all data
+	}
+	if data != start {
+		return false
+	}
+	hole, err := unix.Seek(fd, start, unix.SEEK_HOLE)
+	return err != nil || hole >= start+length
+}
+
 func (f *File) Size() int64 {
 	return f.size
 }

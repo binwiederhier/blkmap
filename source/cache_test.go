@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -137,4 +139,66 @@ type short struct {
 
 func (s *short) ReadAt(p []byte, off int64) (int, error) {
 	return s.mem.ReadAt(p[:min(10, len(p))], off)
+}
+
+// TestCachePartialCopyAsFastTier: a sparse local copy of the image is a fast tier without a
+// map; what it does not hold (its holes) is a miss, never zeros.
+func TestCachePartialCopyAsFastTier(t *testing.T) {
+	dir := t.TempDir()
+	data := pattern(8 << 20)
+	slow := &tier{mem: mem{data: data}}
+	// The partial copy holds [0, 1M) and [4M, 5M); the rest is holes, which read as zeros
+	partial := filepath.Join(dir, "partial.img")
+	require.NoError(t, os.WriteFile(partial, data[:1<<20], 0600))
+	f, err := os.OpenFile(partial, os.O_RDWR, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(8<<20))
+	_, err = f.WriteAt(data[4<<20:5<<20], 4<<20)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	fast, err := OpenFile(partial, 0, 0)
+	require.NoError(t, err)
+	c := NewCache(fast, slow)
+	defer c.Close()
+	// Everything reads as the image, holes included
+	got := make([]byte, 8<<20)
+	_, err = c.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
+	st := c.Stats()
+	assert.Positive(t, st.Misses, "ranges the copy lacks are misses")
+	assert.Equal(t, int64(0), st.Failures)
+	// A read inside the copy is a hit, inside a hole a miss, straddling both a miss
+	before := c.Stats()
+	p := make([]byte, 4096)
+	_, err = c.ReadAt(p, 512<<10)
+	require.NoError(t, err)
+	assert.Equal(t, before.Hits+1, c.Stats().Hits)
+	_, err = c.ReadAt(p, 2<<20)
+	require.NoError(t, err)
+	assert.Equal(t, before.Misses+1, c.Stats().Misses)
+	assert.Equal(t, data[2<<20:2<<20+4096], p)
+	_, err = c.ReadAt(p, (1<<20)-2048)
+	require.NoError(t, err)
+	assert.Equal(t, before.Misses+2, c.Stats().Misses)
+	assert.Zero(t, testing.AllocsPerRun(100, func() { c.ReadAt(p, 512<<10) }), "hit")
+	assert.Zero(t, testing.AllocsPerRun(100, func() { c.ReadAt(p, 2<<20) }), "miss")
+}
+
+func TestCacheMappedFastTier(t *testing.T) {
+	t.Parallel()
+	data := pattern(4 << 20)
+	// A dense copy with stale bytes outside its map: only the mapped part is trusted
+	copyData := append([]byte(nil), data...)
+	for i := 1 << 20; i < 2<<20; i++ {
+		copyData[i] = 0xee
+	}
+	m, err := NewMap([]Range{{Offset: 0, Length: 1 << 20}, {Offset: 2 << 20, Length: 2 << 20}})
+	require.NoError(t, err)
+	c := NewCache(WithMap(&mem{data: copyData}, m, 0), &tier{mem: mem{data: data}})
+	got := make([]byte, 4<<20)
+	_, err = c.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, data, got, "the unmapped part comes from the slow tier")
+	assert.Equal(t, int64(1), c.Stats().Misses)
 }

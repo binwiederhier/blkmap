@@ -141,3 +141,23 @@ func TestFileNoAlloc(t *testing.T) {
 	z := NewZero(1 << 20)
 	assert.Zero(t, testing.AllocsPerRun(100, func() { z.ReadAt(p, 8192) }))
 }
+
+func TestFilePresent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sparse")
+	require.NoError(t, os.WriteFile(path, pattern(1<<20), 0600))
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(4<<20))
+	_, err = f.WriteAt(pattern(4096), 3<<20)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	src, err := OpenFile(path, 0, 0)
+	require.NoError(t, err)
+	defer src.Close()
+	assert.True(t, src.Present(0, 1<<20))
+	assert.True(t, src.Present(3<<20, 4096))
+	assert.False(t, src.Present(1<<20, 4096), "a hole")
+	assert.False(t, src.Present((1<<20)-10, 20), "straddling data and a hole")
+	assert.False(t, src.Present(4<<20, 10), "past the end")
+	assert.Zero(t, testing.AllocsPerRun(100, func() { src.Present(0, 4096) }))
+}

@@ -106,6 +106,17 @@ func (m *Map) HasData(off, length int64) bool {
 	return i < len(m.extents) && m.extents[i].Offset-off < length
 }
 
+// Covers reports whether [off, off+length) lies entirely within one data extent (extents
+// are merged, so touching extents are one).
+func (m *Map) Covers(off, length int64) bool {
+	i := m.first(off)
+	if i >= len(m.extents) || length <= 0 {
+		return false
+	}
+	e := m.extents[i]
+	return e.Offset <= off && off+length <= e.Offset+e.Length
+}
+
 // Holes returns the holes within [off, off+length), clipped, ascending.
 func (m *Map) Holes(off, length int64) []Range {
 	end := off + length
@@ -217,6 +228,11 @@ func (d *Mapped) Holes(off, length int64) ([]Range, error) {
 		holes[i].Offset -= d.base
 	}
 	return holes, nil
+}
+
+// Present reports whether the range lies within the map's data extents.
+func (d *Mapped) Present(off, length int64) bool {
+	return d.m.Covers(d.base+off, length)
 }
 
 // Abort aborts the inner source.

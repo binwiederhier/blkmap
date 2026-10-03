@@ -72,6 +72,14 @@ type Aborter interface {
 	Abort()
 }
 
+// Present is implemented by sources that know which parts of them hold data: a sparse file
+// (SEEK_HOLE), a mapped source. A cache's fast tier that implements it answers a miss for
+// any range not fully present, so a partial local copy serves what it has and never zeros
+// for what it lacks. Must not allocate: it runs on every cached read.
+type Present interface {
+	Present(off, length int64) bool
+}
+
 // Abort aborts s if it can be aborted.
 func Abort(s Source) {
 	if a, ok := s.(Aborter); ok {

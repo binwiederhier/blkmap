@@ -159,6 +159,24 @@ segments:
     slow: {type: http, url: https://origin.example.com/img.raw}
 ```
 
+A partial local copy works as the fast tier as it is. A fast tier that knows which parts of
+it hold data is asked first, and any range it does not fully hold is a miss: a sparse file
+through its holes (`SEEK_HOLE`), any source through a `map:` of its data extents. So a copy
+of just the blocks a boot needs, on local NVMe, in front of a slow archive:
+
+```yaml
+segments:
+  - type: cache
+    fast: {type: file, path: /nvme/vm42.cache}                       # sparse: holes are misses
+    slow: {type: http, url: https://archive.example.com/vm42.raw}
+```
+
+How that copy is made is up to you (`dd` the ranges of a recording, rsync, anything that
+leaves holes where it copied nothing; `blkmap map FILE` prints what a file holds). A dense
+copy, or one on a filesystem without hole support, takes `map:` to say what is in it. A zero
+region stored as a hole counts as absent and is served by the slow tier, correctly but
+slowly, so write zeros out when they are data you want cached.
+
 ### Background hydration
 
 With a `hydrate` block, blkmap copies the base into the COW file in the background, so the
