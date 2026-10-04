@@ -377,14 +377,14 @@ func (p *Params) validate() error {
 	} else if size%int64(p.BlockSize) != 0 {
 		return fmt.Errorf("ublk: backend size %d is not a multiple of the block size %d", size, p.BlockSize)
 	}
-	if page := os.Getpagesize(); p.MaxIOSize < page || p.MaxIOSize%p.BlockSize != 0 {
-		return fmt.Errorf("ublk: max I/O size must be a multiple of the block size and at least a page (%d), got %d", page, p.MaxIOSize)
+	if page := os.Getpagesize(); p.MaxIOSize < page || p.MaxIOSize > maxIOSize || p.MaxIOSize%p.BlockSize != 0 {
+		return fmt.Errorf("ublk: max I/O size must be a multiple of the block size between a page (%d) and %d, got %d", page, maxIOSize, p.MaxIOSize)
 	}
 	if p.QueueDepth < 1 || p.QueueDepth > maxQueueDepth {
 		return fmt.Errorf("ublk: queue depth must be 1..%d, got %d", maxQueueDepth, p.QueueDepth)
 	}
-	if p.NumQueues < 1 {
-		return fmt.Errorf("ublk: at least one queue is required")
+	if p.NumQueues < 1 || p.NumQueues > maxQueues {
+		return fmt.Errorf("ublk: number of queues must be 1..%d, got %d", maxQueues, p.NumQueues)
 	}
 	return nil
 }

@@ -419,7 +419,7 @@ func takeOver(o *Options, statePath string) (*predecessor, error) {
 	}
 	info, err := ublk.GetInfo(id)
 	if err != nil {
-		return &predecessor{}, nil
+		return &predecessor{}, nil // the device is gone: nothing to take over
 	}
 	// A live server is recognized by its pid; a dead one's device by the newest state file
 	// claiming its id (the kernel clears the pid of a device waiting for recovery)

@@ -540,7 +540,8 @@ func (s *Store) IsWritten(chunk int64) bool {
 }
 
 // MarkZero records chunk as written without copying anything, for chunks known to read as
-// zeros: the sparse COW file reads zeros there. It reports whether the bit was newly set.
+// zeros. It reports whether the bit was newly set. The chunk is punched first: after a crash
+// the COW file can still hold data whose bit never reached the disk.
 func (s *Store) MarkZero(chunk int64) bool {
 	if chunk < 0 || chunk >= s.bitmap.Chunks() {
 		return false
@@ -548,7 +549,7 @@ func (s *Store) MarkZero(chunk int64) bool {
 	mu := &s.locks[chunk%lockStripes]
 	mu.Lock()
 	defer mu.Unlock()
-	if s.bitmap.Test(chunk) {
+	if s.bitmap.Test(chunk) || s.punch(chunk) != nil {
 		return false
 	}
 	s.bitmap.Set(chunk)

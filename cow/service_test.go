@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -654,6 +658,24 @@ func TestWithoutLiveBitmapCrashRevertsWrite(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
+func TestMarkZeroAfterCrashReadsZeros(t *testing.T) {
+	t.Parallel()
+	// A crash without a live bitmap (a power loss empties /run) forgets the bit but not the
+	// data in the cow file; hydration then marks the chunk as a base hole
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: make([]byte, testSize)})
+	_, err := s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 3*testChunk)
+	require.NoError(t, err)
+	s.abandon()
+	s = newTestStore(t, dir, &mem{data: make([]byte, testSize)})
+	defer s.Close()
+	require.True(t, s.MarkZero(3))
+	p := make([]byte, testChunk)
+	_, err = s.ReadAt(p, 3*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, make([]byte, testChunk), p, "the chunk read zeros before it was marked and must after")
+}
+
 func TestLiveBitmapIgnoresForeignGeometry(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -828,4 +850,457 @@ func TestStoreCountsDemandReads(t *testing.T) {
 	assert.Equal(t, int64(2), st.Reads, "the hydration read and the demand read; the hydrated chunk came from the cow file")
 	assert.Equal(t, [][2]int64{{2, 2}}, runs)
 	assert.Zero(t, testing.AllocsPerRun(50, func() { s.ReadAt(buf, testChunk) }))
+}
+
+// storeModel is what a Store must read back: the device content and which chunks the
+// bitmap holds, plus the bits the last successful flush made durable.
+type storeModel struct {
+	base      []byte
+	content   []byte
+	written   []bool
+	committed []bool
+	chunk     int64
+	elide     bool
+}
+
+func newStoreModel(base []byte, chunk int64) *storeModel {
+	chunks := (int64(len(base)) + chunk - 1) / chunk
+	return &storeModel{base: base, content: bytes.Clone(base), written: make([]bool, chunks), committed: make([]bool, chunks), chunk: chunk}
+}
+
+func (m *storeModel) span(chunk int64) (int64, int64) {
+	start := chunk * m.chunk
+	return start, min(start+m.chunk, int64(len(m.content)))
+}
+
+func (m *storeModel) write(p []byte, off int64) {
+	for len(p) > 0 {
+		chunk := off / m.chunk
+		_, end := m.span(chunk)
+		n := min(int64(len(p)), end-off)
+		if !m.elide || !bytes.Equal(m.content[off:off+n], p[:n]) {
+			copy(m.content[off:], p[:n])
+			m.written[chunk] = true
+		}
+		p, off = p[n:], off+n
+	}
+}
+
+func (m *storeModel) discard(off, length int64) {
+	for chunk := (off + m.chunk - 1) / m.chunk; chunk < (off+length)/m.chunk; chunk++ {
+		if m.written[chunk] {
+			start, end := m.span(chunk)
+			clear(m.content[start:end])
+		}
+	}
+}
+
+func (m *storeModel) writeZeroes(off, length int64) {
+	for end := off + length; off < end; {
+		chunk := off / m.chunk
+		start, chunkEnd := m.span(chunk)
+		n := min(end, chunkEnd) - off
+		if off == start && n == chunkEnd-start {
+			if !(m.elide && !m.written[chunk] && isZero(m.base[start:chunkEnd])) {
+				clear(m.content[start:chunkEnd])
+				m.written[chunk] = true
+			}
+		} else {
+			m.write(make([]byte, n), off)
+		}
+		off += n
+	}
+}
+
+func (m *storeModel) hydrate(first, count int64) {
+	for chunk := first; chunk < min(first+count, int64(len(m.written))); chunk++ {
+		m.written[chunk] = true
+	}
+}
+
+// crash forgets every bit the last flush did not make durable, unless a live bitmap kept it.
+func (m *storeModel) crash(live bool) {
+	if live {
+		return
+	}
+	for chunk := range m.written {
+		if !m.committed[chunk] {
+			start, end := m.span(int64(chunk))
+			copy(m.content[start:end], m.base[start:end])
+			m.written[chunk] = false
+		}
+	}
+}
+
+func fillRandom(r *rand.Rand, p []byte) {
+	for i := range p {
+		p[i] = byte(r.Uint32())
+	}
+}
+
+func isZero(p []byte) bool {
+	for _, b := range p {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// randomBase is random content with some all-zero chunks and some zero runs inside chunks.
+func randomBase(r *rand.Rand, size, chunk int64) []byte {
+	base := make([]byte, size)
+	fillRandom(r, base)
+	for c := int64(0); c*chunk < size; c++ {
+		start, end := c*chunk, min((c+1)*chunk, size)
+		switch r.IntN(4) {
+		case 0:
+			clear(base[start:end])
+		case 1:
+			clear(base[start : start+(end-start)/2])
+		}
+	}
+	return base
+}
+
+func TestStoreModel(t *testing.T) {
+	t.Parallel()
+	seeds, ops := 300, 400
+	if testing.Short() {
+		seeds = 30
+	}
+	if env := os.Getenv("BLKMAP_MODEL_SEEDS"); env != "" { // a longer hunt
+		n, err := strconv.Atoi(env)
+		require.NoError(t, err)
+		seeds = n
+	}
+	// BLKMAP_MODEL_SEED=N replays one seed, checking the whole device after every operation
+	if env := os.Getenv("BLKMAP_MODEL_SEED"); env != "" {
+		seed, err := strconv.ParseUint(env, 10, 64)
+		require.NoError(t, err)
+		runStoreModel(t, seed, ops, true)
+		return
+	}
+	for seed := range seeds {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			t.Parallel()
+			runStoreModel(t, uint64(seed), ops, false)
+		})
+	}
+}
+
+// runStoreModel drives a store with random operations, reopens and crashes, comparing every
+// read with the model. A failure prints the seed and the operations that led to it.
+func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
+	r := rand.New(rand.NewPCG(seed, 0x6b6d6170))
+	chunk := []int64{512, 4096, 8192}[r.IntN(3)]
+	chunks := 4 + r.Int64N(40)
+	size := chunks*chunk - r.Int64N(chunk/512)*512 // the last chunk may be partial
+	live := r.IntN(2) == 0
+	baseData := randomBase(r, size, chunk)
+	m := newStoreModel(baseData, chunk)
+	dir := t.TempDir()
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), ChunkSize: chunk}
+	if live {
+		o.LiveBitmap = filepath.Join(dir, "d.live")
+	}
+	open := func() *Store {
+		s, err := OpenWith(&mem{data: baseData}, o)
+		require.NoError(t, err)
+		s.SetElision(m.elide)
+		return s
+	}
+	s := open()
+	defer func() { s.Close() }()
+	var log []string
+	fail := func(format string, args ...any) {
+		t.Helper()
+		t.Fatalf("seed %d (chunk %d, size %d, live %v): %s\nops:\n  %s", seed, chunk, size, live, fmt.Sprintf(format, args...), strings.Join(log, "\n  "))
+	}
+	check := func(what string) {
+		t.Helper()
+		got := make([]byte, size)
+		if n, err := s.ReadAt(got, 0); err != nil || n != len(got) {
+			fail("%s: read %d bytes, %v", what, n, err)
+		}
+		for c := range m.written {
+			start, end := m.span(int64(c))
+			if !bytes.Equal(got[start:end], m.content[start:end]) {
+				fail("%s: chunk %d differs from the model (written: model %v, store %v)", what, c, m.written[c], s.IsWritten(int64(c)))
+			}
+			if s.IsWritten(int64(c)) != m.written[c] {
+				fail("%s: chunk %d written: model %v, store %v", what, c, m.written[c], s.IsWritten(int64(c)))
+			}
+		}
+	}
+	randRange := func() (int64, int64) {
+		off := r.Int64N(size)
+		if r.IntN(3) > 0 {
+			off -= off % 512
+		}
+		length := 1 + r.Int64N(min(3*chunk, size-off))
+		return off, length
+	}
+	for i := 0; i < ops; i++ {
+		switch op := r.IntN(100); {
+		case op < 35: // write: random bytes, what is there already, zeros or the base's bytes
+			off, length := randRange()
+			p := make([]byte, length)
+			switch r.IntN(4) {
+			case 0:
+				fillRandom(r, p)
+			case 1:
+				copy(p, m.content[off:])
+			case 2:
+			case 3:
+				copy(p, baseData[off:])
+			}
+			log = append(log, fmt.Sprintf("write %d+%d", off, length))
+			if n, err := s.WriteAt(p, off); err != nil || n != len(p) {
+				fail("write %d+%d: %d, %v", off, length, n, err)
+			}
+			m.write(p, off)
+		case op < 55: // read a range
+			off, length := randRange()
+			p := make([]byte, length)
+			if n, err := s.ReadAt(p, off); err != nil || n != len(p) {
+				fail("read %d+%d: %d, %v", off, length, n, err)
+			}
+			if !bytes.Equal(p, m.content[off:off+length]) {
+				log = append(log, fmt.Sprintf("read %d+%d", off, length))
+				fail("read %d+%d differs from the model", off, length)
+			}
+		case op < 60:
+			off, length := randRange()
+			log = append(log, fmt.Sprintf("discard %d+%d", off, length))
+			if err := s.Discard(off, length); err != nil {
+				fail("discard: %v", err)
+			}
+			m.discard(off, length)
+		case op < 65:
+			off, length := randRange()
+			log = append(log, fmt.Sprintf("zeroes %d+%d", off, length))
+			if err := s.WriteZeroes(off, length); err != nil {
+				fail("write zeroes: %v", err)
+			}
+			m.writeZeroes(off, length)
+		case op < 72:
+			first, count := r.Int64N(chunks), 1+r.Int64N(8)
+			log = append(log, fmt.Sprintf("hydrate %d+%d", first, count))
+			if _, err := s.HydrateRun(first, count, r.IntN(2) == 0); err != nil {
+				fail("hydrate: %v", err)
+			}
+			m.hydrate(first, count)
+		case op < 76: // what the hydrator does for a chunk its source reports as a hole
+			c := r.Int64N(chunks)
+			start, end := m.span(c)
+			if !isZero(baseData[start:end]) {
+				continue
+			}
+			log = append(log, fmt.Sprintf("markzero %d", c))
+			s.MarkZero(c)
+			m.written[c] = true // the base is zero there, so the content must not change
+		case op < 80:
+			m.elide = !m.elide
+			log = append(log, fmt.Sprintf("elide %v", m.elide))
+			s.SetElision(m.elide)
+		case op < 88:
+			log = append(log, "flush")
+			if err := s.Flush(); err != nil {
+				fail("flush: %v", err)
+			}
+			copy(m.committed, m.written)
+		case op < 92:
+			log = append(log, "close+open")
+			if err := s.Close(); err != nil {
+				fail("close: %v", err)
+			}
+			copy(m.committed, m.written)
+			s = open()
+			check("after reopen")
+		case op < 97:
+			log = append(log, "crash")
+			s.abandon()
+			m.crash(live)
+			s = open()
+			check("after crash")
+		default:
+			log = append(log, "writeback")
+			dst := bytes.Clone(baseData)
+			if _, err := s.Writeback(&sliceWriter{dst}); err != nil {
+				fail("writeback: %v", err)
+			}
+			copy(m.committed, m.written)
+			for c := range m.written {
+				start, end := m.span(int64(c))
+				if m.written[c] && !bytes.Equal(dst[start:end], m.content[start:end]) {
+					fail("writeback: chunk %d differs from the model", c)
+				}
+			}
+		}
+		if paranoid {
+			check(fmt.Sprintf("after op %d", i))
+		}
+	}
+	check("at the end")
+}
+
+// sliceWriter is an io.WriterAt over a byte slice.
+type sliceWriter struct{ b []byte }
+
+func (w *sliceWriter) WriteAt(p []byte, off int64) (int, error) {
+	return copy(w.b[off:], p), nil
+}
+
+// TestStoreModelConcurrent races writers on their own chunks against hydration, flushes and
+// readers across the whole device, then crashes: every chunk must read what its writer left,
+// and after the crash either that or, for a bit no flush persisted, the base.
+func TestStoreModelConcurrent(t *testing.T) {
+	t.Parallel()
+	for seed := range uint64(20) {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			t.Parallel()
+			runStoreModelConcurrent(t, seed)
+		})
+	}
+}
+
+func runStoreModelConcurrent(t *testing.T, seed uint64) {
+	const writers, chunk, chunks, rounds = 4, 4096, 64, 300
+	size := int64(chunks*chunk - 1024)
+	r := rand.New(rand.NewPCG(seed, 0x636f6e63))
+	live := seed%2 == 0
+	baseData := randomBase(r, size, chunk)
+	dir := t.TempDir()
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), ChunkSize: chunk}
+	if live {
+		o.LiveBitmap = filepath.Join(dir, "d.live")
+	}
+	s, err := OpenWith(&mem{data: baseData}, o)
+	require.NoError(t, err)
+	s.SetElision(seed%3 == 0)
+	m := newStoreModel(baseData, chunk)
+	m.elide = seed%3 == 0
+	var stop atomic.Bool
+	var bg, wg sync.WaitGroup
+	errs := make(chan error, writers+3)
+	// Hydration, zero marking, flushes and unverified reads across every chunk
+	bg.Add(3)
+	go func() {
+		defer bg.Done()
+		r := rand.New(rand.NewPCG(seed, 1))
+		for !stop.Load() {
+			c := r.Int64N(chunks)
+			if start, end := m.span(c); isZero(baseData[start:end]) && r.IntN(2) == 0 {
+				s.MarkZero(c)
+			} else if _, err := s.HydrateRun(c, 1+r.Int64N(6), false); err != nil {
+				errs <- fmt.Errorf("hydrate: %w", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer bg.Done()
+		for !stop.Load() {
+			if err := s.Flush(); err != nil {
+				errs <- fmt.Errorf("flush: %w", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer bg.Done()
+		r := rand.New(rand.NewPCG(seed, 2))
+		p := make([]byte, 5*chunk)
+		for !stop.Load() {
+			off := r.Int64N(size)
+			n := min(int64(len(p)), size-off)
+			if _, err := s.ReadAt(p[:n], off); err != nil && !errors.Is(err, io.EOF) {
+				errs <- fmt.Errorf("read: %w", err)
+				return
+			}
+		}
+	}()
+	// Each writer owns the chunks c with c%writers == w, so its part of the model is its own
+	contents := make([][]byte, writers)
+	for w := range writers {
+		contents[w] = bytes.Clone(baseData)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := rand.New(rand.NewPCG(seed, uint64(10+w)))
+			own := contents[w]
+			for range rounds {
+				c := int64(w) + writers*r.Int64N(chunks/writers)
+				start, end := m.span(c)
+				off := start + r.Int64N(end-start)
+				off -= off % 512
+				length := 1 + r.Int64N(end-off)
+				switch r.IntN(10) {
+				case 0:
+					// Bits never clear, so a whole chunk written before the discard is punched;
+					// any other may gain its bit from the hydrator concurrently, so skip it
+					if !s.IsWritten(c) || end-start != chunk {
+						continue
+					}
+					if err := s.Discard(start, end-start); err != nil {
+						errs <- err
+						return
+					}
+					clear(own[start:end])
+				case 1:
+					if err := s.WriteZeroes(off, length); err != nil {
+						errs <- err
+						return
+					}
+					clear(own[off : off+length])
+				default:
+					p := make([]byte, length)
+					fillRandom(r, p)
+					if _, err := s.WriteAt(p, off); err != nil {
+						errs <- err
+						return
+					}
+					copy(own[off:], p)
+				}
+				got := make([]byte, end-start)
+				if _, err := s.ReadAt(got, start); err != nil && !errors.Is(err, io.EOF) {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(got, own[start:end]) {
+					errs <- fmt.Errorf("writer %d: chunk %d differs from what it wrote", w, c)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	stop.Store(true)
+	bg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("seed %d (live %v): %v", seed, live, err)
+	}
+	// Assemble the expected device from the writers' chunks
+	want := make([]byte, size)
+	for c := int64(0); c < chunks; c++ {
+		start, end := m.span(c)
+		copy(want[start:end], contents[c%writers][start:end])
+	}
+	assert.Equal(t, want, readAll(t, s), "seed %d: before the crash", seed)
+	s.abandon()
+	s, err = OpenWith(&mem{data: baseData}, o)
+	require.NoError(t, err)
+	defer s.Close()
+	got := readAll(t, s)
+	for c := int64(0); c < chunks; c++ {
+		start, end := m.span(c)
+		switch {
+		case bytes.Equal(got[start:end], want[start:end]):
+		case !live && !s.IsWritten(c) && bytes.Equal(got[start:end], baseData[start:end]):
+		default:
+			t.Fatalf("seed %d (live %v): after the crash chunk %d (written %v) reads neither what was written nor, unflushed, the base", seed, live, c, s.IsWritten(c))
+		}
+	}
 }

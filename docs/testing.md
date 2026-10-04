@@ -21,6 +21,8 @@ record the outcome in `docs/test-results/YYYY-MM-DD.md` (`make test-machine` wri
 | Daemon kills under a verifying writer | `make powercut HOST=ip MODE=kill CYCLES=5` | same | 2 min |
 | Power cuts under a verifying writer | `make powercut HOST=ip MODE=power CYCLES=10` | same; reboots the VM | 4 min |
 | Soak: verified I/O under chaos for hours | `make soak HOST=ip MINUTES=120` | same | 2 h |
+| Crash-point replay: every logged crash state of the COW filesystem | `make crashreplay HOST=ip [RECORDS=3000] [STEP=1]` | same, plus `dm-log-writes` | 10 min |
+| Coverage of unit plus root tests | `make coverage HOST=ip` | same | 3 min |
 
 Never run the root-level layers on a workstation. A bug in the ublk transport can wedge a
 kernel until reboot, and the power-cut test reboots the machine on purpose.
@@ -151,6 +153,27 @@ Native fuzz targets cover the config parser (`config.FuzzParse`), size parsing
 (one target per invocation). The first run found a nil-pointer crash on a YAML list entry
 with nothing under it (`segments:\n  -`), fixed 2026-10-03.
 
+## Model tests
+
+`TestStoreModel` drives `cow.Store` with random operations and checks every read against a
+plain in-memory model, including crashes with and without a live bitmap;
+`TestStoreModelConcurrent` races writers against hydration, flushes and readers. A failure
+prints the seed and the operations; `BLKMAP_MODEL_SEED=N go test -run 'TestStoreModel$' ./cow`
+replays that seed and checks the whole device after every operation, which pins the first
+divergence. `BLKMAP_MODEL_SEEDS=5000` runs a longer hunt. The first run (2026-10-05) found
+that zero marking during hydration could expose COW data whose bit a crash had lost.
+
+## Crash-point replay
+
+`make crashreplay` complements the power cuts: a power cut tests one crash per cycle, the
+replay tests every flush. `dm-log-writes` logs each request to the filesystem holding the
+COW file and bitmap; `scripts/logreplay` rebuilds the state a crash just before each logged
+flush could leave (everything up to the previous flush, the FUA writes since, and a random
+part of the plain writes since, which dm-log-writes logs only when a flush gathers them).
+The base is random, so a bitmap bit that reaches the disk ahead of its data shows as a slot
+that no longer reads as the base. To check the harness itself, commit the bitmap before
+syncing the COW file in `Store.Flush`: the run must fail.
+
 ## Older systemd
 
 Template 9003 on box11 is Ubuntu 22.04 with the HWE kernel 6.8 and systemd 249, where
@@ -162,6 +185,8 @@ space without saying so; check with `virt-ls -a img /boot`.
 
 ## Not covered yet
 
+- A ublk queue loop dying while the device is live (`ublk.Device.fail`, `Device.Done`):
+  nothing in the tests can make io_uring fail on demand yet.
 - Soak runs longer than two hours (days).
 - A device group (aliases) under chaos: groups are covered by unit tests and one
   kernel-level test only.

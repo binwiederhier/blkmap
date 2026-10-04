@@ -58,7 +58,9 @@ const (
 	stateQuiesced    = 2      // a recoverable device whose server died
 	devIDAuto        = ^uint32(0)
 	maxQueueDepth    = 4096
-	resultAbort      = -19 // -ENODEV: the kernel is tearing the queue down
+	maxQueues        = 4096    // UBLK_MAX_NR_QUEUES
+	maxIOSize        = 1 << 25 // UBLK_IO_BUF_BITS: the kernel encodes buffer offsets in 25 bits
+	resultAbort      = -19     // -ENODEV: the kernel is tearing the queue down
 	resultEIO        = -5
 	resultEOpNotSupp = -95
 	// descMmapStride is the per-queue offset of the descriptor array in /dev/ublkcN's mmap

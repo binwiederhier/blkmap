@@ -20,7 +20,11 @@ device must appear as `/dev/blkmap/ID` before the command returns.
 | U1 | `make test` | every package passes with the race detector | CI, `make test` |
 | U2 | Hot paths allocate nothing: store read/write, concat lookup, cache hit and miss, RAID-5 read, map lookups, recording | `AllocsPerRun` is 0 | `*NoAlloc*`, `TestRecorderAddDoesNotAllocate` |
 | U3 | Fuzz the parsers for 1 min each: config, sizes, ranges and maps, Content-Range, HTTP replies | no panic, no accepted invalid value | `go test -fuzz` targets in `config`, `util`, `source` |
-| U4 | `make examples` | the four examples vet, test and build | CI |
+| U4 | `make examples` | the examples vet, test and build | CI |
+| U5 | Static analysis: `make vet` (gofmt, go vet, staticcheck, govulncheck) | no findings, no known vulnerability in a called dependency | CI, `make vet` |
+| U6 | The COW store against a model: random writes (random, identical, zero, base bytes), reads, discards, write-zeroes, hydration runs, zero marking, elision toggles, flushes, clean reopens, crashes with and without a live bitmap, writeback; 300 seeds of 400 operations | every read equals the model; after a crash, chunks whose bits no flush persisted read the base; `BLKMAP_MODEL_SEED=N` replays one seed checking after every operation | `TestStoreModel` |
+| U7 | The COW store under concurrency: four writers on their own chunks race hydration, zero marking, a flush loop and readers, then a crash | every writer reads back what it wrote; after the crash each chunk reads that, or the base where no flush persisted its bit; clean under `-race` | `TestStoreModelConcurrent` |
+| U8 | Coverage | `make coverage HOST=ip` merges unit and root test coverage into `dist/coverage.html`; review functions under 50% in `cow`, `device`, `ublk` after larger changes | `scripts/coverage.sh` |
 
 ## TP-C: configuration and validation
 
@@ -89,6 +93,7 @@ device must appear as `/dev/blkmap/ID` before the command returns.
 | R10 | Origin dies mid-flight | kill the HTTP origin during reads | reads of unhydrated chunks fail with EIO within about a second (3 attempts), the device survives, reads work again when the origin returns | scenario `origin_dies_mid_flight` |
 | R11 | Origin hangs, then stop | origin answers after 90 s; a read is blocked; `systemctl stop` | stop completes in under 10 s (the read is aborted), no SIGKILL | scenario `origin_hangs_then_stop` |
 | R12 | Origin down at start | start with the origin unreachable | start fails cleanly; it starts once the origin is back | scenario `origin_down_at_start` |
+| R13 | Every crash state of the COW filesystem | `make crashreplay HOST=ip RECORDS=3000`: the COW file and bitmap sit on ext4 on `dm-log-writes` while a writer stores checksummed records over a random base and marks each acknowledged flush; each logged flush is replayed with the FUA writes and a random part (none, half, all) of the writes not yet flushed, and a device is started from it without a live bitmap | the COW filesystem mounts and fscks clean; every acknowledged record is present and every slot no record reached still reads as the base (a bitmap bit persisted ahead of its data shows as a lost copy-up) | `scripts/crashreplay.sh`, `scripts/logreplay` |
 
 ## TP-H: hydration, recording and prefetch
 

@@ -1,10 +1,13 @@
 // powercut writes and verifies checksummed records on a block device, for power-loss and
 // crash tests; scripts/powercut.sh drives it.
 //
-//	powercut write DEV           write records forever, flushing every batch; prints
-//	                             "start N" once and "ack N" after each flush
-//	powercut verify DEV A-B...   check that every acknowledged record (the A-B spans of
-//	                             the writer runs) survived
+//	powercut write DEV [-mark DM] [-count N]
+//	                             write records (forever, or N), flushing every batch; prints
+//	                             "start N" once and "ack N" after each flush, and with -mark
+//	                             logs "ackN" in dm-log-writes device DM before going on
+//	powercut verify DEV [-base FILE] A-B...
+//	                             check that every acknowledged record (the A-B spans of
+//	                             the writer runs) survived, and the rest still reads as FILE
 //
 // Record seq lives in slot slotOf(seq), so later records overwrite earlier ones. After a
 // crash each slot must hold at least the newest acknowledged record mapped to it; newer,
@@ -13,12 +16,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -53,11 +59,18 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "write":
-		err = write(os.Args[2])
+		fs := flag.NewFlagSet("write", flag.ExitOnError)
+		mark := fs.String("mark", "", "dm-log-writes device to log an ack mark in after each flush")
+		count := fs.Uint64("count", 0, "stop after this many records (0: never)")
+		fs.Parse(os.Args[3:])
+		err = write(os.Args[2], *mark, *count)
 	case "verify":
+		fs := flag.NewFlagSet("verify", flag.ExitOnError)
+		base := fs.String("base", "", "file the device overlays: slots without a record must read as it")
+		fs.Parse(os.Args[3:])
 		var spans []span
-		if spans, err = parseSpans(os.Args[3:]); err == nil {
-			err = verify(os.Args[2], spans)
+		if spans, err = parseSpans(fs.Args()); err == nil {
+			err = verify(os.Args[2], *base, spans)
 		}
 	default:
 		err = fmt.Errorf("unknown mode %q", os.Args[1])
@@ -69,8 +82,9 @@ func main() {
 	fmt.Println("OK")
 }
 
-// write continues after the newest record on the device and writes until killed.
-func write(path string) error {
+// write continues after the newest record on the device and writes until killed, or count
+// records.
+func write(path, mark string, count uint64) error {
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_DIRECT, 0)
 	if err != nil {
 		return err
@@ -91,7 +105,7 @@ func write(path string) error {
 		}
 	}
 	fmt.Printf("start %d\n", start)
-	for seq := start; ; seq++ {
+	for seq := start; count == 0 || seq < start+count; seq++ {
 		slot := slotOf(seq, slots)
 		copy(buf, encode(seq, slot))
 		if _, err := unix.Pwrite(fd, buf, int64(slot*recordSize)); err != nil {
@@ -102,12 +116,19 @@ func write(path string) error {
 				return fmt.Errorf("flush after seq %d: %w", seq, err)
 			}
 			fmt.Printf("ack %d\n", seq)
+			if mark != "" {
+				if out, err := exec.Command("dmsetup", "message", mark, "0", "mark", fmt.Sprintf("ack%d", seq)).CombinedOutput(); err != nil {
+					return fmt.Errorf("mark ack %d: %w: %s", seq, err, out)
+				}
+			}
 		}
 	}
+	return nil
 }
 
-// verify checks the device against the acknowledged spans.
-func verify(path string, acked []span) error {
+// verify checks the device against the acknowledged spans and, given the base the device
+// overlays, that every slot no record reached still reads as the base.
+func verify(path, base string, acked []span) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -131,15 +152,31 @@ func verify(path string, acked []span) error {
 			tornOK[slotOf(seq, slots)] = true
 		}
 	}
+	var baseFile *os.File
+	if base != "" {
+		if baseFile, err = os.Open(base); err != nil {
+			return err
+		}
+		defer baseFile.Close()
+	}
 	var failures []string
-	buf := make([]byte, recordSize)
+	buf, baseBuf := make([]byte, recordSize), make([]byte, recordSize)
 	for slot := uint64(0); slot < slots; slot++ {
 		if _, err := f.ReadAt(buf, int64(slot*recordSize)); err != nil {
 			return err
 		}
 		want, has := expect[slot]
 		seq, recSlot, ok := decode(buf)
+		baseLost := false
+		if baseFile != nil && !ok && !has && !tornOK[slot] {
+			if _, err := baseFile.ReadAt(baseBuf, int64(slot*recordSize)); err != nil {
+				return err
+			}
+			baseLost = !bytes.Equal(buf, baseBuf)
+		}
 		switch {
+		case baseLost:
+			failures = append(failures, fmt.Sprintf("slot %d holds no record and no longer reads as the base", slot))
 		case ok && recSlot != slot:
 			failures = append(failures, fmt.Sprintf("slot %d holds seq %d of slot %d", slot, seq, recSlot))
 		case ok && has && seq < want:

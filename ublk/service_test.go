@@ -142,6 +142,8 @@ func TestParamsValidation(t *testing.T) {
 		{"max io too small", &Params{Backend: newMem(1 << 20), MaxIOSize: 512}, "max I/O size"},
 		{"max io not aligned", &Params{Backend: newMem(1 << 20), MaxIOSize: 4096 + 512, BlockSize: 4096}, "max I/O size"},
 		{"depth too large", &Params{Backend: newMem(1 << 20), QueueDepth: maxQueueDepth + 1}, "queue depth"},
+		{"too many queues", &Params{Backend: newMem(1 << 20), NumQueues: 1<<16 + 1}, "queues"},
+		{"max io too large", &Params{Backend: newMem(1 << 20), MaxIOSize: 1 << 32}, "max I/O size"},
 		{"empty backend", &Params{Backend: newMem(0)}, "size"},
 	}
 	for _, tt := range tests {
