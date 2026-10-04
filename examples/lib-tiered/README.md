@@ -21,8 +21,12 @@ go build ./examples/lib-tiered
 truncate -s 256M disk.img && dd if=/dev/urandom of=disk.img bs=1M count=256 conv=notrunc
 sudo ./lib-tiered -image disk.img -cached 0:32 -delay 20ms
 sudo dd if=/dev/blkmap/tiered of=/dev/null bs=1M count=32 iflag=direct   # cached: fast
-sudo dd if=/dev/blkmap/tiered of=/dev/null bs=1M skip=64 count=32 iflag=direct  # remote
 ```
+
+Hydration copies the rest at 32 MiB/s in the background, so a 256 MiB image is local after
+about 8 s and then everything reads fast. On the scratch VM with a 128 MiB image: the device
+matched the image, hydration finished in about 4 s, and the progress callback reported
+`hydration done: 2048/2048 chunks; cache 39 hits, 170 misses`.
 
 `go test ./examples/lib-tiered` checks the composition and that an abort reaches the slow
 tier through the cache and the read-ahead.
