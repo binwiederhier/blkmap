@@ -95,8 +95,9 @@ COW chunk write 37 us.
 The ublk transport lives in-tree (`ublk/`, about 1,300 lines, derived from go-ublk): an
 ioctl-encoded control plane, a minimal SQE128/CQE32 io_uring per queue, one OS thread per
 queue, and per-tag buffers sized to the 1 MiB maximum request, so large I/O is never split.
-Defaults are 4 queues (fewer on smaller machines) at depth 64, which costs at most 256 MiB of
-request buffers per device, touched lazily.
+A device whose reads can reach the network gets one queue at depth 64 (one queue thread keeps
+a network busy; 64 MiB of request buffers), a local one up to 4 (at most 256 MiB), touched
+lazily.
 
 Measured 2026-10-03 on a 12 vCPU KVM guest (kernel 6.8), zero-backed 4 GiB device, direct
 I/O with fio's io_uring engine (the psync engine ignores iodepth and understates
@@ -139,4 +140,4 @@ examples and a package build on every push.
 ## License
 
 Apache 2.0. The `ublk` package derives from [go-ublk](https://github.com/ehrlich-b/go-ublk)
-(MIT, Benjamin Ehrlich).
+(MIT, Bryan Ehrlich).

@@ -218,8 +218,8 @@ at its first read, chunk-aligned, consecutive chunks merged; each range keeps it
 timestamp) and point `prefetch-list` at it:
 
 ```
-$ blkmap prefetch /var/lib/blkmap/img1.rec > /etc/blkmap/img1.prefetch
-$ blkmap prefetch --stats /var/lib/blkmap/img1.rec
+$ blkmap recording compact /var/lib/blkmap/img1.rec > /etc/blkmap/img1.prefetch
+$ blkmap recording stats /var/lib/blkmap/img1.rec
 requests:  46 (45 reads, 1 writes) over 27ms
 unique:    4352K read, in 21 ranges
 needed:
@@ -227,7 +227,7 @@ needed:
 rate:      everything was read within the first second
 ```
 
-`--stats` answers whether hydration can keep up: the list phase runs uncapped, and if the
+`recording stats` answers whether hydration can keep up: the list phase runs uncapped, and if the
 source delivers at least that rate the workload never waits for a chunk that is still on the
 way. A raw recording also works as a prefetch list as it is (writes skipped), just larger.
 `--chunk-size` must match the device's `cow.chunk-size` if that is not 64K.
@@ -310,8 +310,8 @@ in the order the workload will want it, ahead of the workload.
    look at what the workload needs by when:
 
    ```
-   blkmap prefetch /srv/images/vm42.rec > /srv/images/vm42.prefetch
-   blkmap prefetch --stats /srv/images/vm42.rec
+   blkmap recording compact /srv/images/vm42.rec > /srv/images/vm42.prefetch
+   blkmap recording stats /srv/images/vm42.rec
    ```
 
 2. Build the cache: copy the blocks the first N seconds touched into a sparse file on the
@@ -356,7 +356,8 @@ in the order the workload will want it, ahead of the workload.
 | `blkmap status [ID] [--json]` | state, chunks in the COW file, I/O and source counters, cache hits, hydration, recording |
 | `blkmap metrics` | the same for all devices in Prometheus text format |
 | `blkmap map FILE` | the data extents of a file as a map (`offset length` lines) |
-| `blkmap prefetch REC [--stats] [--chunk-size S]` | compact a recording into a prefetch list, or report what hydration must keep up with |
+| `blkmap recording compact REC [--chunk-size S]` | turn a recording into a prefetch list (reads only, each chunk once, merged) |
+| `blkmap recording stats REC` | how much data the recorded workload needed by when, and the rate that keeps ahead of it |
 | `blkmap pin ID` | accept the current sources as the ones an existing overlay belongs to (device stopped) |
 | `blkmap reap ID` | fail the I/O of a device whose server will not come back (run by `blkmap-reap@`) |
 
@@ -391,8 +392,10 @@ wedges that device for good and makes a global `sync` hang (use `sync -f`), and 
 ioctl-encoded command set is accepted (`CONFIG_BLKDEV_UBLK_LEGACY_OPCODES` is off).
 
 
-Known limits: one copy per request between kernel and process; up to 256 MiB of request
-buffers per device, touched lazily; HTTP fetches are 1 MiB blocks (a 4 KiB demand read costs
+Known limits: one copy per request between kernel and process; request buffers of 64 MiB
+per device whose reads can reach the network (one ublk queue: a network is kept busy by one
+queue thread at depth 64) and up to 256 MiB for local sources (up to four queues), touched
+lazily; HTTP fetches are 1 MiB blocks (a 4 KiB demand read costs
 a 1 MiB fetch, the right trade for a disk behind a network, wasteful on a metered link);
 Windows LDM RAID-5 is reassembled from the geometry you give, blkmap reads no LDM database.
 

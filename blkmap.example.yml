@@ -34,7 +34,7 @@ hydrate:
   report-every: 30s     # progress line in the journal
 
 # Optional: record every guest request ("millis R|W offset length" per line) to build a
-# prefetch list from a real workload: blkmap prefetch FILE > list. Never overwritten; delete
+# prefetch list from a real workload: blkmap recording compact FILE > list. Never overwritten; delete
 # the file to record again.
 #record:
 #  file: /var/lib/blkmap/example.rec

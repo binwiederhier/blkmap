@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -769,4 +771,25 @@ func TestServeRecordsGuestIO(t *testing.T) {
 	again, err := os.ReadFile(rec)
 	require.NoError(t, err)
 	assert.Equal(t, data, again)
+}
+
+func TestQueuesForSourceKind(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "img", time.Time{}, bytes.NewReader(make([]byte, 1<<20)))
+	}))
+	t.Cleanup(srv.Close)
+	remote, err := source.NewHTTP(srv.Client(), srv.URL, 0, 0)
+	require.NoError(t, err)
+	local := source.NewZero(1 << 20)
+	concat, err := source.NewConcat([]*source.Segment{{Offset: 0, Source: local}, {Offset: 1 << 20, Source: remote}}, 0)
+	require.NoError(t, err)
+	// A device whose reads can reach the network gets one queue (one thread at depth 64 keeps
+	// a network busy, and four queues would cost four times the buffers); local sources keep
+	// the default of up to four
+	assert.Equal(t, 0, queuesFor(local), "default: CPUs up to 4")
+	assert.Equal(t, 1, queuesFor(remote))
+	assert.Equal(t, 1, queuesFor(concat), "anywhere in the tree")
+	assert.Equal(t, 1, queuesFor(source.NewCache(local, remote)))
+	assert.Equal(t, 1, queuesFor(source.NewReadAhead(local)), "a read-ahead wrapper marks a remote source")
 }

@@ -6,7 +6,8 @@
 # throwaway machine: a transport bug can wedge its kernel. Usage:
 #   test-machine.sh HOST [--power [CYCLES]] [--soak MINUTES]
 # The summary names the test-plan sections (docs/test-plan.md) each layer covers and is also
-# written to dist/test-machine-<host>-<date>.md, ready for docs/test-results/.
+# written to logs/test-machine-<host>-<date>.md, ready for docs/test-results/ (not dist/, which
+# the package build empties).
 set -uo pipefail
 host=${1:?usage: test-machine.sh HOST [--power [CYCLES]] [--soak MINUTES]}; shift
 power=""; soak=""
@@ -20,13 +21,13 @@ while [ $# -gt 0 ]; do
 done
 me="$(cd "$(dirname "$0")" && pwd)"
 cd "$me/.."
-out=dist/test-machine-$host-$(date +%Y%m%d-%H%M).md
-mkdir -p dist
+out=logs/test-machine-$host-$(date +%Y%m%d-%H%M).md
+mkdir -p logs
 declare -a names results covers
 run() { # run NAME "PLAN SECTIONS" CMD...: run a layer, record its verdict, keep going
   local name=$1 plan=$2; shift 2
   echo; echo "#### $name"; local start=$(date +%s)
-  if "$@" 2>&1 | tee "dist/test-machine-$name.log" | tail -40; then r=PASS; else r=FAIL; fi
+  if "$@" 2>&1 | tee "logs/test-machine-${name// /-}.log" | tail -40; then r=PASS; else r=FAIL; fi
   names+=("$name"); results+=("$r ($(( $(date +%s) - start )) s)"); covers+=("$plan")
 }
 run "unit tests" "all packages (TP-U)" go test -race ./...

@@ -245,7 +245,7 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 	b := &backend{store: io, id: o.ID}
 	// The recording starts before the kernel device, so it includes the partition scan
 	rec := startRecording(o, b)
-	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery}
+	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, NumQueues: queuesFor(o.Base)}
 	dev, err := pred.recover(o.ID, params)
 	recovered := dev != nil
 	if dev == nil && err == nil {
@@ -323,6 +323,24 @@ func startRecording(o *Options, b *backend) *ioRecorder {
 	log.Printf("%s: recording guest I/O to %s", o.ID, o.Record.File)
 	b.rec.Store(r)
 	return r
+}
+
+// queuesFor picks the ublk queue count for a base: one when its reads can reach the network
+// (an HTTP source or a read-ahead wrapper anywhere in the tree), since one queue thread at
+// depth 64 keeps a network busy and four would cost four times the request buffers; 0 (the
+// transport's default, CPUs up to four) for local sources, where the threads are the throughput.
+func queuesFor(base source.Source) int {
+	remote := false
+	source.Walk(base, func(s source.Source) {
+		switch s.(type) {
+		case *source.HTTP, *source.ReadAhead:
+			remote = true
+		}
+	})
+	if remote {
+		return 1
+	}
+	return 0
 }
 
 // defaults fills in the zero-value options.

@@ -1,7 +1,7 @@
 MAKEFLAGS := --jobs=1
 VERSION := $(shell git describe --tag 2>/dev/null || echo dev)
 
-.PHONY: help build test test-root stress scenarios test-remote test-machine powercut soak test-vm examples vet fmt release release-snapshot install-deb clean
+.PHONY: help build test test-root stress scenarios test-remote test-machine verify-release powercut soak test-vm examples vet fmt release release-snapshot install-deb clean
 
 help:
 	@echo "blkmap"
@@ -12,6 +12,7 @@ help:
 	@echo "  make scenarios        - real-life scenarios: crashes, outages, restarts, bad configs (root, deb, fio)"
 	@echo "  make test-remote HOST=ip [SUITE=stress|scenarios|all] - root suites (+workloads) on a scratch VM"
 	@echo "  make test-machine HOST=ip [POWER=5] [SOAK=120] - everything against one throwaway machine, with a summary"
+	@echo "  make verify-release [SOAK=120] - unattended: test-vm then a soak on every kernel template, one at a time"
 	@echo "  make powercut HOST=ip [CYCLES=10] [MODE=power|kill]  - power-cut or daemon-kill cycles on a scratch VM"
 	@echo "  make soak HOST=ip [MINUTES=120]  - verified I/O under chaos for hours, with leak sampling"
 	@echo "  make test-vm          - everything above on a throwaway Proxmox VM (PROXMOX=root@box11 TEMPLATE=9000)"
@@ -46,6 +47,10 @@ scenarios:
 # Everything against one throwaway machine (unit tests here, all suites there), summary at the end
 test-machine:
 	scripts/test-machine.sh $(HOST) $(if $(POWER),--power $(POWER)) $(if $(SOAK),--soak $(SOAK))
+
+# Release verification: for every kernel template a fresh VM runs everything, then soaks (hours)
+verify-release:
+	scripts/verify-release.sh $(or $(SOAK),120)
 
 # Same suites on a throwaway VM (HOST=... ; SUITE=stress|scenarios|all adds the workloads)
 test-remote:

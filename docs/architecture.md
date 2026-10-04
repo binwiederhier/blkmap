@@ -208,9 +208,9 @@ command tagged with a sequence number (a late completion of a timed-out command 
 apart), and waits up to 30 s; a timed-out control is poisoned and pinned, since the kernel
 may still write into its buffers.
 
-**Data plane.** Per hardware queue (CPUs, at most 4): one io_uring with `SQE128`/`CQE32`,
+**Data plane.** Per hardware queue (one for a device whose base reaches the network, `device.queuesFor`; else CPUs, at most 4): one io_uring with `SQE128`/`CQE32`,
 one OS thread locked for the device's life, a read-only mmap of the request descriptors, a
-private buffer of depth x 1 MiB (depth 64, so at most 256 MiB per device, touched lazily).
+private buffer of depth x 1 MiB (depth 64: 64 MiB for a network-backed device, at most 256 MiB for a local one, touched lazily).
 Every tag starts with `FETCH_REQ`; a completion names the tag, the thread serves it, and
 `COMMIT_AND_FETCH_REQ` returns the result and re-arms the tag. `-ENODEV` on a fetch means the
 kernel is aborting the queue.
@@ -387,9 +387,9 @@ write (offset, length, start time) to an `ioRecorder`: an append to a fixed 64K-
 under a mutex, no allocation. A goroutine swaps the buffer every second and writes
 `millis R|W offset length` lines; a full buffer drops and counts. `max-duration`, `max-size`
 or device stop end the recording, after which the backend is back to a nil check; the file is
-created with `O_EXCL`, so restarts never clobber it. `blkmap prefetch` compacts it
+created with `O_EXCL`, so restarts never clobber it. `blkmap recording compact` turns it into a list
 (`source.CompactRecording`: reads only, first touch per chunk, chunk-aligned, merged, first
-timestamp kept) and `--stats` reports the unique bytes needed by 1/5/10/30 s and the rate
+timestamp kept) and `blkmap recording stats` reports the unique bytes needed by 1/5/10/30 s and the rate
 that stays ahead. `ParsePrefetch` accepts both the two-field and the four-field form; with
 timestamps, `hydrator.schedule` compares the COW file with when the recording read each
 listed chunk: behind (listed chunks due by now and not copied), ahead (time until the next

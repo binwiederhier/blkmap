@@ -461,8 +461,8 @@ YML
   logged sc-rec "$s" 'recording to .* ended (max-duration reached)' || { bad record_then_prefetch "recording did not end at max-duration"; unit stop sc-rec; return; }
   blkmap status sc-rec | grep -q 'recording done' || { bad record_then_prefetch "status does not show the finished recording"; unit stop sc-rec; return; }
   unit stop sc-rec
-  blkmap prefetch /var/lib/blkmap/sc-rec.rec > $dir/sc-rec.prefetch || { bad record_then_prefetch "compaction failed"; return; }
-  blkmap prefetch --stats /var/lib/blkmap/sc-rec.rec | sed 's/^/    /'
+  blkmap recording compact /var/lib/blkmap/sc-rec.rec > $dir/sc-rec.prefetch || { bad record_then_prefetch "compaction failed"; return; }
+  blkmap recording stats /var/lib/blkmap/sc-rec.rec | sed 's/^/    /'
   for want in 10485760 31457280 52428800; do grep -q " R $want " $dir/sc-rec.prefetch || { bad record_then_prefetch "read at $want missing from the list"; return; }; done
   grep -q ' W ' $dir/sc-rec.prefetch && { bad record_then_prefetch "writes in the compacted list"; return; }
   grep -q ' W 5242880 4096' /var/lib/blkmap/sc-rec.rec || { bad record_then_prefetch "the write is missing from the raw recording"; return; }

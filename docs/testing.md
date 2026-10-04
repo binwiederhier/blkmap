@@ -10,6 +10,7 @@ record the outcome in `docs/test-results/YYYY-MM-DD.md` (`make test-machine` wri
 | Layer | Command | Needs | Time (about) |
 |---|---|---|---|
 | Everything below against one machine, with a summary | `make test-machine HOST=ip [POWER=5] [SOAK=120]` | root VM with `ublk_drv`, fio | 15 min + options |
+| Release verification: test-vm then a 2 h soak on every kernel template, unattended | `make verify-release` (`nohup scripts/verify-release.sh > logs/verify.log &`) | Proxmox host with the templates | about 5 h |
 | Unit tests (race detector) | `make test` | Go | 1 min |
 | Examples | `make examples` | Go | 1 min |
 | Everything below, on a fresh VM | `make test-vm` | Proxmox host, see below | 16 min |

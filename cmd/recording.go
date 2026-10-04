@@ -15,24 +15,44 @@ import (
 )
 
 var (
+	chunkSizeFlag = &cli.StringFlag{Name: "chunk-size", Value: util.FormatSize(config.DefaultChunkSize), Usage: "COW chunk `SIZE` of the device the list is for"}
+	cmdRecording  = &cli.Command{
+		Name:  "recording",
+		Usage: "Work with a recording of guest I/O (the record: block of a config)",
+		Subcommands: []*cli.Command{
+			{
+				Name:      "compact",
+				Usage:     "Turn a recording into a prefetch list: reads only, each chunk once at its first read, merged",
+				ArgsUsage: "RECORDING",
+				Flags:     []cli.Flag{chunkSizeFlag},
+				Action:    func(c *cli.Context) error { return execRecording(c, false) },
+			},
+			{
+				Name:      "stats",
+				Usage:     "Show how much data the recorded workload needed by when, and the rate that keeps ahead of it",
+				ArgsUsage: "RECORDING",
+				Flags:     []cli.Flag{chunkSizeFlag},
+				Action:    func(c *cli.Context) error { return execRecording(c, true) },
+			},
+		},
+	}
+	// cmdPrefetch is the old name of "recording compact" (and "recording stats" with --stats),
+	// kept hidden for one release.
 	cmdPrefetch = &cli.Command{
 		Name:      "prefetch",
-		Usage:     "Compact a recording into a prefetch list, or show what hydration must keep up with",
+		Hidden:    true,
 		ArgsUsage: "RECORDING",
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "chunk-size", Value: util.FormatSize(config.DefaultChunkSize), Usage: "COW chunk `SIZE` of the device the list is for"},
-			&cli.BoolFlag{Name: "stats", Usage: "print how much data the workload needed by when, instead of the list"},
-		},
-		Action: execPrefetch,
+		Flags:     []cli.Flag{chunkSizeFlag, &cli.BoolFlag{Name: "stats"}},
+		Action:    func(c *cli.Context) error { return execRecording(c, c.Bool("stats")) },
 	}
 	errNoRecording = errors.New("RECORDING argument required")
 	// prefetchMarks are the points in time --stats reports cumulative needs at.
 	prefetchMarks = []time.Duration{time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
 )
 
-// execPrefetch reads a recording and prints it compacted (reads only, each chunk once at its
-// first read, consecutive chunks merged), or its statistics.
-func execPrefetch(c *cli.Context) error {
+// execRecording reads a recording and prints it compacted (reads only, each chunk once at its
+// first read, consecutive chunks merged), or, with stats, its statistics.
+func execRecording(c *cli.Context, stats bool) error {
 	path := c.Args().First()
 	if path == "" {
 		return errNoRecording
@@ -51,7 +71,7 @@ func execPrefetch(c *cli.Context) error {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	compact := source.CompactRecording(accesses, chunkSize)
-	if c.Bool("stats") {
+	if stats {
 		printPrefetchStats(c.App.Writer, accesses, compact)
 		return nil
 	}
