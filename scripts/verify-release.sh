@@ -19,6 +19,8 @@ mkdir -p logs
 stamp=$(date +%Y%m%d-%H%M)
 out=logs/verify-release-$stamp.md
 pssh() { ssh -o ConnectTimeout=10 -o BatchMode=yes "$pve" "$@"; }
+# Fresh VMs have new host keys, often on recycled IPs: the soak uses the same SSH options as ci-vm.sh
+export SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 declare -a rows
 note() { echo "$(date +%H:%M:%S) $*"; }
 for t in $templates; do
