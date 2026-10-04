@@ -402,29 +402,239 @@ Windows LDM RAID-5 is reassembled from the geometry you give, blkmap reads no LD
 ## Library use
 
 The daemon is a thin layer over three packages, and a Go program that computes or fetches
-blocks can use them directly. Implement `source.Source` (`ReadAt`, `Size`, `Close`) and hand it
-to `device.Serve`; the COW overlay, the kernel device and the `/dev/blkmap/<id>` symlink come
-with it:
+blocks can use them directly. Every recipe below has a complete, tested program under
+`examples/` (`make examples` builds and tests them; serving needs root and `ublk_drv`).
+
+| Recipe | Example |
+|---|---|
+| [Serve a source of your own](#serve-a-source-of-your-own) | `examples/lib-synthetic` |
+| [Give a source optional abilities](#give-a-source-optional-abilities) | `examples/lib-custom-source` |
+| [Add a segment type to YAML configs](#add-a-segment-type-to-yaml-configs) | `examples/lib-custom-source` |
+| [Your own fast and slow backends behind a cache](#your-own-fast-and-slow-backends-behind-a-cache) | `examples/lib-tiered`, `examples/lib-dircache` |
+| [Hydrate and record from code](#hydrate-and-record-from-code) | `examples/lib-tiered`, `examples/lib-dircache` |
+| [A remote protocol that conveys holes](#a-remote-protocol-that-conveys-holes) | `examples/grpc-remote` |
+| [Swap the source under a live device](#swap-the-source-under-a-live-device) | |
+| [A Windows dynamic-disk mirror, and no-op writes](#a-windows-dynamic-disk-mirror-and-no-op-writes) | `examples/lib-ldm-mirror` |
+| [Device groups in general](#device-groups) | `examples/lib-ldm-mirror` |
+| [A block device without the overlay](#a-block-device-without-the-overlay) | |
+
+### Serve a source of your own
+
+Implement `source.Source` (`ReadAt`, `Size`, `Close`) and hand it to `device.Serve`; the COW
+overlay, the kernel device and the `/dev/blkmap/<id>` symlink come with it. `ReadAt` follows
+`io.ReaderAt`: fill the whole buffer or return an error (a short read with `io.EOF` only past
+the end). `Serve` owns the source from then on and closes it, even when it fails.
 
 ```go
+type synthetic struct{ size int64 }
+
+func (s *synthetic) ReadAt(p []byte, off int64) (int, error) {
+	for i := range p {
+		p[i] = byte((off + int64(i)) / 4096) // block i reads as byte i
+	}
+	return len(p), nil
+}
+func (s *synthetic) Size() int64  { return s.size }
+func (s *synthetic) Close() error { return nil }
+
 dev, err := device.Serve(ctx, &device.Options{
-    ID:      "synth",
-    Base:    mySource,                      // source.Source, read-only
-    COWFile: "/var/lib/blkmap/synth.cow",   // bitmap and 64K chunks by default
+	ID:      "synth",
+	Base:    &synthetic{size: 256 << 20},
+	COWFile: "/var/lib/blkmap/synth.cow", // bitmap next to it, 64 KiB chunks by default
 })
-// ... /dev/blkmap/synth is live until dev.Close()
+// /dev/blkmap/synth is live until dev.Close()
 ```
 
-`source.Concat`, `source.RAID5`, `source.Cache`, `source.File`, `source.HTTP` and
-`source.Zero` are ordinary Sources and compose, so one segment of an otherwise ordinary
-layout can come from your code. `source.NewSwappable` wraps a Source whose target can be
-replaced while the device is live. A config-driven program can supply one segment as
-`type: custom` after `source.Register("name", constructor)`; the segment's `name` picks the
-constructor and its `params` (a string map) and `size` are passed to it. A fast tier of your own signals a
-miss with `source.ErrNotFound`. Hydration from code takes `device.Hydrate` with ranges, a
-rate, the cache policy and an optional progress callback. One level down, `ublk.Create`
-serves any `ublk.Backend` (ReadAt, WriteAt, Size, Flush, optionally Discard and WriteZeroes)
-without the COW layer.
+`ReadAt` is called from several goroutines at once (one per in-flight request on a slow
+source), so make it safe for concurrent use. Writes never reach the source.
+
+### Give a source optional abilities
+
+A source can implement more interfaces; blkmap uses each when it is there, through any
+wrapper (`Concat`, `Cache`, `Mapped`, `ReadAhead` forward them).
+
+| Interface | Method | What blkmap does with it |
+|---|---|---|
+| `source.Sparse` | `Holes(off, len) ([]Range, error)` | hydration marks hole chunks without reading; read-ahead skips hole blocks |
+| `source.Present` | `Present(off, len) bool` | as a cache's fast tier: a range not fully present is a miss without a read |
+| `source.Identifier` | `Identity() string` | recorded with the COW file; a different identity later refuses the old overlay (`blkmap pin` accepts it) |
+| `source.Aborter` | `Abort()` | called when the device stops: fail reads blocked on something external now |
+| `source.DirectReader` | `ReadAtDirect(p, off)` | hydration with `use-cache: never` reads around cache tiers |
+| `source.Binder` | `Bind(source.Lookup)` | in a device group, read sibling devices as the guest sees them |
+
+```go
+// A computed disk whose second half is zeros (examples/lib-custom-source/logdisk.go has
+// the full version)
+func (d *logDisk) Holes(off, length int64) ([]source.Range, error) {
+	half := d.size / 2
+	if start := max(off, half); start < off+length {
+		return []source.Range{{Offset: start, Length: off + length - start}}, nil
+	}
+	return nil, nil
+}
+func (d *logDisk) Identity() string { return "logdisk:" + d.version }
+```
+
+Pass `Identity: source.Identity(base)` in `device.Options` to pin the overlay to it.
+
+### Add a segment type to YAML configs
+
+Register a constructor, then load configs as usual: a segment `type: custom` with a matching
+`name` calls it with the segment's `size` and `params`. The custom source then composes with
+everything else a config can do (other segments, cache tiers, hydration, recording).
+
+```go
+source.Register("logdisk", func(size int64, params map[string]string) (source.Source, error) {
+	return &logDisk{name: params["name"], size: size, version: params["version"]}, nil
+})
+conf, err := config.Load("logdisk", "/etc/blkmap/logdisk.yml")
+dev, err := device.Start(ctx, conf, device.DevDir)
+```
+
+```yaml
+segments:
+  - type: custom
+    name: logdisk           # the registered name
+    size: 256M
+    params: {name: logdisk, version: "1"}
+  - type: zero
+    size: 64M
+```
+
+The stock `blkmap serve` binary does not know your types; this is for your own program built
+on the library. `blkmap validate` will reject such a config.
+
+### Your own fast and slow backends behind a cache
+
+`source.NewCache(fast, slow)` reads the fast tier first and falls back to the slow one,
+without retries and without ever writing the fast tier. The fast tier says "I don't have
+this" by returning `source.ErrNotFound` (any other error counts as a failure and also falls
+back), or better, by implementing `Present`, so a missing range never costs a read.
+
+```go
+// A fast tier of your own: some 1 MiB blocks in a store (a map here; a key-value store,
+// object cache or local directory in real life)
+func (m *memTier) Present(off, length int64) bool {
+	for b := off / mib; b <= (off+length-1)/mib; b++ {
+		if _, ok := m.blocks[b]; !ok {
+			return false
+		}
+	}
+	return true
+}
+func (m *memTier) ReadAt(p []byte, off int64) (int, error) {
+	data, ok := m.blocks[off/mib]
+	if !ok {
+		return 0, source.ErrNotFound
+	}
+	return copy(p, data[off%mib:]), nil // full version handles reads spanning blocks
+}
+
+// A slow remote of your own, abortable
+func (s *remote) ReadAt(p []byte, off int64) (int, error) {
+	select {
+	case <-s.abort:
+		return 0, errAborted
+	default:
+	}
+	return s.fetch(p, off) // your RPC
+}
+func (s *remote) Abort() { s.once.Do(func() { close(s.abort) }) }
+
+base := source.NewCache(fast, source.NewReadAhead(slow))
+dev, err := device.Serve(ctx, &device.Options{ID: "tiered", Base: base, COWFile: cow})
+st := base.Stats() // Hits, Misses, Failures
+```
+
+`source.NewReadAhead` gives a remote without a cache of its own what the HTTP source has
+built in: 1 MiB blocks, single-flight fetches (concurrent readers of a block share one
+request) and sequential read-ahead. Use it for anything with a round trip per request.
+Full programs: `examples/lib-tiered` (in-memory fast tier, delayed remote, abort) and
+`examples/lib-dircache` (a directory of block files as the fast tier).
+
+### Hydrate and record from code
+
+The `hydrate:` and `record:` config blocks are `device.Hydrate` and `device.Record`:
+
+```go
+ranges, at, _ := source.ParsePrefetchFileTimed("/srv/vm42.prefetch") // from blkmap recording compact
+dev, err := device.Serve(ctx, &device.Options{
+	ID: "vm42", Base: base, COWFile: cow,
+	Hydrate: &device.Hydrate{
+		Prefetch:   ranges,
+		PrefetchAt: at,        // timestamps: progress then says ahead or behind
+		Rest:       true,
+		Rate:       64 << 20,  // rest phase cap, bytes/s
+		Report:     10 * time.Second,
+		OnProgress: func(p device.Progress) {
+			log.Printf("%s %d/%d, late %d, %v", p.Phase, p.Hydrated, p.Total, p.Late, p.Schedule)
+		},
+	},
+	Record: &device.Record{File: "/srv/vm42.rec", MaxDuration: 2 * time.Minute},
+})
+```
+
+`dev.Status()` returns the same snapshot `blkmap status --json` prints.
+
+### A remote protocol that conveys holes
+
+A remote that knows where its data is can say so once, as a map, instead of answering reads
+for zeros. `examples/grpc-remote` does it with two RPCs: `Open` returns the size and the data
+extents (`source.Extents` of the exported file), `Read` returns bytes. The client attaches
+the extents and the block cache:
+
+```go
+m, _ := source.NewMap(extents)
+base := source.WithMap(source.NewReadAhead(&remoteFile{client: c, name: name, size: size}), m, 0)
+```
+
+Hole regions read as zeros locally, hydration marks them without a request, and read-ahead
+never fetches them. A 1 TiB sparse export with 4 GiB of data hydrated by transferring 4 GiB.
+
+### Swap the source under a live device
+
+`source.NewSwappable(src)` is a source whose target can be replaced while the device serves:
+`Swap(next)` waits for reads in flight on the old target, requires the same size, and returns
+the old one for you to close. Use it to move a device from a failing origin to a mirror, or
+from a remote to a local copy once it has arrived. The content must be the same; blkmap
+cannot check that for you.
+
+### A Windows dynamic-disk mirror, and no-op writes
+
+A Windows mirrored volume is RAID-1 across two dynamic disks: each disk has its own
+partition table and LDM metadata, and the volume's data sits on both, byte for byte the same.
+With a backup of only one disk, both can be served again from one process: disk 0 from the
+backup, disk 1 as its own header plus an alias onto disk 0's data range.
+
+```go
+dataOff, dataLen := int64(1<<20), size-(1<<20)-(1<<20) // up to the LDM database, last MiB
+disk1, _ := source.NewConcat([]*source.Segment{
+	{Offset: 0, Source: header1},                         // disk 1's own first MiB, or zeros
+	{Offset: dataOff, Source: source.NewZero(size - dataOff)}, // never read in the alias range
+}, size)
+g, err := device.ServeGroup(ctx, []*device.GroupOptions{
+	{Options: device.Options{ID: "ldm0", Base: disk0, COWFile: cow0}, ElideIdenticalWrites: true},
+	{Options: device.Options{ID: "ldm1", Base: disk1, COWFile: cow1}, ElideIdenticalWrites: true,
+		Aliases: []device.Alias{{Offset: dataOff, Length: dataLen, Target: "ldm0", TargetOffset: dataOff}}},
+})
+```
+
+Reads of disk 1's data range see disk 0's bytes and writes there land in disk 0's store, so
+the plexes cannot diverge and nothing is stored twice. `ElideIdenticalWrites` handles what
+Windows does next: it does not trust the restored mirror and resyncs it, rewriting every
+block of disk 1 with disk 0's content. Those writes are identical to what the device already
+reads, and elision drops them before they reach the COW file:
+
+```
+$ sudo ./lib-ldm-mirror -disk0 disk0.img -demo
+resync of 16 MiB onto ldm1: chunks stored before 0, after 0
+4 KiB change through ldm1: chunks stored 1; ldm0 reads it back: true
+```
+
+Elision works per device without groups too (`cow.Store.SetElision`). It compares against the
+base only when the base cannot change (no `Binder` in it), otherwise only against chunks
+already in the COW file, and a whole-chunk write never waits on reading the base. The full
+program is `examples/lib-ldm-mirror`.
 
 ### Device groups
 
@@ -449,3 +659,9 @@ each other (the disks of a software RAID restored from a backup that kept only t
 
 `Group.Close` ends every device's I/O before it closes any store.
 
+### A block device without the overlay
+
+`ublk.Create(&ublk.Params{Backend: b})` serves any `ublk.Backend` (`ReadAt`, `WriteAt`,
+`Size`, `Flush`, optionally `Discard` and `WriteZeroes`) as `/dev/ublkbN`, with no COW file,
+no symlink and no systemd integration: the transport alone. `Device.Close` stops and deletes
+it; with `Params.Recovery` the device survives the process and `ublk.Recover` re-attaches.

@@ -138,6 +138,9 @@ device must appear as `/dev/blkmap/ID` before the command returns.
 | L5 | `source.NewSwappable` | the target is replaced between requests, sizes must match | `source/swappable_test.go` |
 | L6 | Device groups: aliases, Binder, elision, writeback, reciprocal aliases | a mirror plex as a view of its sibling; parity sees guest writes; identical writes cost nothing; flush terminates | `device/group_test.go`, `TestServeGroupThroughKernel` |
 | L7 | `ublk.Create` with a bare backend | a device without the COW layer; stop and delete | `ublk/service_test.go` |
+| L8 | A computed source with holes, presence and identity, as a `type: custom` segment and directly | content as computed; holes reported; a changed version is refused | `examples/lib-custom-source` tests |
+| L9 | Own fast and slow backends behind a cache | cached blocks skip the round trip; misses fall through; abort reaches the slow tier through cache and read-ahead | `examples/lib-tiered` tests |
+| L10 | LDM mirror from one disk's backup, with elision | disk 1's data range reads disk 0; a resync stores nothing; a real change stores one chunk and shows on both disks | `examples/lib-ldm-mirror` tests (`TestMirrorThroughKernel` needs root) |
 
 ## Running it
 

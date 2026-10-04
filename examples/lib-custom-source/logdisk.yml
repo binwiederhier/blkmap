@@ -1,0 +1,14 @@
+# A device whose first 256 MiB come from the program's own "logdisk" source and whose tail
+# is a zero segment; writes go to the COW file as always. Run with:
+#   sudo ./lib-custom-source -config logdisk.yml
+segments:
+  - type: custom
+    name: logdisk            # the name passed to source.Register
+    size: 256M
+    params:                  # passed to the constructor as a string map
+      name: logdisk
+      version: "1"
+  - type: zero
+    size: 64M
+cow:
+  file: /var/lib/blkmap/example-logdisk.cow

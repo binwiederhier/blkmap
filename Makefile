@@ -37,7 +37,7 @@ stress:
 
 # Build and test every example (the gRPC one is its own module)
 examples:
-	go vet ./examples/... && go test ./examples/... && go build -o /dev/null ./examples/lib-synthetic && go build -o /dev/null ./examples/lib-dircache
+	go vet ./examples/... && go test ./examples/... && for e in lib-synthetic lib-dircache lib-custom-source lib-tiered lib-ldm-mirror; do go build -o /dev/null ./examples/$$e || exit 1; done
 	cd examples/grpc-remote && go vet ./... && go test ./... && go build -o /dev/null .
 
 scenarios:
