@@ -1,5 +1,5 @@
 // Package ublk serves a Backend as a Linux block device through the kernel's ublk driver.
-// It is a trimmed, in-tree descendant of github.com/ehrlich-b/go-ublk (MIT, Benjamin
+// It is a trimmed, in-tree descendant of github.com/ehrlich-b/go-ublk (MIT, Bryan
 // Ehrlich): an ioctl-encoded control plane on /dev/ublk-control, one io_uring and one OS
 // thread per queue, and per-tag buffers sized to the maximum request.
 package ublk
