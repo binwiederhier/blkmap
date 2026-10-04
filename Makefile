@@ -1,7 +1,7 @@
 MAKEFLAGS := --jobs=1
 VERSION := $(shell git describe --tag 2>/dev/null || echo dev)
 
-.PHONY: help build test test-root stress scenarios test-remote powercut soak test-vm examples vet fmt release release-snapshot install-deb clean
+.PHONY: help build test test-root stress scenarios test-remote test-machine powercut soak test-vm examples vet fmt release release-snapshot install-deb clean
 
 help:
 	@echo "blkmap"
@@ -11,6 +11,7 @@ help:
 	@echo "  make stress           - e2e + fio/mkfs/crash workloads against the installed deb (root, fio)"
 	@echo "  make scenarios        - real-life scenarios: crashes, outages, restarts, bad configs (root, deb, fio)"
 	@echo "  make test-remote HOST=ip [SUITE=stress|scenarios|all] - root suites (+workloads) on a scratch VM"
+	@echo "  make test-machine HOST=ip [POWER=5] [SOAK=120] - everything against one throwaway machine, with a summary"
 	@echo "  make powercut HOST=ip [CYCLES=10] [MODE=power|kill]  - power-cut or daemon-kill cycles on a scratch VM"
 	@echo "  make soak HOST=ip [MINUTES=120]  - verified I/O under chaos for hours, with leak sampling"
 	@echo "  make test-vm          - everything above on a throwaway Proxmox VM (PROXMOX=root@box11 TEMPLATE=9000)"
@@ -41,6 +42,10 @@ examples:
 scenarios:
 	go build -o dist/rangehttpd ./scripts/rangehttpd
 	sudo scripts/scenarios.sh
+
+# Everything against one throwaway machine (unit tests here, all suites there), summary at the end
+test-machine:
+	scripts/test-machine.sh $(HOST) $(if $(POWER),--power $(POWER)) $(if $(SOAK),--soak $(SOAK))
 
 # Same suites on a throwaway VM (HOST=... ; SUITE=stress|scenarios|all adds the workloads)
 test-remote:

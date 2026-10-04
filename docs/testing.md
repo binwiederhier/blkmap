@@ -1,13 +1,15 @@
 # Testing blkmap
 
-This is the repeatable test plan. Run it again after every change that touches the I/O path,
-the COW store, device lifecycle, packaging or the unit files, and record the outcome in
-`docs/test-results/YYYY-MM-DD.md` (copy the latest one as a template).
+How the suite is organized and how to run it. What it verifies, use case by use case with
+expected outcomes, is [test-plan.md](test-plan.md). Run the suite after every change that
+touches the I/O path, the COW store, device lifecycle, packaging or the unit files, and
+record the outcome in `docs/test-results/YYYY-MM-DD.md` (`make test-machine` writes a draft).
 
 ## What runs where
 
 | Layer | Command | Needs | Time (about) |
 |---|---|---|---|
+| Everything below against one machine, with a summary | `make test-machine HOST=ip [POWER=5] [SOAK=120]` | root VM with `ublk_drv`, fio | 15 min + options |
 | Unit tests (race detector) | `make test` | Go | 1 min |
 | Examples | `make examples` | Go | 1 min |
 | Everything below, on a fresh VM | `make test-vm` | Proxmox host, see below | 16 min |
@@ -82,18 +84,18 @@ load; cache tiers and hydration with a prefetch list; a sparse image with a map 
 (checks only the data is transferred); stop while mounted; restart churn. Results go to
 `/var/tmp/blkmap-stress/results.txt` on the VM.
 
-**scenarios** (`scripts/scenarios.sh`, 37): each runs in a subshell with a 300 s limit, asserts
+**scenarios** (`scripts/scenarios.sh`, 38): each runs in a subshell with a 300 s limit, asserts
 its outcome, and is followed by a leak check (no ublk device, `blkmap serve` process, mount or
 active unit left behind). Run a subset with `scripts/scenarios.sh NAME...` on the VM.
 
 | Group | Scenarios |
 |---|---|
 | Lifecycle | start_stop_cycles, rapid_restart_reuses_id, sigterm_twice, restart_storm_under_reads, many_devices, huge_device (8 TiB), unprivileged |
-| Sources failing | missing_source, origin_down_at_start, origin_dies_mid_flight, origin_hangs_then_stop, cache_tier_vanishes |
+| Sources failing | missing_source, origin_down_at_start, origin_dies_mid_flight, origin_hangs_then_stop, cache_tier_vanishes, partial_cache_file |
 | Crashes and recovery | kill9_under_write_load (mounted, fio verify keeps running), kill9_during_hydration, origin_down_across_crash, crash_loop_reaps |
 | Handoff and upgrades | reload_handoff_under_load, package_upgrade_under_load |
 | State and config mistakes | two_devices_one_cow, geometry_change_refused, cow_file_lost, bitmap_lost, cow_disk_full, bad_configs_rejected, source_changed_refused |
-| Hydration | stop_during_hydration, hydration_survives_origin_outage, hydration_vs_guest_writes, detached_after_sources_gone, prefetch_beyond_end |
+| Hydration | stop_during_hydration, hydration_survives_origin_outage, hydration_vs_guest_writes, detached_after_sources_gone, prefetch_beyond_end, record_then_prefetch |
 | Filesystems and systemd | partition_table_survives_restart, fstab_mount_dependency, stop_while_mounted, read_only_device, discard_reclaims_space |
 | Observability | status_and_metrics |
 

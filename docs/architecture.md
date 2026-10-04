@@ -26,7 +26,7 @@ Three layers, each a Go package, each usable on its own:
 
 `device` ties them to the operating system (config to device, publish `/dev/blkmap/<id>`,
 systemd notify, status socket, hydration, crash recovery, device groups); `cmd` is the thin
-CLI (`serve`, `validate`, `map`, `pin`, `status`, `metrics`, `reap`, `udev-name`).
+CLI (`serve`, `validate`, `map`, `prefetch`, `pin`, `status`, `metrics`, `reap`, `udev-name`).
 
 ```mermaid
 flowchart LR
@@ -46,8 +46,8 @@ flowchart LR
 
 | Package | Files | What it owns |
 |---|---|---|
-| `cmd` | app, serve, validate, map, pin, status, reap, udev, util | The CLI: parse arguments, load config, call into `device`, print |
-| `device` | service, group, hydrate, backend, status, udev | A config or `Options` to a live device: store, ublk device, publish, status socket, hydration, recovery, groups |
+| `cmd` | app, serve, validate, map, prefetch, pin, status, reap, udev, util | The CLI: parse arguments, load config, call into `device`, print |
+| `device` | service, group, hydrate, record, backend, status, udev | A config or `Options` to a live device: store, ublk device, publish, status socket, hydration, recovery, groups |
 | `cow` | service, bitmap | `Store` (the ublk backend): bitmap, copy-up, flush ordering, discard, elision, writeback, hydration primitives; `Bitmap` format and live file |
 | `source` | source, concat, file, zero, http, blockcache, readahead, cache, map, range, raid5, swappable, custom, bind, identity, util | The read-only base: `Source` and every source type, holes and maps, content identity |
 | `ublk` | uapi, ring, control, queue, service | The kernel transport: ioctl encoding, minimal io_uring, control commands, queue threads and dispatch, create/stop/delete/recover |
@@ -76,6 +76,32 @@ optionally `Sparse`, `DirectReader`, `Aborter`, `Identifier`, `Binder`); `ublk.B
 (`ReadAt`, `WriteAt`, `Size`, `Flush`, optionally `Discarder`, `ZeroWriter`), implemented by
 `cow.Store`; `device.Options`, the library entry point: `device.Serve(ctx, &Options{ID, Base,
 COWFile})` makes any Source a block device.
+
+## Important types
+
+The types a reader meets first, and what owns what.
+
+| Type | Package | Role |
+|---|---|---|
+| `Config`, `Segment`, `COW`, `Hydrate`, `Record` | `config` | the validated YAML; `Segment` is recursive (raid5 members, cache tiers), `Offset < 0` means "after the previous one" |
+| `Source` | `source` | `ReadAt`, `Size`, `Close`: anything the base is made of |
+| `Sparse`, `Present`, `DirectReader`, `Aborter`, `Identifier`, `Binder` | `source` | optional abilities: tell holes; tell what it holds (a cache's fast tier misses on the rest); read around a cache; fail blocked reads at shutdown; fingerprint content; read sibling devices in a group |
+| `Concat`, `File`, `Zero`, `HTTP`, `RAID5`, `Cache`, `Mapped`, `ReadAhead`, `Swappable` | `source` | the source types; `Mapped` attaches a `Map` of data extents to any of them |
+| `Range`, `Map`, `Access` | `source` | a byte range; sorted merged data extents; one recorded request (`Millis`, `Write`, `Offset`, `Length`) |
+| `Store` | `cow` | the ublk backend: base + COW file + `Bitmap` + chunk locks; `ReadAt`, `WriteAt`, `Flush`, `Discard`, `WriteZeroes`, `HydrateRun`, `MarkZero`, `Writeback`, `SetElision`, `OnDemandRead`, `SourceStats` |
+| `Bitmap` | `cow` | one bit per chunk, 4 KiB header (magic, geometry, identity), dirty pages, optional live file in `/run` |
+| `Options`, `Device` | `device` | the library entry (`ID`, `Base`, `COWFile`, `Hydrate`, `Record`, `Recovery`, ...) and the running device (`Path`, `BlockPath`, `Close`, `Detach`, `Status`, `Done`, `Writeback`) |
+| `Hydrate`, `Progress`, `Schedule` | `device` | the hydration plan (prefetch ranges and their times, rest, rate, cache policy, concurrency); a snapshot (phase, chunks, copied, errors, late); ahead/behind a timed list |
+| `Record`, `RecordStatus` | `device` | recording options (file, max duration and size) and its state |
+| `GroupOptions`, `Alias`, `Group` | `device` | several devices from one process; a range of one as a view of another |
+| `Status`, `IOStats`, `Histogram` | `device` | what the status socket and `blkmap status` report |
+| `backend` (unexported) | `device` | wraps the store for the kernel: counters, latency histograms, the busy signal, the recorder |
+| `Params`, `Device`, `Backend`, `Discarder`, `ZeroWriter`, `Info` | `ublk` | create/recover/stop/delete a kernel device over a `Backend` |
+
+Ownership: `device.Serve` owns the `Base` it was given (closes it even on failure); the
+`Store` owns the COW and bitmap files; the `ublk.Device` owns the char device fd, the queue
+threads and their buffers; the `Group` owns every device's store and halts all I/O before
+closing any of them.
 
 ## Lifecycle: start, shutdown, crash recovery
 
@@ -297,8 +323,21 @@ chunks the guest wrote meanwhile.
 | `cache` | `fast`, fall through to `slow` | slow's | slow's |
 | `custom` | a registered `Constructor` | as implemented | as implemented |
 
-- **Cache tiers**: the fast tier answers, or returns `ErrNotFound` (miss) or any error
-  (failure), and the slow tier answers instead. Nothing is written to the fast tier.
+- **Cache tiers**: a fast tier that implements `Present` (a sparse file, a mapped source) is
+  asked first and any range it does not fully hold is a miss; otherwise the fast tier answers,
+  or returns `ErrNotFound` (miss) or any error (failure), and the slow tier answers instead.
+  Nothing is written to the fast tier, so a partial local copy is a fast tier as it is.
+
+```mermaid
+flowchart LR
+  R[read off,len] --> P{fast implements Present?}
+  P -- "yes, not fully present" --> MISS[miss: read slow]
+  P -- "yes, present" --> F[read fast]
+  P -- no --> F
+  F -- "ok, full count" --> HIT[hit]
+  F -- "ErrNotFound or short" --> MISS
+  F -- other error --> FAIL[failure: read slow]
+```
 - **Holes and maps**: `Sparse` sources answer `Holes`; others get a *map* of data extents
   (`offset length` lines from `blkmap map FILE`, `map:` in the config, or `<url>.map` probed
   next to an HTTP image). `Mapped` zero-fills holes locally and tells the read-ahead what to
@@ -314,34 +353,57 @@ chunks the guest wrote meanwhile.
 
 ## Background hydration
 
-List phase (prefetch ranges, in order, full speed), then rest phase (everything else,
-ascending, paced by `rate` with a token bucket) unless `rest: false`. A hole scan in 4 GiB
-windows marks hole chunks with `MarkZero` first. Consecutive same-kind chunks form batches of
-up to 1 MiB handed to `concurrency` workers (default 4). Guest requests come first without starving
-hydration: while the guest is active (a request in flight or within 100 ms) at most one copy
-runs, or half the workers while a timed list is behind the recording; an idle guest gets all
-of them (`hydrator.share`/`admit`). A chunk the guest wrote is skipped.
-`use-cache: never` reads around cache tiers. Failed runs are retried in up to 5 passes 10 s
-apart. Progress every `report-every` (default 30 s):
+List phase (prefetch ranges, in order), then rest phase (everything else, ascending, paced by
+`rate` with a token bucket) unless `rest: false`. A hole scan in 4 GiB windows marks hole
+chunks with `MarkZero` first. Consecutive same-kind chunks form batches of up to 1 MiB handed
+to `concurrency` workers (default 4). A chunk the guest wrote is skipped. `use-cache: never`
+reads around cache tiers. Failed runs are retried in up to 5 passes 10 s apart; reads that
+fail because the device is stopping are not retried.
+
+**Fair share.** Guest requests come first without starving hydration. Before each copy a
+worker takes a slot in the share: all workers when the guest is idle (no request in flight or
+within the last 100 ms), one copy when the guest is busy, half the workers when the guest is
+busy but a timed prefetch list is behind the recording (those chunks are the guest's own
+next reads). Pausing entirely, the old rule, starved the prefetch on a slow source where the
+guest always has a request in flight.
+
+```mermaid
+flowchart TD
+  B[batch of chunks ready] --> Z{zero run?}
+  Z -- yes --> M[MarkZero, no copy]
+  Z -- no --> L{rest phase and rate set?}
+  L -- yes --> T[token bucket wait]
+  L -- no --> S
+  T --> S{slots in the share?}
+  S -- "guest idle: all workers" --> C
+  S -- "guest busy, list behind: half" --> C
+  S -- "guest busy: one" --> C
+  S -- none free --> W[wait 10 ms] --> S
+  C[HydrateRun: one base read up to 1 MiB, write, set bits] --> D[release slot]
+```
+
+**Recording and timed lists.** With a `record` block, `device.backend` hands every read and
+write (offset, length, start time) to an `ioRecorder`: an append to a fixed 64K-entry buffer
+under a mutex, no allocation. A goroutine swaps the buffer every second and writes
+`millis R|W offset length` lines; a full buffer drops and counts. `max-duration`, `max-size`
+or device stop end the recording, after which the backend is back to a nil check; the file is
+created with `O_EXCL`, so restarts never clobber it. `blkmap prefetch` compacts it
+(`source.CompactRecording`: reads only, first touch per chunk, chunk-aligned, merged, first
+timestamp kept) and `--stats` reports the unique bytes needed by 1/5/10/30 s and the rate
+that stays ahead. `ParsePrefetch` accepts both the two-field and the four-field form; with
+timestamps, `hydrator.schedule` compares the COW file with when the recording read each
+listed chunk: behind (listed chunks due by now and not copied), ahead (time until the next
+due range), or list complete with the lead at that moment. The store tells the hydrator
+about every guest read that went to the base (`OnDemandRead`), and it counts the listed
+chunks among them as late.
+
+Progress every `report-every` (default 30 s):
 
 ```
-12:35:37 doc2: hydration rest: 320/16384 chunks (1%), 20M copied
-12:35:38 doc2: hydration rest: 704/16384 chunks (4%), 44M copied
-12:35:39 doc2: hydration rest: 8256/16384 chunks (50%), 68M copied
-12:35:40 doc2: hydration done: 16384/16384 chunks in the cow file, 80M copied, 0 errors
+vm: hydration list: 1275/57344 chunks (2%), 77696K copied; 1.8s ahead of the recording
+vm: hydration list: 2494/57344 chunks (4%), 150720K copied; behind the recording by 1.6s (623 chunks due), 71 listed chunks read on demand
+vm: hydration rest: 8958/57344 chunks (15%), 311360K copied; prefetch list complete, 1.2s after the recording needed the last of it
 ```
-
-The jump from 4% to 50% is the hole scan: a 1 GiB file with 80 MiB of data.
-
-**Recording a prefetch list.** With a `record` block, `device.backend` hands every read and
-write (device offset, length, start time) to an `ioRecorder`: an append to a fixed 64K-entry
-buffer under a mutex, no allocation. A goroutine swaps the buffer every second and writes
-`millis R|W offset length` lines; a full buffer drops and counts. `max-duration`,
-`max-size` or device stop end the recording, after which the backend is back to a nil check.
-The file is created with `O_EXCL`, so restarts never clobber it. `blkmap prefetch` compacts it
-(`source.CompactRecording`: reads only, first touch per chunk, merged), `--stats` reports the
-unique bytes needed by 1/5/10/30 s and the constant rate that stays ahead, and
-`ParsePrefetch` accepts both the two-field and the four-field form.
 
 ## Device groups
 
