@@ -1,7 +1,7 @@
 MAKEFLAGS := --jobs=1
 VERSION := $(shell git describe --tag 2>/dev/null || echo dev)
 
-.PHONY: help build test test-root stress scenarios test-remote test-machine verify-release powercut crashreplay coverage soak test-vm examples vet fmt release release-snapshot install-deb clean
+.PHONY: help build test test-root stress scenarios test-remote test-machine verify-release powercut crashreplay faults coverage soak test-vm examples vet fmt release release-snapshot install-deb clean
 
 help:
 	@echo "blkmap"
@@ -15,7 +15,8 @@ help:
 	@echo "  make verify-release [SOAK=120] - unattended: test-vm then a soak on every kernel template, one at a time"
 	@echo "  make powercut HOST=ip [CYCLES=10] [MODE=power|kill]  - power-cut or daemon-kill cycles on a scratch VM"
 	@echo "  make soak HOST=ip [MINUTES=120]  - verified I/O under chaos for hours, with leak sampling"
-	@echo "  make crashreplay HOST=ip [RECORDS=3000] [STEP=1] - every logged crash state of the COW filesystem (dm-log-writes)"
+	@echo "  make crashreplay HOST=ip [MODE=records|fs] [N=3000] [CHECKS=0] - logged crash states of the COW filesystem (dm-log-writes)"
+	@echo "  make faults HOST=ip   - write errors on the COW filesystem (dm-flakey) under a verifying writer"
 	@echo "  make coverage HOST=ip - unit + root test coverage into dist/coverage.html"
 	@echo "  make test-vm          - everything above on a throwaway Proxmox VM (PROXMOX=root@box11 TEMPLATE=9000)"
 	@echo "  make examples         - vet, test and build everything under examples/"
@@ -64,7 +65,11 @@ powercut:
 
 # Every logged crash state of the COW filesystem must keep each acknowledged write
 crashreplay:
-	scripts/crashreplay.sh $(HOST) $(or $(RECORDS),3000) $(or $(STEP),1)
+	scripts/crashreplay.sh $(HOST) $(or $(MODE),records) $(or $(N),3000) $(or $(CHECKS),0)
+
+# Write errors under the COW file must never leave a bit without its data
+faults:
+	scripts/faults.sh $(HOST)
 
 # Unit plus root test coverage (the root tests run on HOST)
 coverage:

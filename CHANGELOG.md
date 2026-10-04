@@ -5,6 +5,15 @@ releases are cut with `make release` from a `vX.Y.Z` tag.
 
 ## Unreleased
 
+- **A failed COW fsync stops the store** (after v0.2.2): Linux marks the pages of a failed
+  writeback clean, so a retried flush used to succeed and commit bitmap bits for data that
+  never reached the disk (seen as lost copy-ups: chunks reading zeros instead of the base).
+  Now the store refuses all I/O after the first failed sync, never commits another bit,
+  drops the live bitmap, and the server hands the kernel device to a successor that serves
+  the last durable state (`cow.ErrCOWFailed`, `Device.Abandon`).
+- **Zero marking after a crash** (v0.2.2): hydration marking a base hole as zero could
+  expose COW data whose bit a crash without a live bitmap had lost; it now punches first.
+
 - **Device groups** (library): `device.ServeGroup` with aliased ranges between devices
   (mirror plexes stored once), `source.Binder` for bases derived from their siblings' live
   views (RAID parity), write elision for identical rewrites, and overlay writeback. Review

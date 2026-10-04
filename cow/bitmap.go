@@ -353,6 +353,12 @@ func (b *Bitmap) CloseNoSync() error {
 	return errors.Join(b.releaseLive(false), b.f.Close())
 }
 
+// CloseDropLive closes the bitmap without writing pending bits and removes the live file:
+// for when the cow file's page cache, which the live bits describe, may have lost data.
+func (b *Bitmap) CloseDropLive() error {
+	return errors.Join(b.releaseLive(true), b.f.Close())
+}
+
 // releaseLive unmaps and closes the live file, removing it if remove is set.
 func (b *Bitmap) releaseLive(remove bool) error {
 	if b.live == nil {

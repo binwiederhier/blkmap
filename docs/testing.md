@@ -21,7 +21,8 @@ record the outcome in `docs/test-results/YYYY-MM-DD.md` (`make test-machine` wri
 | Daemon kills under a verifying writer | `make powercut HOST=ip MODE=kill CYCLES=5` | same | 2 min |
 | Power cuts under a verifying writer | `make powercut HOST=ip MODE=power CYCLES=10` | same; reboots the VM | 4 min |
 | Soak: verified I/O under chaos for hours | `make soak HOST=ip MINUTES=120` | same | 2 h |
-| Crash-point replay: every logged crash state of the COW filesystem | `make crashreplay HOST=ip [RECORDS=3000] [STEP=1]` | same, plus `dm-log-writes` | 10 min |
+| Crash-point replay: every logged crash state of the COW filesystem | `make crashreplay HOST=ip [MODE=records\|fs] [N=3000] [CHECKS=0]` | same, plus `dm-log-writes` | 10 min (records), 30 min (fs, 300 states) |
+| Write errors under the COW file | `make faults HOST=ip` | same, plus `dm-flakey` | 1 min |
 | Coverage of unit plus root tests | `make coverage HOST=ip` | same | 3 min |
 
 Never run the root-level layers on a workstation. A bug in the ublk transport can wedge a
@@ -174,6 +175,23 @@ The base is random, so a bitmap bit that reaches the disk ahead of its data show
 that no longer reads as the base. To check the harness itself, commit the bitmap before
 syncing the COW file in `Store.Flush`: the run must fail.
 
+`MODE=fs` replays a guest filesystem instead: ext4 inside the device over a sparse ext4
+base that hydrates during the recording, with a workload that marks each fsync. Every state
+is read once without hydration and again after hydration completes, which catches zero
+marking that exposes unclaimed COW data (the old `MarkZero` fails 6 of 85 states), then
+the guest filesystem must fsck clean and hold each file as its last fsync left it.
+
+## Write errors under the COW file
+
+`make faults` puts the COW filesystem on device-mapper and swaps in dm-flakey
+`error_writes` mid-write. After a failed fsync Linux marks the failed pages clean, so a
+retried flush would succeed without the data: the store must stop at the first failure
+(`cow.ErrCOWFailed`) and the server must restart from the last flushed state. The COW
+filesystem has no journal in this test, since ext4 with one aborts and goes read-only on
+the first failed commit, hiding the COW file's own failure; it gets a fsck before the last
+phase, like any filesystem after write errors. Before the fix the test lost 240 slots of
+base data.
+
 ## Older systemd
 
 Template 9003 on box11 is Ubuntu 22.04 with the HWE kernel 6.8 and systemd 249, where
@@ -185,8 +203,6 @@ space without saying so; check with `virt-ls -a img /boot`.
 
 ## Not covered yet
 
-- A ublk queue loop dying while the device is live (`ublk.Device.fail`, `Device.Done`):
-  nothing in the tests can make io_uring fail on demand yet.
 - Soak runs longer than two hours (days).
 - A device group (aliases) under chaos: groups are covered by unit tests and one
   kernel-level test only.

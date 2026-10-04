@@ -11,6 +11,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
+	"heckel.io/blkmap/cow"
 	"heckel.io/blkmap/device"
 	"heckel.io/blkmap/util"
 )
@@ -60,8 +61,19 @@ func execServe(c *cli.Context) error {
 	case <-ctx.Done():
 		log.Printf("stopping %s", d.Path)
 	case <-d.Done():
-		// The kernel device is dead underneath; exit non-zero so systemd restarts the unit
 		failure = d.Err()
+		if errors.Is(failure, cow.ErrCOWFailed) {
+			// Writes the guest saw complete may be lost with the COW file's page cache: hand
+			// the device to a fresh server, which serves the last durable state
+			log.Printf("%s failed: %s; restarting from the last flushed state", d.Path, failure.Error())
+			if err := d.Abandon(); errors.Is(err, device.ErrNoRecovery) {
+				break
+			} else if err != nil && !errors.Is(err, cow.ErrCOWFailed) {
+				log.Printf("abandon: %s", err.Error())
+			}
+			os.Exit(device.ExitDetached)
+		}
+		// The kernel device is dead underneath; exit non-zero so systemd restarts the unit
 		log.Printf("%s failed: %s; stopping", d.Path, failure.Error())
 	}
 	util.SdNotify(util.NotifyStopping)

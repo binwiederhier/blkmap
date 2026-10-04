@@ -49,6 +49,9 @@ const (
 )
 
 var (
+	// ErrNoRecovery means a device cannot be handed to a successor: its kernel lacks ublk
+	// user recovery, or it was served without Options.Recovery.
+	ErrNoRecovery = errors.New("device served without recovery")
 	// served holds the IDs this process serves, so a second Serve of one is refused rather
 	// than mistaken for a predecessor to recover
 	served   = map[string]bool{}
@@ -96,8 +99,10 @@ type Device struct {
 	hydrator  *hydrator   // nil without hydration
 	recorder  *ioRecorder // nil without a recording
 	started   time.Time
-	recovered bool      // re-attached to a running device
-	status    io.Closer // the status socket; nil if it could not be opened
+	recovered bool          // re-attached to a running device
+	recovery  bool          // the kernel device outlives this process (Options.Recovery)
+	failed    chan struct{} // closed when the kernel device or the store fails
+	status    io.Closer     // the status socket; nil if it could not be opened
 }
 
 // Start opens the sources and COW store for c and serves them as a block device, publishing
@@ -258,7 +263,7 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
 	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev,
-		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered}
+		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered, recovery: o.Recovery, failed: make(chan struct{})}
 	if err := os.WriteFile(filepath.Join("/sys/block", filepath.Base(dev.BlockPath), "queue", "read_ahead_kb"), []byte(strconv.Itoa(readAheadKB)), 0); err != nil {
 		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
 	}
@@ -281,10 +286,20 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 	}
 	bgCtx, cancel := context.WithCancel(context.Background())
 	d.stop = cancel
-	d.bg.Add(1)
+	d.bg.Add(2)
 	go func() {
 		defer d.bg.Done()
 		d.flushLoop(bgCtx)
+	}()
+	go func() {
+		defer d.bg.Done()
+		select {
+		case <-dev.Done():
+		case <-store.Failed():
+		case <-bgCtx.Done():
+			return
+		}
+		close(d.failed)
 	}()
 	if rec != nil {
 		d.bg.Add(1)
@@ -554,15 +569,36 @@ func (d *Device) Status() *Status {
 	return st
 }
 
-// Done is closed if the kernel device fails underneath (a queue thread died); the device
-// then answers nothing and should be closed. Err says why.
+// Done is closed if the kernel device fails underneath (a queue thread died) or the store
+// does (a COW sync failed, cow.ErrCOWFailed); the device then answers nothing and should be
+// closed, or after a store failure abandoned. Err says why.
 func (d *Device) Done() <-chan struct{} {
-	return d.ublk.Done()
+	return d.failed
 }
 
 // Err returns why the device failed, or nil.
 func (d *Device) Err() error {
+	if err := d.store.Err(); err != nil {
+		return err
+	}
 	return d.ublk.Err()
+}
+
+// Abandon gives up on a device whose store failed: background work stops, the store closes
+// without committing anything and drops the live bitmap, and the kernel device waits for a
+// successor, which serves the last durable state; a mounted guest keeps its device. The
+// caller must exit at once (with ExitDetached under systemd). Without recovery it returns
+// ErrNoRecovery and does nothing: Close the device instead.
+func (d *Device) Abandon() error {
+	if !d.recovery {
+		return ErrNoRecovery
+	}
+	if d.closed.Swap(true) {
+		return nil
+	}
+	unmarkServed(d.id)
+	d.stopBackground()
+	return d.store.Close()
 }
 
 // Close shuts the device down in an order that cannot lose data: background work stops,

@@ -672,6 +672,7 @@ the device instead of timing out.
 | Origin hangs | reads block up to the 60 s request timeout | `systemctl stop` aborts them, completes in ~1 s |
 | Power cut | nothing acknowledged before the cut is lost beyond what the page cache loses | bitmap and COW file agree by construction |
 | COW filesystem full | writes fail `ENOSPC`, reads work | free space; the preallocated bitmap still records what was written |
+| COW file sync fails (EIO under it) | the store stops (`cow.ErrCOWFailed`): every request fails, no bit is committed again, the live bitmap is dropped, and the server exits for a successor that serves the last flushed state | fix the disk (fsck the COW filesystem); writes since the last guest flush are lost, as the guest's failed flush said |
 | Base changed under the overlay | start refused with the identity message | `blkmap pin <id>` if the content is the same |
 | COW file lost, bitmap present | start refused ("missing or truncated") | restore it or delete the bitmap |
 | Second server on the same COW file | start refused ("in use") | nothing |

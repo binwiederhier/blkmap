@@ -33,6 +33,9 @@ var (
 	// ErrSourceChanged means the base no longer has the content the COW file was written
 	// over; see Options.Identity.
 	ErrSourceChanged = errors.New("source changed")
+	// ErrCOWFailed means a sync of the COW file failed: its dirty pages may be gone (Linux
+	// marks them clean), so the store refuses all I/O and never commits another bit.
+	ErrCOWFailed = errors.New("cow file failed")
 )
 
 // Options locates a store's files.
@@ -78,6 +81,11 @@ type Store struct {
 	onDemand    func(first, count int64) // see OnDemandRead; nil if unset
 	srcErrors   atomic.Int64
 	srcNanos    atomic.Int64
+	syncCOW     func() error  // the COW file's Sync; tests make it fail
+	broken      atomic.Bool   // a COW sync failed; failErr says how
+	failErr     error         // set once, before broken and failed
+	failed      chan struct{} // closed when broken is set
+	failOnce    sync.Once
 	flushMu     sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
 	locks       [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 }
@@ -131,6 +139,7 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 		}
 	}
 	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size, baseMutable: derivesFromOthers(base)}
+	s.syncCOW, s.failed = cow.Sync, make(chan struct{})
 	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
 	s.bufs.New = func() any {
 		b := make([]byte, chunkSize)
@@ -210,6 +219,9 @@ func checkIdentity(bitmap *Bitmap, identity string) error {
 }
 
 func (s *Store) ReadAt(p []byte, off int64) (int, error) {
+	if err := s.Err(); err != nil {
+		return 0, err
+	}
 	if off < 0 {
 		return 0, fmt.Errorf("%w: negative offset %d", errOutOfRange, off)
 	}
@@ -266,6 +278,9 @@ func fullRead(n, want int, err error) error {
 }
 
 func (s *Store) WriteAt(p []byte, off int64) (int, error) {
+	if err := s.Err(); err != nil {
+		return 0, err
+	}
 	if off < 0 || off+int64(len(p)) > s.size {
 		return 0, fmt.Errorf("%w: offset %d, length %d, size %d", errOutOfRange, off, len(p), s.size)
 	}
@@ -298,14 +313,16 @@ func (s *Store) Abort() {
 func (s *Store) Flush() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
+	if err := s.Err(); err != nil {
+		return err
+	}
 	if !s.dirty.Swap(false) {
 		return nil
 	}
 	pages := s.bitmap.Snapshot()
-	if err := s.cow.Sync(); err != nil {
-		s.bitmap.Redirty(pages)
-		s.dirty.Store(true)
-		return err
+	if err := s.syncCOW(); err != nil {
+		// A retry would find the failed pages clean and succeed without their data
+		return s.fail(err)
 	}
 	if err := s.bitmap.Commit(pages); err != nil {
 		s.dirty.Store(true)
@@ -314,17 +331,44 @@ func (s *Store) Flush() error {
 	return nil
 }
 
+// Failed is closed once a COW sync failed (see ErrCOWFailed). The store then answers every
+// call with Err; close it and start over from the last durable state.
+func (s *Store) Failed() <-chan struct{} {
+	return s.failed
+}
+
+// Err returns why the store failed, or nil.
+func (s *Store) Err() error {
+	if s.broken.Load() {
+		return s.failErr
+	}
+	return nil
+}
+
+// fail stops the store for good and returns why.
+func (s *Store) fail(err error) error {
+	s.failOnce.Do(func() {
+		s.failErr = fmt.Errorf("%w: %w", ErrCOWFailed, err)
+		s.broken.Store(true)
+		close(s.failed)
+	})
+	return s.failErr
+}
+
 // Written returns the number of chunks that live in the COW file.
 func (s *Store) Written() int64 {
 	return s.bitmap.Count()
 }
 
 // Close flushes and closes the COW file, the bitmap, and the base source. If the data could
-// not be made durable, pending bits are dropped rather than written ahead of it.
+// not be made durable, pending bits are dropped rather than written ahead of it; after a
+// failed COW sync the live bitmap goes too, since the page cache it vouches for may be gone.
 func (s *Store) Close() error {
 	err := s.Flush()
 	closeBitmap := s.bitmap.Close
-	if err != nil {
+	if s.Err() != nil {
+		closeBitmap = s.bitmap.CloseDropLive
+	} else if err != nil {
 		closeBitmap = s.bitmap.CloseNoSync
 	}
 	return errors.Join(err, s.cow.Close(), closeBitmap(), s.base.Close())
@@ -338,7 +382,7 @@ func (s *Store) Close() error {
 // If dst is the base itself, the base's identity changes (see Options.Identity): discard the
 // COW file and bitmap afterwards, since the base now holds what they recorded.
 func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
-	if err := s.Flush(); err != nil {
+	if err := s.Flush(); err != nil { // fails too once the store failed
 		return 0, err
 	}
 	buf := make([]byte, s.chunkSize)
@@ -432,6 +476,9 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 // as zeros and stop using space. Partial chunks and unwritten chunks are left alone, which
 // discard semantics allow.
 func (s *Store) Discard(off, length int64) error {
+	if err := s.Err(); err != nil {
+		return err
+	}
 	if err := s.checkRange(off, length); err != nil {
 		return err
 	}
@@ -456,6 +503,9 @@ func (s *Store) Discard(off, length int64) error {
 // WriteZeroes zeroes a range: whole chunks are punched out and marked written (reading as
 // zeros from the sparse COW file); partial chunks go through the normal write path.
 func (s *Store) WriteZeroes(off, length int64) error {
+	if err := s.Err(); err != nil {
+		return err
+	}
 	if err := s.checkRange(off, length); err != nil {
 		return err
 	}
@@ -543,7 +593,7 @@ func (s *Store) IsWritten(chunk int64) bool {
 // zeros. It reports whether the bit was newly set. The chunk is punched first: after a crash
 // the COW file can still hold data whose bit never reached the disk.
 func (s *Store) MarkZero(chunk int64) bool {
-	if chunk < 0 || chunk >= s.bitmap.Chunks() {
+	if chunk < 0 || chunk >= s.bitmap.Chunks() || s.Err() != nil {
 		return false
 	}
 	mu := &s.locks[chunk%lockStripes]
@@ -609,6 +659,9 @@ func (s *Store) Dirty() bool {
 // read, so a remote source sees one request per run instead of one per chunk. It reports the
 // bytes copied; chunks the guest wrote meanwhile keep the guest's data.
 func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
+	if err := s.Err(); err != nil {
+		return 0, err
+	}
 	chunks := s.bitmap.Chunks()
 	if first < 0 || first >= chunks || count <= 0 {
 		return 0, fmt.Errorf("%w: chunks %d..%d of %d", errOutOfRange, first, first+count, chunks)

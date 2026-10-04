@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -231,6 +232,72 @@ func TestDeviceLifecycle(t *testing.T) {
 	_, err = os.Stat(d.CharPath)
 	assert.True(t, os.IsNotExist(err))
 	assert.NoError(t, d.Close()) // idempotent
+}
+
+func TestQueueDeathFailsDevice(t *testing.T) {
+	requireUblk(t)
+	if runtime.NumCPU() < 2 {
+		t.Skip("needs two CPUs to map requests to both queues")
+	}
+	d := createTestDevice(t, &Params{Backend: newMem(16 << 20), NumQueues: 2})
+	select {
+	case <-d.Done():
+		t.Fatal("Done is closed on a healthy device")
+	default:
+	}
+	assert.NoError(t, d.Err())
+	// The partition scan and udev's probe must be done: a ublk server dying under them
+	// wedges the kernel device for good (see README), which no server can help
+	require.NoError(t, exec.Command("udevadm", "settle", "-t", "10").Run())
+	f, err := os.OpenFile(d.BlockPath, os.O_RDONLY|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	// Kill queue 1's loop the way a broken ring would: its next wait fails. The fd number is
+	// replaced, not closed, so it cannot be reused by a parallel test and closed again later
+	null, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	require.NoError(t, err)
+	require.NoError(t, unix.Dup3(null, d.queues[1].ring.fd, unix.O_CLOEXEC))
+	unix.Close(null)
+	select {
+	case <-d.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("a dead queue loop did not fail the device")
+	}
+	require.Error(t, d.Err())
+	assert.Contains(t, d.Err().Error(), "queue 1")
+	// Reads from every CPU: those mapped to the dead queue must fail, not hang forever
+	results := make(chan error, runtime.NumCPU())
+	for cpu := range runtime.NumCPU() {
+		go func() {
+			runtime.LockOSThread()
+			var set unix.CPUSet
+			set.Set(cpu)
+			if err := unix.SchedSetaffinity(0, &set); err != nil {
+				results <- err
+				return
+			}
+			_, err := f.ReadAt(alignedBuf(4096), int64(cpu)*4096)
+			results <- err
+		}()
+	}
+	for range runtime.NumCPU() {
+		select {
+		case <-results:
+		case <-time.After(10 * time.Second):
+			t.Fatal("a read on the dead queue hangs")
+		}
+	}
+	// The owner must still be able to tear the device down
+	require.NoError(t, f.Close())
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close hangs on a device with a dead queue")
+	}
+	_, err = os.Stat(d.BlockPath)
+	assert.True(t, os.IsNotExist(err))
 }
 
 func TestDeviceConcurrent(t *testing.T) {

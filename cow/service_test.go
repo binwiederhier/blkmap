@@ -676,6 +676,47 @@ func TestMarkZeroAfterCrashReadsZeros(t *testing.T) {
 	assert.Equal(t, make([]byte, testChunk), p, "the chunk read zeros before it was marked and must after")
 }
 
+func TestFailedCOWSyncStopsTheStore(t *testing.T) {
+	t.Parallel()
+	// A failed fsync may have dropped the COW file's dirty pages (Linux marks them clean),
+	// so a retry would succeed without the data: no bit may ever be committed after it
+	dir := t.TempDir()
+	cowPath, bitmapPath, livePath := filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap"), filepath.Join(dir, "d.live")
+	base := pattern(testSize)
+	open := func() *Store {
+		s, err := OpenWith(&mem{data: base}, &Options{COWFile: cowPath, Bitmap: bitmapPath, LiveBitmap: livePath, ChunkSize: testChunk})
+		require.NoError(t, err)
+		return s
+	}
+	s := open()
+	_, err := s.WriteAt(bytes.Repeat([]byte{'w'}, 100), 2*testChunk)
+	require.NoError(t, err)
+	s.syncCOW = func() error { return syscall.EIO }
+	require.ErrorIs(t, s.Flush(), syscall.EIO)
+	s.syncCOW = s.cow.Sync
+	assert.ErrorIs(t, s.Flush(), ErrCOWFailed, "the retry must not commit the bits")
+	select {
+	case <-s.Failed():
+	default:
+		t.Fatal("Failed is not closed")
+	}
+	_, err = s.WriteAt([]byte{1}, 0)
+	assert.ErrorIs(t, err, ErrCOWFailed)
+	_, err = s.ReadAt(make([]byte, 10), 2*testChunk)
+	assert.ErrorIs(t, err, ErrCOWFailed, "the chunk's data may be gone from the page cache")
+	info, err := Inspect(bitmapPath)
+	require.NoError(t, err)
+	assert.Zero(t, info.Written)
+	assert.ErrorIs(t, s.Close(), ErrCOWFailed)
+	_, err = os.Stat(livePath)
+	assert.True(t, os.IsNotExist(err), "a successor must not adopt bits whose data may be lost")
+	// The next server serves the last durable state: the write never got its flush
+	s = open()
+	defer s.Close()
+	assert.False(t, s.IsWritten(2))
+	assert.Equal(t, base, readAll(t, s))
+}
+
 func TestLiveBitmapIgnoresForeignGeometry(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
