@@ -10,7 +10,11 @@
 #            without hydration, then hydrated to the end (marking base holes as zero): the
 #            device must read the same, and the guest filesystem must mount, fsck clean and
 #            hold every file as its last fsync left it.
-# Usage: crashreplay-run.sh [records|fs] [N] [CHECKS]: N records or files; CHECKS crash
+#   mirror:  a mirror group (mirrorcrash): m1's base is a live view of m0, nopwrite and
+#            reclaim on both; writes reach the plexes in either order and are flushed at
+#            different times. In each crash state every write a plex acknowledged with a
+#            flush must read back on that plex, whatever its sibling had made durable.
+# Usage: crashreplay-run.sh [records|fs|mirror] [N] [CHECKS]: N records or files; CHECKS crash
 # states spread evenly over the log (0: every flush).
 set -uo pipefail
 mode=${1:-records}
@@ -44,7 +48,9 @@ systemctl reset-failed blkmap@$id blkmap@$chk 2>/dev/null
 rm -rf $w && mkdir -p $w/f $w/chk $w/g
 
 # The base: random bytes, or a sparse ext4 image with some files on it
-if [ "$mode" = fs ]; then
+if [ "$mode" = mirror ]; then
+  head -c 16M /dev/urandom > $w/base.img
+elif [ "$mode" = fs ]; then
   truncate -s 256M $w/base.img && mkfs.ext4 -q -F $w/base.img
   mount -o loop $w/base.img $w/g && head -c 24M /dev/urandom > $w/g/data && mkdir $w/g/dir && umount $w/g || exit 1
 else
@@ -57,9 +63,18 @@ truncate -s 4G $w/log.img
 data=$(losetup -f --show $w/data.img) && logdev=$(losetup -f --show $w/log.img) || exit 1
 dmsetup create lw --table "0 $(blockdev --getsz $data) log-writes $data $logdev" || exit 1
 mount /dev/mapper/lw $w/f || exit 1
-if [ "$mode" = fs ]; then config $id $w/f/d.cow 4M; else config $id $w/f/d.cow; fi
-systemctl start blkmap@$id && wait_dev $id || { echo "FAIL: the recorded device did not start"; exit 1; }
-if [ "$mode" = fs ]; then
+if [ "$mode" = mirror ]; then
+  # The group runs in mirrorcrash itself; its live bitmaps go to tmpfs, off the log, so every
+  # replayed state is a host reboot
+  mkdir -p /run/blkmap-mirror
+  $bin/mirrorcrash record -dir $w/f -base $w/base.img -run /run/blkmap-mirror -records "$n" -mark lw -journal $w/journal | sed 's/^/  /' || { echo "FAIL: mirrorcrash record"; exit 1; }
+  rm -rf /run/blkmap-mirror
+  echo "recorded $n mirror writes, $(grep -c '^A' $w/journal) acknowledgements in $(awk '/^A/{k=$2} END{print k}' $w/journal) flushes"
+elif [ "$mode" = fs ]; then config $id $w/f/d.cow 4M; else config $id $w/f/d.cow; fi
+[ "$mode" = mirror ] || { systemctl start blkmap@$id && wait_dev $id; } || { echo "FAIL: the recorded device did not start"; exit 1; }
+if [ "$mode" = mirror ]; then
+  :
+elif [ "$mode" = fs ]; then
   # Each fsync is followed by a mark; ops records which mark made which change durable
   mount /dev/blkmap/$id $w/g || exit 1
   m=0
@@ -79,7 +94,7 @@ else
   start=$(awk '/^start /{print $2; exit}' $w/writer.out)
   echo "recorded $n records ($(grep -c '^ack ' $w/writer.out) acknowledged flushes)"
 fi
-systemctl stop blkmap@$id
+[ "$mode" = mirror ] || systemctl stop blkmap@$id
 umount $w/f && dmsetup remove lw && losetup -d $data $logdev
 data="" logdev=""
 echo "log: $(du -h $w/log.img | cut -f1) used"
@@ -148,6 +163,20 @@ while read -r q p ack; do
   loop=$(losetup -f --show $w/chk.img)
   if ! mount $loop $w/chk 2>/dev/null; then
     echo "FAIL: $what: the COW filesystem does not mount"; failed=$((failed + 1)); losetup -d $loop; loop=""; continue
+  fi
+  if [ "$mode" = mirror ]; then
+    # Both stores straight from the replayed files, no server: what a reboot finds
+    if out=$($bin/mirrorcrash verify -dir $w/chk -base $w/base.img -journal $w/journal -upto "$ack" 2>&1); then
+      checked=$((checked + 1))
+    else
+      echo "FAIL: $what: $out"; failed=$((failed + 1))
+    fi
+    umount $w/chk
+    e2fsck -fn $loop >/dev/null 2>&1 || { echo "FAIL: $what: the COW filesystem is inconsistent after the check"; failed=$((failed + 1)); }
+    losetup -d $loop; loop=""
+    [ $((k % 50)) = 0 ] && echo "  $k/$total states, $failed failed"
+    [ $failed -ge 10 ] && { echo "stopping after 10 failures"; break; }
+    continue
   fi
   rm -f /run/blkmap/$chk.*
   if ! { systemctl start blkmap@$chk && wait_dev $chk; }; then

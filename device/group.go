@@ -60,6 +60,8 @@ func ServeGroup(ctx context.Context, opts []*Options) (*Group, error) {
 			closeStores()
 			return nil, fmt.Errorf("%s: %w", o.ID, err)
 		}
+		// Any member may be a sibling's base: its views ask it what is durable
+		store.TrackDurability()
 		stores[o.ID] = opened{store: store, pred: pred}
 	}
 	bases := make([]source.Source, len(opts))

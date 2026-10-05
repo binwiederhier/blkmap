@@ -89,6 +89,20 @@ type siblingSource struct {
 }
 
 func (s *siblingSource) Bind(lookup source.Lookup) { s.lookup = lookup }
+
+// Durable forwards to the sibling's store (source.Durability), so a store over this view
+// relies on what the sibling made durable only.
+func (s *siblingSource) Durable(off, length int64) bool {
+	if s.lookup == nil {
+		return false
+	}
+	a, ok := s.lookup(s.id)
+	if !ok {
+		return false
+	}
+	d, ok := a.(source.Durability)
+	return ok && d.Durable(off, length)
+}
 func (s *siblingSource) ReadAt(p []byte, off int64) (int, error) {
 	if s.lookup == nil {
 		return 0, io.ErrUnexpectedEOF
@@ -122,6 +136,7 @@ func TestMirrorPlexNeverClobbersItsSibling(t *testing.T) {
 	dir := t.TempDir()
 	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
 	a.EnableReclaim()
+	a.TrackDurability()
 	view := &siblingSource{id: "a", size: 8 * groupChunk}
 	b := openTestStoreOver(t, dir, "b", view)
 	b.EnableReclaim()
@@ -130,11 +145,14 @@ func TestMirrorPlexNeverClobbersItsSibling(t *testing.T) {
 	view.Bind(lookupOf(map[string]*cow.Store{"a": a, "b": b}))
 	off := int64(3*groupChunk + 100)
 	x, y := bytes.Repeat([]byte{0xAA}, 200), bytes.Repeat([]byte{0xBB}, 200)
+	// a mirrored write whose first half a made durable before b's half lands; b relies on
+	// a's content only once it is durable (see TestNopWriteNeverReliesOnAnUnflushedSibling)
 	writeBoth := func(p []byte) {
-		for _, s := range []*cow.Store{a, b} {
-			_, err := s.WriteAt(p, off)
-			require.NoError(t, err)
-		}
+		_, err := a.WriteAt(p, off)
+		require.NoError(t, err)
+		require.NoError(t, a.Flush())
+		_, err = b.WriteAt(p, off)
+		require.NoError(t, err)
 	}
 	writeBoth(x)
 	writeBoth(y)
@@ -159,6 +177,7 @@ func TestMirrorPlexNeverClobbersItsSibling(t *testing.T) {
 	_, err = a.WriteAt([]byte{7, 7, 7}, 5*groupChunk)
 	require.NoError(t, err)
 	require.Equal(t, []byte{7, 7, 7}, readAt(t, b, 5*groupChunk, 3), "an unwritten range of b follows a")
+	require.NoError(t, a.Flush())
 	// a sweep finds the chunk the re-copy wrote identical to what b reads through a again and
 	// drops it, so b follows a there once more and the next mirrored write is a nopwrite again
 	require.Equal(t, 1, b.Reclaim(context.Background(), 256), "one chunk was written since the last sweep")

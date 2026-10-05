@@ -91,10 +91,20 @@ type Store struct {
 	locks       [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
 	// readMu is held shared by a read of the COW file, from the bitmap test that chose it to the
 	// read itself, and exclusively by the punch of a chunk Reclaim dropped (see punchFreed)
-	readMu  sync.RWMutex
-	readGap func() // called by a read between its bitmap test and its COW read; tests widen the race there
-	punchMu sync.Mutex
-	punches []int64 // chunks Reclaim dropped from the overlay, punched once their cleared bits are on disk
+	readMu       sync.RWMutex
+	readGap      func() // called by a read between its bitmap test and its COW read; tests widen the race there
+	writebackGap func() // called by Writeback between its bitmap test and the chunk lock; tests only
+	// mutableBase: the base can change under the store (a sibling's view, see
+	// source.Durability); the store then relies on its content only where it is durable
+	mutableBase bool
+	// unsynced has a bit per chunk whose COW data changed since the last data sync, for
+	// Durable; allocated by the first Durable call, which a store over this one makes
+	unsynced    []uint32
+	durOnce     sync.Once
+	durTracking atomic.Bool // unsynced and the bitmap's committed copy exist
+	durReady    atomic.Bool // a flush completed since tracking began: unsynced is complete
+	punchMu     sync.Mutex
+	punches     []int64 // chunks Reclaim dropped from the overlay, punched once their cleared bits are on disk
 	// recent has one bit per chunk, set when a write changes the chunk's overlay content (or
 	// repeats it, see writeChunk) and taken by Reclaim when it examines the chunk. A chunk
 	// that differed from its base is collected in again for a second look; due is the set
@@ -163,7 +173,7 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 			return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 		}
 	}
-	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
+	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size, mutableBase: source.Mutable(base)}
 	s.syncCOW, s.failed = cow.Sync, make(chan struct{})
 	s.settle = reclaimSettle
 	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
@@ -354,10 +364,20 @@ func (s *Store) Flush() error {
 		return err
 	}
 	if !s.dirty.Swap(false) {
+		if s.durTracking.Load() {
+			s.durReady.Store(true) // nothing changed since the last flush: all of it is synced
+		}
 		return nil
 	}
 	punches := s.takePunches() // before the snapshot, so it holds every clear they wait for
 	pages := s.bitmap.Snapshot()
+	// What changed so far is in the sync below; what changes from here is marked again
+	tracking := s.durTracking.Load()
+	if tracking {
+		for w := range s.unsynced {
+			atomic.StoreUint32(&s.unsynced[w], 0)
+		}
+	}
 	if err := s.syncCOW(); err != nil {
 		// A retry would find the failed pages clean and succeed without their data
 		return s.fail(err)
@@ -368,6 +388,9 @@ func (s *Store) Flush() error {
 		return err
 	}
 	s.punchFreed(punches)
+	if tracking {
+		s.durReady.Store(true)
+	}
 	return nil
 }
 
@@ -474,10 +497,20 @@ func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
 		if !s.bitmap.Test(chunk) {
 			continue
 		}
+		if s.writebackGap != nil {
+			s.writebackGap()
+		}
 		start := chunk * s.chunkSize
 		length := min(s.chunkSize, s.size-start)
 		mu := &s.locks[chunk%lockStripes]
 		mu.Lock()
+		// Test again under the lock: Reclaim may have dropped the chunk since, and the flush
+		// that punches it holds this lock, so the bit decides what the read sees. A dropped
+		// chunk equals the base, which the destination already holds
+		if !s.bitmap.Test(chunk) {
+			mu.Unlock()
+			continue
+		}
 		read, err := s.cow.ReadAt(buf[:length], start)
 		mu.Unlock()
 		if err := fullRead(read, int(length), err); err != nil {
@@ -519,7 +552,7 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	written := s.bitmap.Test(chunk)
 	partial := int64(len(p)) < length
 	nopwrite := s.nopwrite.Load()
-	nopBase := nopwrite && !written
+	nopBase := nopwrite && !written && s.baseDurable(start, length)
 	var buf []byte // the whole chunk from base, when a copy-up or a nopwrite check needs it
 	if !written && (partial || nopBase) {
 		scratch := s.bufs.Get().(*[]byte)
@@ -541,7 +574,8 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 			same = fullRead(read, len(p), err) == nil && bytes.Equal(cur, p)
 			s.bufs.Put(scratch)
 		} else {
-			same = bytes.Equal(buf[off-start:off-start+int64(len(p))], p)
+			// and still durable after the read: a sibling flushed meanwhile still holds the bytes
+			same = bytes.Equal(buf[off-start:off-start+int64(len(p))], p) && s.baseDurable(start, length)
 		}
 		if same {
 			if written {
@@ -559,6 +593,7 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	} else if _, err := s.cow.WriteAt(p, off); err != nil {
 		return err
 	}
+	s.markUnsynced(chunk)
 	s.bitmap.Set(chunk)
 	s.dirty.Store(true)
 	s.recordWrite(chunk)
@@ -597,6 +632,73 @@ func (s *Store) EnableReclaim() {
 	s.recent, s.again, s.due = make([]uint32, words), make([]uint32, words), make([]uint32, words)
 	s.bitmap.trackCommitted()
 	s.reclaimOn.Store(true)
+}
+
+// Durable reports whether the device's content in [off, off+length) would read the same after
+// a crash (source.Durability), for a store whose base is a view of this one: a written chunk
+// is durable once its bit is on disk and its data synced since its last change, an unwritten
+// one once its clear is on disk and its base is durable. The first call starts the tracking
+// it needs (a bit per chunk) and answers false until a flush has completed, since changes
+// before it were not tracked. Must not allocate after the first call.
+func (s *Store) Durable(off, length int64) bool {
+	s.durOnce.Do(s.trackDurability)
+	if !s.durReady.Load() || s.Err() != nil {
+		return false
+	}
+	end := min(off+length, s.size)
+	if off < 0 || off >= end {
+		return true
+	}
+	unwritten := false
+	for c := off / s.chunkSize; c*s.chunkSize < end; c++ {
+		if s.bitmap.Test(c) {
+			if !s.bitmap.committed(c) || atomic.LoadUint32(&s.unsynced[c/bitmapWordBits])&(1<<(c%bitmapWordBits)) != 0 {
+				return false
+			}
+		} else if s.bitmap.committed(c) {
+			return false // its clear is not on disk yet: a crash would bring the old copy back
+		} else {
+			unwritten = true
+		}
+	}
+	return !unwritten || s.baseDurable(off, end-off)
+}
+
+// TrackDurability starts what Durable needs, for a store that other stores' bases read (a
+// device group's member). Called before the store serves I/O, Durable is exact at once: the
+// data behind every committed bit is synced, and bits adopted from a live bitmap are not
+// committed yet. Called later (or not at all), Durable answers false until the next flush.
+func (s *Store) TrackDurability() {
+	fresh := false
+	s.durOnce.Do(func() {
+		s.trackDurability()
+		fresh = true
+	})
+	if fresh && !s.dirty.Load() {
+		s.durReady.Store(true)
+	}
+}
+
+// trackDurability starts what Durable needs: the unsynced chunks and the committed bits.
+func (s *Store) trackDurability() {
+	s.unsynced = make([]uint32, (s.bitmap.Chunks()+bitmapWordBits-1)/bitmapWordBits)
+	s.bitmap.trackCommitted()
+	s.durTracking.Store(true)
+}
+
+// markUnsynced notes that chunk's COW data changed; callers hold the chunk lock.
+func (s *Store) markUnsynced(chunk int64) {
+	if s.durTracking.Load() {
+		atomic.OrUint32(&s.unsynced[chunk/bitmapWordBits], 1<<(chunk%bitmapWordBits))
+	}
+}
+
+// baseDurable reports whether the base's content in [off, off+length) is durable: always for
+// read-only content, as source.Durable answers for a base that can change. The store skips a
+// write or drops a chunk in favour of its base only where it is, or a crash of a sibling could
+// take the only copy of data this store already made durable.
+func (s *Store) baseDurable(off, length int64) bool {
+	return !s.mutableBase || source.Durable(s.base, off, length)
 }
 
 // ReclaimStats counts what Reclaim did and has left to do.
@@ -663,9 +765,11 @@ func (s *Store) Reclaim(ctx context.Context, budget int) int {
 			break
 		}
 		examined++
-		if s.reclaimChunk(chunk, *stored, *base) {
+		freed, retry := s.reclaimChunk(chunk, *stored, *base)
+		if freed {
 			s.forget(chunk)
-		} else if !second && s.bitmap.Test(chunk) && s.record(s.again, chunk) {
+		} else if (retry || !second) && s.bitmap.Test(chunk) && s.record(s.again, chunk) {
+			// A chunk kept for want of a durable base keeps its turns until the sibling flushes
 			s.againCount++
 		}
 	}
@@ -773,9 +877,11 @@ func (s *Store) nextDue() (int64, bool) {
 	return 0, false
 }
 
-// reclaimChunk drops chunk from the overlay if it holds exactly what its base reads now (see
-// Reclaim); stored and base are chunk-sized scratch buffers.
-func (s *Store) reclaimChunk(chunk int64, stored, base []byte) bool {
+// reclaimChunk drops chunk from the overlay if it holds exactly what its base reads now and
+// that content is durable (see Reclaim); stored and base are chunk-sized scratch buffers.
+// retry reports a chunk kept only because its base is not durable yet: a sibling that has not
+// flushed the same bytes; it is worth another look later.
+func (s *Store) reclaimChunk(chunk int64, stored, base []byte) (freed, retry bool) {
 	start := chunk * s.chunkSize
 	length := min(s.chunkSize, s.size-start)
 	stored, base = stored[:length], base[:length]
@@ -783,20 +889,26 @@ func (s *Store) reclaimChunk(chunk int64, stored, base []byte) bool {
 	mu.Lock()
 	defer mu.Unlock()
 	if !s.bitmap.Test(chunk) {
-		return false
+		return false, false
+	}
+	if !s.baseDurable(start, length) {
+		return false, true
 	}
 	if read, err := s.cow.ReadAt(stored, start); fullRead(read, int(length), err) != nil {
-		return false
+		return false, false
 	}
 	if read, err := s.readBase(base, start); fullRead(read, int(length), err) != nil || !bytes.Equal(stored, base) {
-		return false
+		return false, false
+	}
+	if !s.baseDurable(start, length) { // again after the read: what it read is what is durable
+		return false, true
 	}
 	s.bitmap.Clear(chunk)
 	s.queuePunches(chunk)
 	s.dirty.Store(true)
 	s.reclaimed.Add(1)
 	s.reclaimedBytes.Add(length)
-	return true
+	return true, false
 }
 
 // Discard drops a range: whole chunks already in the COW file are punched out, so they read
@@ -847,7 +959,7 @@ func (s *Store) WriteZeroes(off, length int64) error {
 		if off == chunkStart && m == chunkEnd-chunkStart {
 			mu := &s.locks[chunk%lockStripes]
 			mu.Lock()
-			if s.nopwrite.Load() && !s.bitmap.Test(chunk) && s.baseIsZero(chunkStart, m) {
+			if s.nopwrite.Load() && !s.bitmap.Test(chunk) && s.baseDurable(chunkStart, m) && s.baseIsZero(chunkStart, m) && s.baseDurable(chunkStart, m) {
 				// the base already reads as zeros there: nothing to record
 			} else if err = s.punch(chunk); err == nil {
 				s.bitmap.Set(chunk)
@@ -891,6 +1003,7 @@ func (s *Store) baseIsZero(start, length int64) bool {
 
 // punch deallocates chunk in the COW file; it reads back as zeros. Callers hold the lock.
 func (s *Store) punch(chunk int64) error {
+	s.markUnsynced(chunk)
 	start := chunk * s.chunkSize
 	length := min(s.chunkSize, s.size-start)
 	return unix.Fallocate(int(s.cow.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, start, length)
@@ -1031,6 +1144,7 @@ func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
 				mu.Unlock()
 				return copied, err
 			}
+			s.markUnsynced(chunk)
 			s.bitmap.Set(chunk)
 			s.dirty.Store(true)
 			copied += int64(len(data))

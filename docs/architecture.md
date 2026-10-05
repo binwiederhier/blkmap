@@ -320,7 +320,11 @@ after a settle time, then forgotten until written again. The chunk is punched by
 that commits the clear; the first call also queues chunks a crashed predecessor dropped but
 never punched (allocated in the COW file with a clear bit). The recorded set is process memory:
 chunks frozen before a restart stay stored until written again. `Writeback(dst)` copies every
-written chunk into a writable copy of the base.
+written chunk into a writable copy of the base. Both rely on a derived base only where it is durable (`source.Durable`): a sibling store
+answers `Durable` from its committed bits and a bit per chunk of data changed since the last
+sync (`TrackDurability`), so a skipped write or a dropped chunk never depends on a sibling's
+unflushed state, cycles between siblings included. Writeback re-tests a chunk's bit under its
+lock: a chunk reclaimed and punched in between is skipped, never copied as zeros.
 
 **Hydration primitives.** `HydrateRun(first, count, direct)` copies up to 1 MiB of consecutive
 unwritten chunks in one read; `MarkZero(chunk)` marks a hole chunk without copying. Both skip

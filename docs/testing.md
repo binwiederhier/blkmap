@@ -182,6 +182,14 @@ is read once without hydration and again after hydration completes, which catche
 marking that exposes unclaimed COW data (the old `MarkZero` fails 6 of 85 states), then
 the guest filesystem must fsck clean and hold each file as its last fsync left it.
 
+`MODE=mirror` replays a mirror group (`scripts/mirrorcrash`): m1's base is a live view of m0,
+nopwrite and reclaim are on, and the writer mixes mirrored writes in either order with writes
+one plex gets alone and the other much later. Every write a plex acknowledged with a flush
+must survive every crash state; this is the test that a store relies on its sibling only
+where the sibling's content is durable. `MIRRORCRASH=path` runs a mirrorcrash built against
+another release: built against v0.4.0 it loses acknowledged writes on m1 within the first 50
+states, which proves the harness catches that bug.
+
 ## Faults under the COW file
 
 `make faults` puts the COW filesystem on device-mapper and swaps in faulty tables mid-write

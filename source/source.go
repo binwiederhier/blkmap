@@ -30,7 +30,9 @@ var (
 )
 
 // Source is a fixed-size, read-only byte range. ReadAt follows io.ReaderAt semantics; a read
-// past Size returns a short count and io.EOF.
+// past Size returns a short count and io.EOF. Its content must not change while a store uses
+// it: a source that reads other devices (a sibling's live view) must say so, as a Binder or
+// by implementing Durability, or a store over it relies on content a crash can take away.
 type Source interface {
 	io.ReaderAt
 	Size() int64
@@ -248,4 +250,51 @@ func Walk(s Source, fn func(Source)) {
 // composite is implemented by sources built from other sources.
 type composite interface {
 	parts() []Source
+}
+
+// Durability is implemented by sources whose content can change and that know which parts
+// of it would read the same after a crash: a live view of a sibling device answers from that
+// device's store. A store over such a source relies on its content (skipping an identical
+// write, dropping an identical chunk) only where it is durable, or a crash of the sibling
+// could take the only copy of data the store had already made durable. Must not allocate.
+type Durability interface {
+	Durable(off, length int64) bool
+}
+
+// Durable reports whether s's content in [off, off+length) would read the same after a crash.
+// A source that implements Durability answers itself; one that derives its content from
+// sibling devices (a Binder) without answering is never durable; any other source is
+// read-only content and always durable.
+func Durable(s Source, off, length int64) bool {
+	if d, ok := s.(Durability); ok {
+		return d.Durable(off, length)
+	}
+	return !hasBinder(s)
+}
+
+// Mutable reports whether some part of s can change under a store: a Binder or a source that
+// answers Durability. A store checks durability only over such a base.
+func Mutable(s Source) bool {
+	mutable := false
+	Walk(s, func(part Source) {
+		if _, ok := part.(composite); ok {
+			return // a container only routes the question to its parts
+		}
+		if _, ok := part.(Durability); ok {
+			mutable = true
+		} else if _, ok := part.(Binder); ok {
+			mutable = true
+		}
+	})
+	return mutable
+}
+
+func hasBinder(s Source) bool {
+	found := false
+	Walk(s, func(part Source) {
+		if _, ok := part.(Binder); ok {
+			found = true
+		}
+	})
+	return found
 }

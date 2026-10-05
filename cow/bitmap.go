@@ -54,7 +54,7 @@ var (
 type Bitmap struct {
 	f        *os.File
 	words    []uint32
-	disk     []uint32 // the bits as the file holds them, as of the last Commit (see committed); nil until trackCommitted
+	disk     atomic.Pointer[[]uint32] // the bits as the file holds them, as of the last Commit (see committed); nil until trackCommitted
 	chunks   int64
 	dirty    []atomic.Bool // one per bitmapPageSize of the bit area
 	live     *os.File      // nil without a live file
@@ -326,10 +326,11 @@ func (b *Bitmap) committed(i int64) bool {
 	if i < 0 || i >= b.chunks {
 		return false
 	}
-	if b.disk == nil {
+	disk := b.disk.Load()
+	if disk == nil {
 		return true // not tracked: never let a caller punch on a guess
 	}
-	return atomic.LoadUint32(&b.disk[i/bitmapWordBits])&(1<<(i%bitmapWordBits)) != 0
+	return atomic.LoadUint32(&(*disk)[i/bitmapWordBits])&(1<<(i%bitmapWordBits)) != 0
 }
 
 // Commit writes snapshotted pages to the file and makes it durable. On failure the pages are
@@ -359,17 +360,19 @@ func (b *Bitmap) Commit(pages []page) error {
 // record updates disk with what Commit wrote from pages: the pages themselves when they are
 // durable, else their union with the old state, since either may be what the file holds.
 func (b *Bitmap) record(pages []page, durable bool) {
-	if b.disk == nil {
+	diskp := b.disk.Load()
+	if diskp == nil {
 		return
 	}
+	disk := *diskp
 	for _, p := range pages {
 		first := p.index * bitmapPageSize / bitmapWordSize
 		for w := 0; w < bitmapPageSize/bitmapWordSize; w++ {
 			word := binary.LittleEndian.Uint32(p.data[w*bitmapWordSize:])
 			if durable {
-				atomic.StoreUint32(&b.disk[first+w], word)
+				atomic.StoreUint32(&disk[first+w], word)
 			} else {
-				atomic.OrUint32(&b.disk[first+w], word)
+				atomic.OrUint32(&disk[first+w], word)
 			}
 		}
 	}
@@ -380,6 +383,9 @@ func (b *Bitmap) record(pages []page, durable bool) {
 func (b *Bitmap) trackCommitted() {
 	b.syncMu.Lock()
 	defer b.syncMu.Unlock()
+	if b.disk.Load() != nil {
+		return // already tracking (reclaim and durability both use it)
+	}
 	area := make([]byte, len(b.words)*bitmapWordSize)
 	disk := make([]uint32, len(b.words))
 	if _, err := b.f.ReadAt(area, bitmapHeaderSize); err == nil {
@@ -391,7 +397,7 @@ func (b *Bitmap) trackCommitted() {
 			disk[w] = ^uint32(0) // unreadable: every bit counts as set, so nothing is punched
 		}
 	}
-	b.disk = disk
+	b.disk.Store(&disk)
 }
 
 // Redirty marks snapshotted pages dirty again, when their data sync failed.

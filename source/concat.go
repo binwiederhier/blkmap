@@ -81,6 +81,20 @@ func (c *Concat) Holes(off, length int64) ([]Range, error) {
 	return holes, nil
 }
 
+// Durable reports whether every segment's part of [off, off+length) is durable (see
+// Durability); gaps read as zeros and always are.
+func (c *Concat) Durable(off, length int64) bool {
+	end := min(off+length, c.size)
+	for i := c.index(off); i < len(c.segments) && c.segments[i].Offset < end; i++ {
+		s := c.segments[i]
+		start, stop := max(off, s.Offset), min(end, s.Offset+s.Source.Size())
+		if !Durable(s.Source, start-s.Offset, stop-start) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Concat) readAt(p []byte, off int64, direct bool) (int, error) {
 	n, eof := clampRead(len(p), off, c.size)
 	p = p[:n]

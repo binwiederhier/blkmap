@@ -15,7 +15,7 @@ help:
 	@echo "  make verify-release [SOAK=120] - unattended: test-vm then a soak on every kernel template, one at a time"
 	@echo "  make powercut HOST=ip [CYCLES=10] [MODE=power|kill]  - power-cut or daemon-kill cycles on a scratch VM"
 	@echo "  make soak HOST=ip [MINUTES=120]  - verified I/O under chaos for hours, with leak sampling"
-	@echo "  make crashreplay HOST=ip [MODE=records|fs] [N=3000] [CHECKS=0] - logged crash states of the COW filesystem (dm-log-writes)"
+	@echo "  make crashreplay HOST=ip [MODE=records|fs|mirror] [N=3000] [CHECKS=0] - logged crash states of the COW filesystem (dm-log-writes)"
 	@echo "  make faults HOST=ip   - write errors on the COW filesystem (dm-flakey) under a verifying writer"
 	@echo "  make coverage HOST=ip - unit + root test coverage into dist/coverage.html"
 	@echo "  make test-vm          - everything above on a throwaway Proxmox VM (PROXMOX=root@box11 TEMPLATE=9000)"

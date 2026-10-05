@@ -60,6 +60,21 @@ func (v *plexView) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// Durable tells disk 1's store which of disk 0's content would survive a crash
+// (source.Durability): disk 1 skips a write or drops a chunk in favour of disk 0's bytes only
+// where disk 0 made them durable, or a crash of disk 0 could take disk 1's acknowledged data.
+func (v *plexView) Durable(off, length int64) bool {
+	if v.lookup == nil {
+		return false
+	}
+	r, ok := v.lookup(v.target)
+	if !ok {
+		return false
+	}
+	d, ok := r.(source.Durability)
+	return ok && d.Durable(v.offset+off, length)
+}
+
 func (v *plexView) Size() int64  { return v.length }
 func (v *plexView) Close() error { return nil }
 

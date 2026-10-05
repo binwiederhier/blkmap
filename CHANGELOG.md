@@ -3,6 +3,24 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## v0.4.1 (2026-10-05)
+
+- **Reliance on a sibling only where it is durable** (2026-10-05 external review, finding 01):
+  nopwrite and reclaim over a sibling's view compared against the sibling's current content,
+  so b could skip or drop data it had acknowledged in favour of bytes a still held unflushed,
+  and a crash of a lost it. Now a store relies on its base only where `source.Durable` says
+  the content would survive a crash; `cow.Store.Durable` answers for a sibling store (bit
+  committed, data synced since its last change; `TrackDurability`, called by `ServeGroup`);
+  views forward it (`source.Durability`), and a Binder that does not is never relied on. A
+  chunk reclaim keeps for want of a durable base is looked at again later.
+- **Writeback never copies a reclaimed chunk** (finding 02): it tested a chunk's bit before
+  taking its lock, and a reclaim and flush in between punched the chunk, so Writeback wrote
+  zeros over the destination's right bytes. It re-tests the bit under the lock.
+- **Testing**: `make crashreplay MODE=mirror` (`scripts/mirrorcrash`): every logged crash state
+  of a mirror group with nopwrite and reclaim; v0.4.0 loses acknowledged writes there, v0.4.1
+  passes. The Windows soak bounds its SQL probes and power-cycles a guest that hangs in
+  firmware after a reset.
+
 ## v0.4.0 (2026-10-05)
 
 - **Reclaim** (library, `device.Options.Reclaim`, `cow.Store.Reclaim`): a background sweeper

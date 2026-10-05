@@ -35,11 +35,13 @@ guest_start() {
     for i in \$(seq 1 100); do [ -e /dev/blkmap/win-$v ] && break; sleep 0.1; done
     kill -0 \$(cat /run/win/$v.pid 2>/dev/null) 2>/dev/null || MEM=${GUEST_MEM:-4096} CPUS=3 /srv/win/bin/win-vm.sh $v $s /dev/blkmap/win-$v" || fail "$v: start"
 }
-# sql_ready V: wait until SQL Server in guest V answers (a Windows boot, crash recovery)
+# sql_ready V [MINUTES]: wait until SQL Server in guest V answers (a Windows boot, crash
+# recovery), 30 minutes at most; each probe is bounded, since a guest that is still booting
+# accepts the forwarded port and never answers
 sql_ready() {
-  local s; s=$(slot $1)
-  for _ in $(seq 1 180); do
-    "$sqlsoak" init -addr "$host:$((11433 + s))" >/dev/null 2>&1 && return 0
+  local s deadline; s=$(slot $1); deadline=$(( $(date +%s) + ${2:-30} * 60 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    timeout 90 "$sqlsoak" init -addr "$host:$((11433 + s))" >/dev/null 2>&1 && return 0
     sleep 10
   done
   return 1
@@ -59,7 +61,14 @@ client_stop() {
 check() {
   local v=$1 why=$2 s out; s=$(slot $1)
   client_stop $v
-  sql_ready $v || { fail "$v after $why: SQL Server did not come back in 30 min"; $ssh "/srv/win/bin/win-vm.sh shot $v /srv/win/$v-stuck.png"; return; }
+  if ! sql_ready $v; then
+    # QEMU's OVMF can spin forever after a hard reset (seen 2026-10-05: "Guest has not
+    # initialized the display", one vCPU at 100%); that is the hypervisor, not the disk
+    $ssh "/srv/win/bin/win-vm.sh shot $v /srv/win/$v-stuck.png"
+    log "INFRA $v after $why: no SQL Server in 30 min (screenshot /srv/win/$v-stuck.png); power-cycling the guest"
+    $ssh "/srv/win/bin/win-vm.sh kill $v; sleep 3; MEM=${GUEST_MEM:-4096} CPUS=3 /srv/win/bin/win-vm.sh $v $s /dev/blkmap/win-$v"
+    sql_ready $v || { fail "$v after $why: SQL Server did not come back, not even after a power cycle"; return; }
+  fi
   if out=$("$sqlsoak" verify -addr "$host:$((11433 + s))" -acked "${acks[$v]:--1}" 2>&1); then
     log "PASS $v after $why: $out"
   else

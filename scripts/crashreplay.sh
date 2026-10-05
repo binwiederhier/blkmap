@@ -16,10 +16,13 @@ cd "$me/.."
 goreleaser release --snapshot --clean >/dev/null 2>&1
 go build -o dist/powercut ./scripts/powercut
 go build -o dist/logreplay ./scripts/logreplay
+go build -o dist/mirrorcrash ./scripts/mirrorcrash
 deb=$(ls dist/blkmap_*_linux_amd64.deb)
 $ssh 'mkdir -p /root/blkmap-test/scripts /root/blkmap-test/bin'
 scp -q ${SSH_OPTS:-} "$deb" root@$host:/root/blkmap-test/
 scp -q ${SSH_OPTS:-} dist/powercut dist/logreplay root@$host:/root/blkmap-test/bin/
+# MIRRORCRASH: a mirrorcrash built against another release, to check the harness catches its bugs
+scp -q ${SSH_OPTS:-} "${MIRRORCRASH:-dist/mirrorcrash}" root@$host:/root/blkmap-test/bin/mirrorcrash
 scp -q ${SSH_OPTS:-} scripts/crashreplay-run.sh root@$host:/root/blkmap-test/scripts/
 # Detached on the host, so a dropped session cannot leave devices or mounts behind
 steps="modprobe ublk_drv; modprobe dm-log-writes; dpkg -i $(basename "$deb") >/dev/null; scripts/crashreplay-run.sh $mode $n $checks"

@@ -687,6 +687,13 @@ each other (the disks of a software RAID restored from a backup that kept only t
   what the device already reads is dropped, so a RAID resync after a restore costs no overlay
   space. Over a derived base (a Binder) a skipped range keeps following the base until a write
   there differs. It never makes a whole-chunk write depend on reading the base.
+- **Durability across siblings**: nopwrite and reclaim rely on a sibling's content only where
+  the sibling made it durable, or a crash of the sibling could take data this device already
+  flushed. A sibling's view must say what is durable: implement `source.Durability` by
+  forwarding to the sibling's store (`cow.Store.Durable`; `ServeGroup` starts the tracking for
+  every member), as `plexView` in `examples/lib-ldm-mirror` does. A Binder that does not is
+  treated as never durable, so nothing relies on it. The cost: a mirrored write whose other
+  half is not flushed yet is stored, and reclaim drops it once the sibling has flushed.
 - **Reclaim** (`Reclaim`, or `cow.Store.EnableReclaim` before I/O and then `cow.Store.Reclaim`): a background sweeper that drops stored
   chunks which equal their base again. A chunk freezes in the overlay the first time a write
   to it differs from the base at that instant, and for a mirror plex that is a matter of

@@ -1546,6 +1546,10 @@ func (d *derived) Size() int64                             { return int64(len(d.
 func (d *derived) Close() error                            { return nil }
 func (d *derived) Bind(source.Lookup)                      {}
 
+// Durable: the fake sibling's bytes are in memory and count as durable, so the tests of the
+// following semantics are about nopwrite, not about a sibling's flushes.
+func (d *derived) Durable(off, length int64) bool { return true }
+
 // Over a base derived from other devices, a write equal to what the base reads now is skipped
 // like any other, and the range keeps following the base afterwards: a mirror plex rewritten
 // with its sibling's bytes stays a view of the sibling, a parity column regenerated from the
@@ -2029,6 +2033,7 @@ func (v *liveView) ReadAt(p []byte, off int64) (int, error) { return v.of.ReadAt
 func (v *liveView) Size() int64                             { return v.of.Size() }
 func (v *liveView) Close() error                            { return nil }
 func (v *liveView) Bind(source.Lookup)                      {}
+func (v *liveView) Durable(off, length int64) bool          { return v.of.Durable(off, length) }
 
 // xorView is a parity column's base: the XOR of the data columns, read live through their
 // stores.
@@ -2052,6 +2057,9 @@ func (v *xorView) ReadAt(p []byte, off int64) (int, error) {
 func (v *xorView) Size() int64        { return v.a.Size() }
 func (v *xorView) Close() error       { return nil }
 func (v *xorView) Bind(source.Lookup) {}
+func (v *xorView) Durable(off, length int64) bool {
+	return v.a.Durable(off, length) && v.b.Durable(off, length)
+}
 
 // nonZero fills p with random bytes none of which is zero, so a hole reads apart from data.
 func nonZero(r *rand.Rand, p []byte) {
@@ -2146,6 +2154,7 @@ func TestReclaimMirrorTorture(t *testing.T) {
 	a, err := Open(&mem{data: baseData}, filepath.Join(dir, "a.cow"), filepath.Join(dir, "a.bitmap"), testChunk)
 	require.NoError(t, err)
 	a.EnableReclaim()
+	a.TrackDurability()
 	b, err := Open(&liveView{of: a}, filepath.Join(dir, "b.cow"), filepath.Join(dir, "b.bitmap"), testChunk)
 	require.NoError(t, err)
 	b.EnableReclaim()
@@ -2156,6 +2165,7 @@ func TestReclaimMirrorTorture(t *testing.T) {
 	want := assembleChunks(contents, chunks, testChunk)
 	assert.Equal(t, want, readAll(t, a), "a holds every write")
 	assert.Equal(t, want, readAll(t, b), "b reads what a reads")
+	require.NoError(t, a.Flush()) // b relies on a only once a's writes are durable
 	settleAndReclaim(b)
 	assert.EqualValues(t, 0, b.Written(), "every chunk of b equals a: all reclaimed")
 	assert.Zero(t, b.ReclaimStats().Pending)
@@ -2369,9 +2379,11 @@ func TestReclaimParityTorture(t *testing.T) {
 	d1, err := Open(&mem{data: base1}, filepath.Join(dir, "d1.cow"), filepath.Join(dir, "d1.bitmap"), testChunk)
 	require.NoError(t, err)
 	d1.EnableReclaim()
+	d1.TrackDurability()
 	d2, err := Open(&mem{data: base2}, filepath.Join(dir, "d2.cow"), filepath.Join(dir, "d2.bitmap"), testChunk)
 	require.NoError(t, err)
 	d2.EnableReclaim()
+	d2.TrackDurability()
 	p, err := Open(&xorView{a: d1, b: d2}, filepath.Join(dir, "p.cow"), filepath.Join(dir, "p.bitmap"), testChunk)
 	require.NoError(t, err)
 	p.EnableReclaim()
@@ -2457,6 +2469,8 @@ func TestReclaimParityTorture(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
+	require.NoError(t, d1.Flush()) // p relies on the data columns only once they are durable
+	require.NoError(t, d2.Flush())
 	settleAndReclaim(p)
 	assert.EqualValues(t, 0, p.Written(), "every chunk of p equals the live XOR: all reclaimed")
 	require.NoError(t, p.Flush())
@@ -2486,7 +2500,7 @@ func TestReclaimStateOnlyWhenEnabled(t *testing.T) {
 	assert.Nil(t, s.recent)
 	assert.Nil(t, s.again)
 	assert.Nil(t, s.due)
-	assert.Nil(t, s.bitmap.disk)
+	assert.Nil(t, s.bitmap.disk.Load())
 	assert.Zero(t, s.Reclaim(context.Background(), 100), "off: nothing recorded, nothing examined")
 	require.NoError(t, s.Flush())
 	s.EnableReclaim()
@@ -2497,4 +2511,121 @@ func TestReclaimStateOnlyWhenEnabled(t *testing.T) {
 	assert.Equal(t, 1, s.Reclaim(context.Background(), 100))
 	assert.EqualValues(t, 0, s.Written())
 	require.NoError(t, s.Close())
+}
+
+// storeView is a sibling's live view of a store, the way a mirror plex reads its partner:
+// it forwards Durable, so a store over it relies only on content the sibling made durable.
+type storeView struct{ s *Store }
+
+func (v *storeView) Size() int64                             { return v.s.Size() }
+func (v *storeView) ReadAt(p []byte, off int64) (int, error) { return v.s.ReadAt(p, off) }
+func (v *storeView) Close() error                            { return nil }
+func (v *storeView) Durable(off, length int64) bool          { return v.s.Durable(off, length) }
+
+// siblingPair opens a over a zero base and b over a live view of a, both without live
+// bitmaps, so abandon models a host reboot.
+func siblingPair(t *testing.T, dir string) (a, b *Store, reopen func() (*Store, *Store)) {
+	t.Helper()
+	ao := &Options{COWFile: filepath.Join(dir, "a.cow"), Bitmap: filepath.Join(dir, "a.bitmap"), ChunkSize: testChunk}
+	bo := &Options{COWFile: filepath.Join(dir, "b.cow"), Bitmap: filepath.Join(dir, "b.bitmap"), ChunkSize: testChunk}
+	open := func() (*Store, *Store) {
+		a, err := OpenWith(source.NewZero(testSize), ao)
+		require.NoError(t, err)
+		a.TrackDurability() // b's base reads it, as ServeGroup sets up
+		b, err := OpenWith(&storeView{s: a}, bo)
+		require.NoError(t, err)
+		return a, b
+	}
+	a, b = open()
+	return a, b, open
+}
+
+// From the 2026-10-05 external review (finding 01): b flushed 0x42; a later gets the same
+// bytes without a flush; reclaiming b's chunk because it equals a's current content, then a
+// reboot, lost b's flushed data (a's write never became durable). b may drop a chunk only
+// in favour of content its sibling made durable.
+func TestReclaimNeverReliesOnAnUnflushedSibling(t *testing.T) {
+	t.Parallel()
+	a, b, reopen := siblingPair(t, t.TempDir())
+	b.EnableReclaim()
+	want := bytes.Repeat([]byte{0x42}, testChunk)
+	_, err := b.WriteAt(want, 0)
+	require.NoError(t, err)
+	require.NoError(t, b.Flush())
+	_, err = a.WriteAt(want, 0) // the same bytes on the sibling, not flushed
+	require.NoError(t, err)
+	b.Reclaim(context.Background(), 1)
+	require.NoError(t, b.Flush())
+	b.abandon()
+	a.abandon()
+	a, b = reopen()
+	defer a.Close()
+	defer b.Close()
+	assert.Equal(t, want, readAll(t, b)[:testChunk], "b's flushed data must survive a reboot")
+}
+
+// The same flaw through nopwrite: b skips a write because a holds the bytes, unflushed; b's
+// flush succeeds, and after a reboot b reads a's durable content instead of what it acked.
+func TestNopWriteNeverReliesOnAnUnflushedSibling(t *testing.T) {
+	t.Parallel()
+	a, b, reopen := siblingPair(t, t.TempDir())
+	b.SetNopWrite(true)
+	want := bytes.Repeat([]byte{0x42}, testChunk)
+	_, err := a.WriteAt(want, 0) // not flushed
+	require.NoError(t, err)
+	_, err = b.WriteAt(want, 0) // equals what b reads through a now
+	require.NoError(t, err)
+	require.NoError(t, b.Flush())
+	b.abandon()
+	a.abandon()
+	a, b = reopen()
+	defer a.Close()
+	defer b.Close()
+	assert.Equal(t, want, readAll(t, b)[:testChunk], "a write b acknowledged with a flush must survive a reboot")
+}
+
+// Once the sibling flushed, relying on it is safe again: nopwrite skips, reclaim drops.
+func TestNopWriteAndReclaimRelyOnADurableSibling(t *testing.T) {
+	t.Parallel()
+	a, b, _ := siblingPair(t, t.TempDir())
+	defer a.Close()
+	defer b.Close()
+	b.SetNopWrite(true)
+	b.EnableReclaim()
+	want := bytes.Repeat([]byte{0x42}, testChunk)
+	_, err := a.WriteAt(want, 0)
+	require.NoError(t, err)
+	require.NoError(t, a.Flush())
+	_, err = b.WriteAt(want, 0)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, b.Written(), "a durable sibling: the write is skipped")
+	_, err = b.WriteAt(want, testChunk) // a still reads zeros there, durably
+	require.NoError(t, err)
+	_, err = a.WriteAt(want, testChunk)
+	require.NoError(t, err)
+	require.NoError(t, a.Flush())
+	b.Reclaim(context.Background(), 10)
+	assert.EqualValues(t, 0, b.Written(), "the sibling caught up durably: dropped")
+}
+
+// From the 2026-10-05 external review (finding 02): Writeback tested a chunk's bit, then took
+// its lock; a reclaim and a flush in between cleared and punched the chunk, and Writeback
+// copied the hole: zeros into the destination over the right bytes.
+func TestWritebackSkipsAChunkReclaimedMeanwhile(t *testing.T) {
+	t.Parallel()
+	base := bytes.Repeat([]byte{0x42}, testSize)
+	s := newTestStore(t, t.TempDir(), &mem{data: base})
+	defer s.Close()
+	s.EnableReclaim()
+	_, err := s.WriteAt(base[:testChunk], 0) // identical to the base: reclaimable
+	require.NoError(t, err)
+	dst := &sliceWriter{bytes.Clone(base)}
+	s.writebackGap = func() {
+		s.writebackGap = nil
+		s.Reclaim(context.Background(), 1)
+		require.NoError(t, s.Flush()) // commits the clear, punches the chunk
+	}
+	_, err = s.Writeback(dst)
+	require.NoError(t, err)
+	assert.Equal(t, base, dst.b, "writeback must not copy a punched chunk")
 }
