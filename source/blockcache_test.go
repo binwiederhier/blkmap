@@ -3,6 +3,7 @@ package source
 import (
 	"bytes"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -117,20 +118,34 @@ func TestBlockCacheReadAhead(t *testing.T) {
 	// read-ahead of the following blocks, so later sequential reads hit the cache
 	require.NoError(t, c.readAt(p, 0))
 	require.NoError(t, c.readAt(p, 4096))
-	time.Sleep(200 * time.Millisecond) // let the read-ahead fetches land
-	fetched := f.fetched()
-	assert.GreaterOrEqual(t, len(fetched), 1+1+readAheadBlocks)
-	for i := int64(1); i <= readAheadBlocks; i++ {
-		assert.Contains(t, fetched, i, "block %d should have been read ahead", i)
-	}
-	// Reading on through the read-ahead window costs no fetch and no delay
-	start := time.Now()
+	// The read-ahead fetches land in the background; wait for them rather than a fixed time
+	require.Eventually(t, func() bool {
+		fetched := f.fetched()
+		for i := int64(1); i <= readAheadBlocks; i++ {
+			if !slices.Contains(fetched, i) {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 10*time.Millisecond, "blocks 1..%d should have been read ahead", readAheadBlocks)
+	// Reading on through the read-ahead window hits the cache: none of its blocks is fetched a
+	// second time (counted, not timed: a loaded CI runner under -race made a 100 ms bound
+	// flaky). The reads move the stream on, so blocks further ahead are fetched meanwhile.
 	big := make([]byte, cacheBlockSize)
 	for b := int64(1); b <= readAheadBlocks; b++ {
 		require.NoError(t, c.readAt(big, b*cacheBlockSize))
 		assert.Equal(t, f.data[b*cacheBlockSize:(b+1)*cacheBlockSize], big)
 	}
-	assert.Less(t, time.Since(start), 100*time.Millisecond)
+	fetched := f.fetched()
+	for i := int64(1); i <= readAheadBlocks; i++ {
+		n := 0
+		for _, b := range fetched {
+			if b == i {
+				n++
+			}
+		}
+		assert.Equal(t, 1, n, "block %d inside the read-ahead window must be fetched once", i)
+	}
 	// Read-ahead stops at the end of the resource without errors
 	require.NoError(t, c.readAt(p, 31*cacheBlockSize))
 	require.NoError(t, c.readAt(p, 31*cacheBlockSize+4096))

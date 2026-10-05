@@ -37,11 +37,12 @@ func TestTieredReadsAndStats(t *testing.T) {
 	assert.Equal(t, data, got)
 	st := c.Stats()
 	assert.Equal(t, int64(1), st.Misses, "the read straddling cached and uncached blocks is one miss")
-	start := time.Now()
 	p := make([]byte, 4096)
 	_, err = c.ReadAt(p, 1<<20)
 	require.NoError(t, err)
-	assert.Less(t, time.Since(start), 5*time.Millisecond, "a cached block does not pay the round trip")
+	after := c.Stats()
+	assert.Equal(t, st.Misses, after.Misses, "a cached block does not go to the slow tier")
+	assert.Equal(t, st.Hits+1, after.Hits)
 	assert.Equal(t, data[1<<20:1<<20+4096], p)
 }
 
