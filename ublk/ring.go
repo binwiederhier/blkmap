@@ -11,8 +11,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	// maxSubmitStalls bounds the attempts submit makes without the kernel consuming anything
+	maxSubmitStalls = 50
+)
+
 var (
 	errRingFull = errors.New("submission queue full")
+	// ringEnter is io_uring_enter's syscall; tests replace it to script partial submissions
+	ringEnter = syscall.Syscall6
 )
 
 // ring is a minimal io_uring that only ever submits URING_CMD SQEs to one target fd. The
@@ -108,22 +115,38 @@ func (r *ring) prepareRead(fd int, buf unsafe.Pointer, n uint32, userData uint64
 	return nil
 }
 
-// flush publishes the prepared SQEs and submits them with one io_uring_enter.
+// flush publishes the prepared SQEs and submits them. io_uring_enter may consume fewer than
+// it was given; the rest stay in the submission queue, so what is still to submit comes from
+// the kernel's head, never from what was published.
 func (r *ring) flush() error {
-	pending := r.local - atomic.LoadUint32(r.sqTail)
-	if pending == 0 {
-		return nil
-	}
 	atomic.StoreUint32(r.sqTail, r.local) // the atomic store is the release fence the kernel needs
-	for {
-		_, _, errno := syscall.Syscall6(sysIoUringEnter, uintptr(r.fd), uintptr(pending), 0, 0, 0, 0)
-		if errno == syscall.EINTR {
+	return r.submit()
+}
+
+// submit hands the kernel every published SQE it has not consumed yet. Interruptions are
+// retried at once; resource pressure (EAGAIN, EBUSY) and calls that consume nothing are
+// retried with a growing pause, and only a submission that makes no progress for
+// maxSubmitStalls attempts (about half a second) is an error.
+func (r *ring) submit() error {
+	for stalls := 0; ; {
+		pending := atomic.LoadUint32(r.sqTail) - atomic.LoadUint32(r.sqHead)
+		if pending == 0 {
+			return nil
+		}
+		n, _, errno := ringEnter(sysIoUringEnter, uintptr(r.fd), uintptr(pending), 0, 0, 0, 0)
+		switch {
+		case errno == syscall.EINTR:
+			continue
+		case errno != 0 && errno != syscall.EAGAIN && errno != syscall.EBUSY:
+			return fmt.Errorf("io_uring_enter: %w", errno)
+		case errno == 0 && n > 0:
+			stalls = 0
 			continue
 		}
-		if errno != 0 {
-			return fmt.Errorf("io_uring_enter: %w", errno)
+		if stalls++; stalls > maxSubmitStalls {
+			return fmt.Errorf("io_uring_enter: %d entries not consumed after %d attempts (last: %v)", pending, stalls, errno)
 		}
-		return nil
+		time.Sleep(time.Duration(min(stalls, 10)) * time.Millisecond)
 	}
 }
 
@@ -131,7 +154,9 @@ func (r *ring) flush() error {
 // signal is not an error; the caller re-checks the CQ and its own stop conditions.
 func (r *ring) wait(timeout time.Duration) error {
 	r.ts = syscall.NsecToTimespec(timeout.Nanoseconds())
-	_, _, errno := syscall.Syscall6(sysIoUringEnter, uintptr(r.fd), 0, 1, ringEnterGetEvents|ringEnterExtArg,
+	// Anything a short submission left behind goes along with the wait
+	pending := atomic.LoadUint32(r.sqTail) - atomic.LoadUint32(r.sqHead)
+	_, _, errno := syscall.Syscall6(sysIoUringEnter, uintptr(r.fd), uintptr(pending), 1, ringEnterGetEvents|ringEnterExtArg,
 		uintptr(unsafe.Pointer(&r.arg)), unsafe.Sizeof(r.arg))
 	switch errno {
 	case 0, syscall.ETIME, syscall.EINTR:

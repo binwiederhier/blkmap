@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -2628,4 +2630,59 @@ func TestWritebackSkipsAChunkReclaimedMeanwhile(t *testing.T) {
 	_, err = s.Writeback(dst)
 	require.NoError(t, err)
 	assert.Equal(t, base, dst.b, "writeback must not copy a punched chunk")
+}
+
+// An overlay recorded with an older form of its base's identity (before HTTP identities named
+// their resource) opens and is re-pinned to the current form; any other identity is refused.
+func TestStoreAcceptsALegacyIdentityAndRepins(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), ChunkSize: testChunk, Identity: "http:4096:etag=x@0+4096"}
+	s, err := OpenWith(&mem{data: pattern(testSize)}, o)
+	require.NoError(t, err)
+	_, err = s.WriteAt([]byte{1}, 0)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	o.Identity, o.LegacyIdentity = "http:4096:etag=x@0+4096#r0123456789abcdef", "http:4096:etag=x@0+4096"
+	s, err = OpenWith(&mem{data: pattern(testSize)}, o)
+	require.NoError(t, err, "the legacy form of the same identity is accepted")
+	require.NoError(t, s.Close())
+	info, err := Inspect(o.Bitmap)
+	require.NoError(t, err)
+	assert.Equal(t, o.Identity, info.Identity, "and re-pinned to the current form")
+	o.Identity, o.LegacyIdentity = "http:4096:etag=x@0+4096#rfedcba9876543210", "http:4096:etag=x@0+4096"
+	_, err = OpenWith(&mem{data: pattern(testSize)}, o)
+	assert.ErrorIs(t, err, ErrSourceChanged, "once re-pinned, another resource is refused")
+}
+
+// The review's reopen criterion for finding 03: an overlay made over one HTTP resource is
+// refused over another that answers with the same size and ETag.
+func TestStoreRefusesAnotherResourceWithTheSameValidator(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"revision-1"`)
+		value := byte(1)
+		if r.URL.Path == "/b" {
+			value = 2
+		}
+		http.ServeContent(w, r, "img", time.Time{}, bytes.NewReader(bytes.Repeat([]byte{value}, testSize)))
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	open := func(path string) (*Store, error) {
+		h, err := source.NewHTTP(srv.Client(), srv.URL+path, 0, 0)
+		require.NoError(t, err)
+		id := source.Identity(h)
+		return OpenWith(h, &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), ChunkSize: testChunk, Identity: id, LegacyIdentity: source.LegacyIdentity(id)})
+	}
+	s, err := open("/a")
+	require.NoError(t, err)
+	_, err = s.WriteAt([]byte{9}, 0)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	_, err = open("/b")
+	assert.ErrorIs(t, err, ErrSourceChanged, "the same validator on another resource is another source")
+	s, err = open("/a")
+	require.NoError(t, err, "the original resource still opens")
+	require.NoError(t, s.Close())
 }

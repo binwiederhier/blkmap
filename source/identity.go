@@ -3,11 +3,16 @@ package source
 import (
 	"fmt"
 	"hash/fnv"
+	"regexp"
 	"strings"
 )
 
 const (
 	missingMember = "missing"
+)
+
+var (
+	resourceSuffix = regexp.MustCompile(`#r[0-9a-f]{16}`) // what HTTP.Identity adds since v0.4.2
 )
 
 // Identifier is implemented by sources that can fingerprint the version of their content:
@@ -26,6 +31,13 @@ func Identity(s Source) string {
 	return fmt.Sprintf("%T:%d", s, s.Size())
 }
 
+// LegacyIdentity returns identity as releases before v0.4.2 computed it: without the
+// resource HTTP sources name. An overlay recorded with that form is accepted and re-pinned
+// (see cow.Options.LegacyIdentity), so an upgrade needs no blkmap pin.
+func LegacyIdentity(identity string) string {
+	return resourceSuffix.ReplaceAllString(identity, "")
+}
+
 func (f *File) Identity() string {
 	return f.ident
 }
@@ -35,7 +47,12 @@ func (h *HTTP) Identity() string {
 	if h.etag == "" {
 		version = "modified=" + h.modified
 	}
-	return fmt.Sprintf("http:%d:%s@%d+%d", h.total, version, h.offset, h.size)
+	// Validators are unique only per resource (RFC 9110 8.8.1): another URL with the same
+	// ETag and size may hold other bytes, so the resource is part of the identity, hashed to
+	// keep it short and free of characters the composite forms use
+	r := fnv.New64a()
+	r.Write([]byte(h.resource))
+	return fmt.Sprintf("http:%d:%s@%d+%d#r%016x", h.total, version, h.offset, h.size, r.Sum64())
 }
 
 func (z *Zero) Identity() string {

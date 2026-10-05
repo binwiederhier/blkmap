@@ -235,7 +235,7 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 		}
 		livePath = filepath.Join(o.RunDir, o.ID+liveBitmapExt)
 	}
-	store, err := cow.OpenWith(o.Base, &cow.Options{COWFile: o.COWFile, Bitmap: o.Bitmap, LiveBitmap: livePath, ChunkSize: o.ChunkSize, Identity: o.Identity})
+	store, err := cow.OpenWith(o.Base, &cow.Options{COWFile: o.COWFile, Bitmap: o.Bitmap, LiveBitmap: livePath, ChunkSize: o.ChunkSize, Identity: o.Identity, LegacyIdentity: source.LegacyIdentity(o.Identity)})
 	if err != nil {
 		o.Base.Close()
 		pred.drop(o.ID)

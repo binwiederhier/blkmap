@@ -32,6 +32,7 @@ type HTTP struct {
 	client   *http.Client
 	url      string
 	name     string // url with the password hidden, for errors and logs
+	resource string // scheme, host and path: what the validators below are scoped to
 	offset   int64
 	size     int64
 	total    int64  // length of the whole resource
@@ -48,7 +49,7 @@ type HTTP struct {
 // whole body) and learns the size from Content-Range, so HEAD is never needed.
 func NewHTTP(client *http.Client, url string, offset, size int64) (*HTTP, error) {
 	ctx, abort := context.WithCancel(context.Background())
-	h := &HTTP{client: client, url: url, name: redact(url), offset: offset, ctx: ctx, abort: abort}
+	h := &HTTP{client: client, url: url, name: redact(url), resource: resource(url), offset: offset, ctx: ctx, abort: abort}
 	total, err := h.probe()
 	if err != nil {
 		abort()
@@ -221,6 +222,16 @@ func parseContentRange(cr string) (start, end, total int64, err error) {
 }
 
 // redact hides the password of a URL with credentials.
+// resource names what a URL points at for identity purposes: scheme, host and path, without
+// credentials, query or fragment, so a signed URL or a rotated token stays the same resource.
+func resource(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Scheme + "://" + strings.ToLower(u.Host) + u.EscapedPath()
+}
+
 func redact(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {

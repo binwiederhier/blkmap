@@ -52,6 +52,9 @@ type Options struct {
 	// chunks are written a different one is refused: the overlay belongs to that content.
 	// Empty skips the check.
 	Identity string
+	// LegacyIdentity is an older form of Identity (source.LegacyIdentity): an overlay recorded
+	// with it is accepted and re-pinned to Identity. Empty skips that.
+	LegacyIdentity string
 }
 
 // Info is what Inspect reads from a bitmap file.
@@ -162,7 +165,7 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 		bitmap.CloseNoSync()
 		return fail(fmt.Errorf("cow file %s is missing or truncated (%d bytes) but its bitmap records %d written chunks; restore it or delete the bitmap to start over", cowPath, st.Size(), written))
 	}
-	if err := checkIdentity(bitmap, o.Identity); err != nil {
+	if err := checkIdentity(bitmap, o.Identity, o.LegacyIdentity); err != nil {
 		bitmap.CloseNoSync()
 		return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 	}
@@ -237,7 +240,8 @@ func (s *Store) countBase(n int, err error, start time.Time) {
 }
 
 // checkIdentity records the base's identity, refusing a changed one once chunks are written.
-func checkIdentity(bitmap *Bitmap, identity string) error {
+// A recorded legacy form of the same identity is accepted and replaced with the current one.
+func checkIdentity(bitmap *Bitmap, identity, legacy string) error {
 	if identity == "" {
 		return nil
 	}
@@ -247,6 +251,9 @@ func checkIdentity(bitmap *Bitmap, identity string) error {
 	}
 	if recorded == storedIdentity(identity) {
 		return nil
+	}
+	if legacy != "" && legacy != identity && recorded == storedIdentity(legacy) {
+		return bitmap.SetIdentity(identity)
 	}
 	if recorded != "" && bitmap.Count() > 0 {
 		return fmt.Errorf("%w: its %d written chunks overlay %q, the source is now %q; restore the original source, or run blkmap pin if the content is the same", ErrSourceChanged, bitmap.Count(), recorded, storedIdentity(identity))

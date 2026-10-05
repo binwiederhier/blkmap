@@ -93,13 +93,16 @@ size or read-only setting) replaces it with a fresh one; the old one's I/O fails
 ### Changed sources
 
 The COW file only makes sense over the content it was written over. blkmap records a
-fingerprint of the sources (file size and modification time, HTTP ETag or Last-Modified,
-the layout, and for RAID-5 the ordered members) and refuses to start once writes exist if
+fingerprint of the sources (file size and modification time, for HTTP the resource (scheme,
+host and path, never credentials or the query string, so signed URLs may rotate) with its
+ETag or Last-Modified, the layout, and for RAID-5 the ordered members) and refuses to start
+once writes exist if
 it changed; an HTTP origin whose ETag (or, without one, Last-Modified) changes while running
 fails reads rather than mixing old and new blocks, and so does one that stops sending the
 validator it had at open. An origin that sends neither cannot be checked, so publish
 immutable, versioned objects there. If the content is known to be the same (an image copied
-with a new timestamp, a mirror, a RAID-5 set that lost or regained a member), accept it:
+with a new timestamp or moved to another URL, a mirror, a RAID-5 set that lost or regained a
+member), accept it:
 
 ```
 blkmap pin disk1    # with the device stopped

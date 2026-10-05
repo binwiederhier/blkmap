@@ -3,6 +3,22 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## v0.4.2 (2026-10-05)
+
+- **HTTP identity names the resource** (2026-10-05 external review, finding 03): two URLs can
+  answer with the same size and ETag and hold different bytes (RFC 9110 scopes validators to
+  a resource), so an overlay could be reopened over another resource and mix the two. The
+  identity now includes a hash of scheme, host and path; credentials and the query string
+  are left out, so signed URLs and rotated tokens keep their identity. Overlays recorded with
+  the older form are accepted and re-pinned (`source.LegacyIdentity`,
+  `cow.Options.LegacyIdentity`), so upgrading needs no `blkmap pin`; moving an image to
+  another URL does.
+- **Short io_uring submissions** (finding 04): io_uring_enter may consume fewer entries than
+  it is given, and the rest stayed in the submission queue for good, since the next flush
+  counted from the tail already published. Submission now follows the kernel's head until
+  everything is consumed, retrying interruptions, EAGAIN/EBUSY and calls without progress,
+  and a wait hands over anything still unconsumed.
+
 ## v0.4.1 (2026-10-05)
 
 - **Reliance on a sibling only where it is durable** (2026-10-05 external review, finding 01):
