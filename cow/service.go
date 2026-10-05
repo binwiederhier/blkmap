@@ -62,16 +62,13 @@ type Info struct {
 // Store is the writable device image: reads come from the COW file for written chunks and
 // from the base source otherwise. It implements ublk.Backend.
 type Store struct {
-	base      source.Source
-	cow       *os.File
-	bitmap    *Bitmap
-	chunkSize int64
-	size      int64
-	dirty     atomic.Bool // something changed since the last Flush
-	elide     atomic.Bool // drop writes whose bytes equal what the device already reads there
-	// baseMutable: the base derives its bytes from other devices (a source.Binder), so it may
-	// change after a write was compared against it; elision then trusts only the COW file
-	baseMutable bool
+	base        source.Source
+	cow         *os.File
+	bitmap      *Bitmap
+	chunkSize   int64
+	size        int64
+	dirty       atomic.Bool  // something changed since the last Flush
+	nopwrite    atomic.Bool  // drop writes whose bytes equal what the device already reads there
 	bufs        sync.Pool    // chunk-sized scratch buffers for read-modify-write
 	runBufs     sync.Pool    // MaxRunBytes buffers for hydration runs
 	srcReads    atomic.Int64 // base reads, for SourceStats
@@ -138,7 +135,7 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 			return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 		}
 	}
-	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size, baseMutable: derivesFromOthers(base)}
+	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
 	s.syncCOW, s.failed = cow.Sync, make(chan struct{})
 	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
 	s.bufs.New = func() any {
@@ -345,6 +342,12 @@ func (s *Store) Err() error {
 	return nil
 }
 
+// Fail stops the store as a failed COW sync does (see ErrCOWFailed), for an owner that
+// finds the COW file unusable some other way. It returns the store's error.
+func (s *Store) Fail(err error) error {
+	return s.fail(err)
+}
+
 // fail stops the store for good and returns why.
 func (s *Store) fail(err error) error {
 	s.failOnce.Do(func() {
@@ -408,13 +411,20 @@ func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
 	return n, nil
 }
 
-// SetElision turns write elision on or off: with it on, a write whose bytes equal what the
-// device already returns for that range (from the COW file or the base) is dropped. That
-// costs one read per write and saves the copy-up and the space for guests that rewrite what
-// is already there, such as a RAID resynchronisation after a crash-consistent snapshot, the
-// way ZFS nopwrite skips rewrites of identical blocks.
-func (s *Store) SetElision(on bool) {
-	s.elide.Store(on)
+// SetNopWrite turns nopwrite on or off (the name ZFS uses): a write whose bytes equal what
+// the device already returns for that range (from the COW file or the base) is dropped. It
+// compares and drops, it never merges. That costs one read per write and saves the copy-up
+// and the space for guests that rewrite what is already there, such as a RAID
+// resynchronisation after a crash-consistent snapshot.
+//
+// Over a base derived from sibling devices (a source.Binder: a mirror plex that is a view of
+// the other plex, a parity column computed from the data columns) a skipped range keeps
+// following the base until a later write there differs. That is what a RAID member does
+// anyway, since every write to the array rewrites the dependent member too, and it keeps a
+// resynchronisation or parity regeneration from freezing a copy of the whole range in the
+// overlay.
+func (s *Store) SetNopWrite(on bool) {
+	s.nopwrite.Store(on)
 }
 
 // writeChunk writes p, which lies entirely within chunk, at device offset off. The first
@@ -428,12 +438,10 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	defer mu.Unlock()
 	written := s.bitmap.Test(chunk)
 	partial := int64(len(p)) < length
-	elide := s.elide.Load()
-	// Against the base only when it cannot change: over a derived base (a source.Binder) an
-	// elided write would later read as whatever the base derives then
-	elideBase := elide && !written && !s.baseMutable
-	var buf []byte // the whole chunk from base, when a copy-up or an elision check needs it
-	if !written && (partial || elideBase) {
+	nopwrite := s.nopwrite.Load()
+	nopBase := nopwrite && !written
+	var buf []byte // the whole chunk from base, when a copy-up or a nopwrite check needs it
+	if !written && (partial || nopBase) {
 		scratch := s.bufs.Get().(*[]byte)
 		defer s.bufs.Put(scratch)
 		buf = (*scratch)[:length]
@@ -441,10 +449,10 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 			if partial {
 				return fmt.Errorf("copy chunk %d from base: %w", chunk, fullRead(read, int(length), err))
 			}
-			elideBase = false // a whole-chunk write does not need the base: store it
+			nopBase = false // a whole-chunk write does not need the base: store it
 		}
 	}
-	if elide && (written || elideBase) {
+	if nopwrite && (written || nopBase) {
 		var same bool
 		if written {
 			scratch := s.bufs.Get().(*[]byte)
@@ -519,7 +527,7 @@ func (s *Store) WriteZeroes(off, length int64) error {
 		if off == chunkStart && m == chunkEnd-chunkStart {
 			mu := &s.locks[chunk%lockStripes]
 			mu.Lock()
-			if s.elide.Load() && !s.baseMutable && !s.bitmap.Test(chunk) && s.baseIsZero(chunkStart, m) {
+			if s.nopwrite.Load() && !s.bitmap.Test(chunk) && s.baseIsZero(chunkStart, m) {
 				// the base already reads as zeros there: nothing to record
 			} else if err = s.punch(chunk); err == nil {
 				s.bitmap.Set(chunk)
@@ -708,15 +716,4 @@ func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
 		mu.Unlock()
 	}
 	return copied, nil
-}
-
-// derivesFromOthers reports whether any part of base is a source.Binder.
-func derivesFromOthers(base source.Source) bool {
-	found := false
-	source.Walk(base, func(s source.Source) {
-		if _, ok := s.(source.Binder); ok {
-			found = true
-		}
-	})
-	return found
 }

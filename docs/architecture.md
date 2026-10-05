@@ -19,7 +19,7 @@ Three layers, each a Go package, each usable on its own:
   Discard): one io_uring and one OS thread per hardware queue, 1 MiB per-tag buffers, a
   control plane over `/dev/ublk-control`.
 - `cow` is that backend: a `Store` over any `source.Source`, the chunk bitmap, flush ordering
-  (data before bits), elision, writeback, the live bitmap that survives a crash.
+  (data before bits), nopwrite, writeback, the live bitmap that survives a crash.
 - `source` builds the base: `Concat` of segments, `Cache` (fast tier over slow), `Mapped`
   (data-extent map so holes are never fetched), `HTTP` with a block cache and read-ahead,
   `RAID5` with parity reconstruction, `File`, `Zero`, `Swappable`, custom sources.
@@ -48,7 +48,7 @@ flowchart LR
 |---|---|---|
 | `cmd` | app, serve, validate, map, prefetch, pin, status, reap, udev, util | The CLI: parse arguments, load config, call into `device`, print |
 | `device` | service, group, hydrate, record, backend, status, udev | A config or `Options` to a live device: store, ublk device, publish, status socket, hydration, recovery, groups |
-| `cow` | service, bitmap | `Store` (the ublk backend): bitmap, copy-up, flush ordering, discard, elision, writeback, hydration primitives; `Bitmap` format and live file |
+| `cow` | service, bitmap | `Store` (the ublk backend): bitmap, copy-up, flush ordering, discard, nopwrite, writeback, hydration primitives; `Bitmap` format and live file |
 | `source` | source, concat, file, zero, http, blockcache, readahead, cache, map, range, raid5, swappable, custom, bind, identity, util | The read-only base: `Source` and every source type, holes and maps, content identity |
 | `ublk` | uapi, ring, control, queue, service | The kernel transport: ioctl encoding, minimal io_uring, control commands, queue threads and dispatch, create/stop/delete/recover |
 | `config` | types, config | YAML parsing and validation |
@@ -88,12 +88,12 @@ The types a reader meets first, and what owns what.
 | `Sparse`, `Present`, `DirectReader`, `Aborter`, `Identifier`, `Binder` | `source` | optional abilities: tell holes; tell what it holds (a cache's fast tier misses on the rest); read around a cache; fail blocked reads at shutdown; fingerprint content; read sibling devices in a group |
 | `Concat`, `File`, `Zero`, `HTTP`, `RAID5`, `Cache`, `Mapped`, `ReadAhead`, `Swappable` | `source` | the source types; `Mapped` attaches a `Map` of data extents to any of them |
 | `Range`, `Map`, `Access` | `source` | a byte range; sorted merged data extents; one recorded request (`Millis`, `Write`, `Offset`, `Length`) |
-| `Store` | `cow` | the ublk backend: base + COW file + `Bitmap` + chunk locks; `ReadAt`, `WriteAt`, `Flush`, `Discard`, `WriteZeroes`, `HydrateRun`, `MarkZero`, `Writeback`, `SetElision`, `OnDemandRead`, `SourceStats` |
+| `Store` | `cow` | the ublk backend: base + COW file + `Bitmap` + chunk locks; `ReadAt`, `WriteAt`, `Flush`, `Discard`, `WriteZeroes`, `HydrateRun`, `MarkZero`, `Writeback`, `SetNopWrite`, `OnDemandRead`, `SourceStats`, `Failed`/`Err`/`Fail` (fail-stop after a failed COW sync, `ErrCOWFailed`) |
 | `Bitmap` | `cow` | one bit per chunk, 4 KiB header (magic, geometry, identity), dirty pages, optional live file in `/run` |
-| `Options`, `Device` | `device` | the library entry (`ID`, `Base`, `COWFile`, `Hydrate`, `Record`, `Recovery`, ...) and the running device (`Path`, `BlockPath`, `Close`, `Detach`, `Status`, `Done`, `Writeback`) |
+| `Options`, `Device` | `device` | the library entry (`ID`, `Base`, `COWFile`, `Hydrate`, `Record`, `Recovery`, `NopWrite`, ...) and the running device (`Path`, `BlockPath`, `Close`, `Detach`, `Abandon`, `Status`, `Done`, `Err`, `Writeback`) |
 | `Hydrate`, `Progress`, `Schedule` | `device` | the hydration plan (prefetch ranges and their times, rest, rate, cache policy, concurrency); a snapshot (phase, chunks, copied, errors, late); ahead/behind a timed list |
 | `Record`, `RecordStatus` | `device` | recording options (file, max duration and size) and its state |
-| `GroupOptions`, `Alias`, `Group` | `device` | several devices from one process; a range of one as a view of another |
+| `Group` | `device` | several devices from one process whose bases may read each other's live views (`source.Binder`); `Close`, `Done`, `Err`, `Abandon` |
 | `Status`, `IOStats`, `Histogram` | `device` | what the status socket and `blkmap status` report |
 | `backend` (unexported) | `device` | wraps the store for the kernel: counters, latency histograms, the busy signal, the recorder |
 | `Params`, `Device`, `Backend`, `Discarder`, `ZeroWriter`, `Info` | `ublk` | create/recover/stop/delete a kernel device over a `Backend` |
@@ -269,7 +269,7 @@ fast tier and falls through on `ErrNotFound` or any error, `Mapped` zero-fills h
 stripes). A chunk already in the COW file is written in place (the COW file is a sparse image
 of the device, offsets are identical). A first write is a *copy-up*: read the whole chunk
 from the base into a pooled buffer, overlay the bytes, write the chunk, set the bit (live
-bitmap first). A whole-chunk first write skips the base read. With elision on, a write equal
+bitmap first). A whole-chunk first write skips the base read. With nopwrite on, a write equal
 to what the device already reads is dropped.
 
 **Flush.** A bit on disk never describes data that is not: `Flush` snapshots the dirty
@@ -303,9 +303,9 @@ ETag or Last-Modified; RAID-5: geometry plus ordered member identities; concat: 
 identity of every segment). Once chunks are written, a different identity is refused;
 `blkmap pin` rewrites it.
 
-**Elision and writeback** exist for device groups: `SetElision(true)` drops writes equal to
-what the device already reads (against the base only when it cannot change), `Writeback(dst)`
-copies every written chunk into a writable copy of the base.
+**Nopwrite and writeback** exist for device groups: `SetNopWrite(true)` drops writes equal to
+what the device already reads (over a derived base the skipped range keeps following it),
+`Writeback(dst)` copies every written chunk into a writable copy of the base.
 
 **Hydration primitives.** `HydrateRun(first, count, direct)` copies up to 1 MiB of consecutive
 unwritten chunks in one read; `MarkZero(chunk)` marks a hole chunk without copying. Both skip
@@ -407,29 +407,24 @@ vm: hydration rest: 8958/57344 chunks (15%), 311360K copied; prefetch list compl
 
 ## Device groups
 
-`device.ServeGroup` serves several devices from one process. A *router* sits in front of each
-store; `Alias{Offset, Length, Target, TargetOffset}` routes a range to a sibling's store (a
-mirror's second plex needs no copy and both plexes stay identical). An alias must land in a
-range its target serves itself (no chains); two devices may alias different ranges of each
-other, so `Flush` across the group carries a visited set. A base implementing `source.Binder`
-gets a `source.Lookup` of its siblings' live views (parity derived from the data members sees
-guest writes). `ElideIdenticalWrites` turns on elision per device. `Group.Close` halts all
-I/O before closing any store.
+`device.ServeGroup` serves several devices from one process. A base implementing
+`source.Binder` gets a `source.Lookup` of its siblings' live views, COW overlay included:
+parity derived from the data members sees guest writes, and a mirror's second plex is a view
+of the first. Every device keeps its own store, so a write to one device never lands in
+another's. `NopWrite` turns nopwrite on per device; over a derived base a skipped
+range keeps following the base until a write there differs, so a RAID resync or parity
+regeneration stores nothing while the members agree. `Group.Close` halts all I/O before
+closing any store.
 
 ```mermaid
 flowchart LR
-  subgraph A[device A router]
-    a0[range 0: own store A]
-    a1[range 1: alias of B range 1]
+  subgraph B[device B]
+    SB[(cow.Store B)] --> VB[base: view of A, a Binder]
   end
-  subgraph B[device B router]
-    b0[range 0: alias of A range 0]
-    b1[range 1: own store B]
+  subgraph A[device A]
+    SA[(cow.Store A)] --> BA[base: image]
   end
-  b0 --> a0
-  a1 --> b1
-  a0 --> SA[(cow.Store A)]
-  b1 --> SB[(cow.Store B)]
+  VB -. reads live .-> SA
 ```
 
 ## CLI walkthrough
@@ -647,7 +642,7 @@ dev, err := device.Start(ctx, conf, device.DevDir)
 ```
 
 `source.NewSwappable(src)` swaps the target under a live device; `device.ServeGroup` serves
-groups with aliases and `Binder` bases; `ublk.Create(&ublk.Params{Backend: b})` serves any
+groups whose bases read each other live (`Binder`); `ublk.Create(&ublk.Params{Backend: b})` serves any
 backend without the COW layer, and `ublk.Recover` re-attaches to a device whose server died.
 
 ## Operations

@@ -15,9 +15,9 @@ import (
 	"heckel.io/blkmap/source"
 )
 
-// TestElisionSkipsIdenticalWrites shows the store-level behaviour the mirror relies on, no
-// kernel needed: with elision on, rewriting what the device already reads stores nothing.
-func TestElisionSkipsIdenticalWrites(t *testing.T) {
+// TestNopWriteSkipsIdenticalWrites shows the store-level behaviour the mirror relies on, no
+// kernel needed: with nopwrite on, rewriting what the device already reads stores nothing.
+func TestNopWriteSkipsIdenticalWrites(t *testing.T) {
 	data := make([]byte, 4<<20)
 	_, _ = rand.Read(data)
 	path := filepath.Join(t.TempDir(), "disk0.img")
@@ -28,7 +28,7 @@ func TestElisionSkipsIdenticalWrites(t *testing.T) {
 	s, err := cow.Open(base, filepath.Join(dir, "c.cow"), filepath.Join(dir, "c.bitmap"), 64<<10)
 	require.NoError(t, err)
 	defer s.Close()
-	s.SetElision(true)
+	s.SetNopWrite(true)
 	_, err = s.WriteAt(data[1<<20:2<<20], 1<<20) // a resync: the same bytes
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), s.Written(), "identical writes store nothing")
@@ -73,5 +73,7 @@ func TestMirrorThroughKernel(t *testing.T) {
 	assert.Equal(t, make([]byte, 4096), got)
 	require.NoError(t, f1.Close())
 	require.NoError(t, showElision(d0, d1, 1<<20))
-	assert.Equal(t, int64(1), d0.Written()+d1.Written(), "the resync stored nothing, the change one chunk")
+	assert.Equal(t, int64(2), d0.Written()+d1.Written(), "the resync stored nothing, the mirrored write one chunk on ldm0, the write to ldm1 alone one on ldm1")
+	assert.Equal(t, int64(1), d0.Written())
+	assert.Equal(t, int64(1), d1.Written())
 }

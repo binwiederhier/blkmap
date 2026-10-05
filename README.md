@@ -129,13 +129,16 @@ make test                          # unit tests (no root)
 make examples                      # vet, test and build the examples
 make test-machine HOST=ip          # everything against a throwaway machine, with a summary
 make test-vm                       # the same on a VM created and destroyed for the run
+make faults HOST=ip                # write errors and bad blocks under the COW file
+make crashreplay HOST=ip [MODE=fs] # every logged crash state of the COW filesystem
 make release                       # tag first; builds and publishes debs and rpms
 ```
 
 Never run the root suites on a workstation: a transport bug can wedge the kernel for good.
 Layout follows the ntfy conventions: `cmd/` (CLI), `config/`, `source/`, `cow/`, `device/`,
-`ublk/`, `util/`; see the architecture doc. GitHub Actions runs the unit tests, vet, the
-examples and a package build on every push.
+`ublk/`, `util/`; see the architecture doc. GitHub Actions runs the unit tests, vet,
+staticcheck, govulncheck, the examples and a package build on every push. Windows guests
+with SQL Server on blkmap devices: `scripts/windows/` (soak harness, see its README).
 
 ## License
 

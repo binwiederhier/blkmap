@@ -5,6 +5,7 @@
 //	                             write records (forever, or N), flushing every batch; prints
 //	                             "start N" once and "ack N" after each flush, and with -mark
 //	                             logs "ackN" in dm-log-writes device DM before going on
+//	powercut slot DEV SEQ         print the slot record SEQ lives in
 //	powercut verify DEV [-base FILE] A-B...
 //	                             check that every acknowledged record (the A-B spans of
 //	                             the writer runs) survived, and the rest still reads as FILE
@@ -64,6 +65,18 @@ func main() {
 		count := fs.Uint64("count", 0, "stop after this many records (0: never)")
 		fs.Parse(os.Args[3:])
 		err = write(os.Args[2], *mark, *count)
+	case "slot":
+		// Where a record lives: for tests that need to damage a known acknowledged record
+		var seq uint64
+		var size int64
+		if len(os.Args) < 4 {
+			err = errors.New("usage: powercut slot DEV SEQ")
+		} else if seq, err = strconv.ParseUint(os.Args[3], 10, 64); err == nil {
+			if size, err = deviceSize(os.Args[2]); err == nil {
+				fmt.Println(slotOf(seq, min(uint64(size)/recordSize, maxSlots)))
+				return
+			}
+		}
 	case "verify":
 		fs := flag.NewFlagSet("verify", flag.ExitOnError)
 		base := fs.String("base", "", "file the device overlays: slots without a record must read as it")
@@ -246,4 +259,14 @@ func aligned() []byte {
 	b := make([]byte, 2*recordSize)
 	off := recordSize - int(uintptr(unsafe.Pointer(&b[0]))%recordSize)
 	return b[off : off+recordSize]
+}
+
+// deviceSize returns the size of a block device or file.
+func deviceSize(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return f.Seek(0, io.SeekEnd)
 }

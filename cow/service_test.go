@@ -901,7 +901,7 @@ type storeModel struct {
 	written   []bool
 	committed []bool
 	chunk     int64
-	elide     bool
+	nopwrite  bool
 }
 
 func newStoreModel(base []byte, chunk int64) *storeModel {
@@ -919,7 +919,7 @@ func (m *storeModel) write(p []byte, off int64) {
 		chunk := off / m.chunk
 		_, end := m.span(chunk)
 		n := min(int64(len(p)), end-off)
-		if !m.elide || !bytes.Equal(m.content[off:off+n], p[:n]) {
+		if !m.nopwrite || !bytes.Equal(m.content[off:off+n], p[:n]) {
 			copy(m.content[off:], p[:n])
 			m.written[chunk] = true
 		}
@@ -942,7 +942,7 @@ func (m *storeModel) writeZeroes(off, length int64) {
 		start, chunkEnd := m.span(chunk)
 		n := min(end, chunkEnd) - off
 		if off == start && n == chunkEnd-start {
-			if !(m.elide && !m.written[chunk] && isZero(m.base[start:chunkEnd])) {
+			if !(m.nopwrite && !m.written[chunk] && isZero(m.base[start:chunkEnd])) {
 				clear(m.content[start:chunkEnd])
 				m.written[chunk] = true
 			}
@@ -1048,7 +1048,7 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 	open := func() *Store {
 		s, err := OpenWith(&mem{data: baseData}, o)
 		require.NoError(t, err)
-		s.SetElision(m.elide)
+		s.SetNopWrite(m.nopwrite)
 		return s
 	}
 	s := open()
@@ -1142,9 +1142,9 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 			s.MarkZero(c)
 			m.written[c] = true // the base is zero there, so the content must not change
 		case op < 80:
-			m.elide = !m.elide
-			log = append(log, fmt.Sprintf("elide %v", m.elide))
-			s.SetElision(m.elide)
+			m.nopwrite = !m.nopwrite
+			log = append(log, fmt.Sprintf("nopwrite %v", m.nopwrite))
+			s.SetNopWrite(m.nopwrite)
 		case op < 88:
 			log = append(log, "flush")
 			if err := s.Flush(); err != nil {
@@ -1219,9 +1219,9 @@ func runStoreModelConcurrent(t *testing.T, seed uint64) {
 	}
 	s, err := OpenWith(&mem{data: baseData}, o)
 	require.NoError(t, err)
-	s.SetElision(seed%3 == 0)
+	s.SetNopWrite(seed%3 == 0)
 	m := newStoreModel(baseData, chunk)
-	m.elide = seed%3 == 0
+	m.nopwrite = seed%3 == 0
 	var stop atomic.Bool
 	var bg, wg sync.WaitGroup
 	errs := make(chan error, writers+3)
@@ -1344,4 +1344,131 @@ func runStoreModelConcurrent(t *testing.T, seed uint64) {
 			t.Fatalf("seed %d (live %v): after the crash chunk %d (written %v) reads neither what was written nor, unflushed, the base", seed, live, c, s.IsWritten(c))
 		}
 	}
+}
+
+// With nopwrite on, writes that repeat what the device already reads are dropped: no chunk
+// is recorded for an identical write over the base, an identical rewrite of a stored chunk
+// does not dirty the store, and zeroing a range the base already reads as zeros is free.
+func TestNopWriteIdenticalWrites(t *testing.T) {
+	dir := t.TempDir()
+	base := &mem{data: pattern(testSize)}
+	s, err := Open(base, filepath.Join(dir, "cow"), filepath.Join(dir, "cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	s.SetNopWrite(true)
+
+	// identical partial write over the base: nothing stored
+	_, err = s.WriteAt(base.data[100:600], 100)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, s.Written())
+	require.False(t, s.Dirty())
+
+	// identical whole-chunk write over the base: nothing stored
+	_, err = s.WriteAt(base.data[testChunk:2*testChunk], testChunk)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, s.Written())
+
+	// a different write is stored, and the rest of its chunk is copied up as usual
+	changed := bytes.Repeat([]byte{0xAB}, 300)
+	_, err = s.WriteAt(changed, 2*testChunk+50)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, s.Written())
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, 2*testChunk)
+	require.NoError(t, err)
+	require.Equal(t, base.data[2*testChunk:2*testChunk+50], got[:50])
+	require.Equal(t, changed, got[50:350])
+	require.Equal(t, base.data[2*testChunk+350:3*testChunk], got[350:])
+	require.NoError(t, s.Flush())
+
+	// rewriting a stored chunk with what it already holds does not dirty the store
+	_, err = s.WriteAt(changed, 2*testChunk+50)
+	require.NoError(t, err)
+	require.False(t, s.Dirty())
+	// but a real change to it does
+	_, err = s.WriteAt([]byte{1, 2, 3}, 2*testChunk+50)
+	require.NoError(t, err)
+	require.True(t, s.Dirty())
+
+	// zeroing a chunk the base reads as zeros records nothing; zeroing data does
+	zeroBase := &mem{data: make([]byte, testSize)}
+	copy(zeroBase.data[5*testChunk:], pattern(testChunk))
+	z, err := Open(zeroBase, filepath.Join(dir, "z"), filepath.Join(dir, "z.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer z.Close()
+	z.SetNopWrite(true)
+	require.NoError(t, z.WriteZeroes(0, testChunk))
+	require.EqualValues(t, 0, z.Written())
+	require.NoError(t, z.WriteZeroes(5*testChunk, testChunk))
+	require.EqualValues(t, 1, z.Written())
+	_, err = z.ReadAt(got, 5*testChunk)
+	require.NoError(t, err)
+	require.Equal(t, make([]byte, testChunk), got)
+
+	// with nopwrite off, the same identical write is stored
+	s.SetNopWrite(false)
+	_, err = s.WriteAt(base.data[7*testChunk:7*testChunk+10], 7*testChunk)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, s.Written())
+}
+
+// derived is a base whose bytes are computed from other devices (a source.Binder): they can
+// change after a write was checked against them.
+type derived struct {
+	data []byte
+}
+
+func (d *derived) ReadAt(p []byte, off int64) (int, error) { return copy(p, d.data[off:]), nil }
+func (d *derived) Size() int64                             { return int64(len(d.data)) }
+func (d *derived) Close() error                            { return nil }
+func (d *derived) Bind(source.Lookup)                      {}
+
+// Over a base derived from other devices, a write equal to what the base reads now is skipped
+// like any other, and the range keeps following the base afterwards: a mirror plex rewritten
+// with its sibling's bytes stays a view of the sibling, a parity column regenerated from the
+// data columns stays computed. A write that differs is stored and no longer follows.
+func TestNopWriteOverADerivedBaseFollowsIt(t *testing.T) {
+	dir := t.TempDir()
+	base := &derived{data: make([]byte, testSize)}
+	s, err := Open(base, filepath.Join(dir, "cow"), filepath.Join(dir, "cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	s.SetNopWrite(true)
+	_, err = s.WriteAt(make([]byte, testChunk), 0) // equal to what the base derives right now
+	require.NoError(t, err)
+	require.NoError(t, s.WriteZeroes(testChunk, testChunk))
+	require.EqualValues(t, 0, s.Written(), "identical writes over a derived base store nothing")
+	base.data[10], base.data[testChunk+10] = 0xFF, 0xFF // a sibling changes
+	got := make([]byte, 2*testChunk)
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, byte(0xFF), got[10], "a skipped range follows its base")
+	require.Equal(t, byte(0xFF), got[testChunk+10])
+	_, err = s.WriteAt([]byte{1, 2, 3}, 0) // differs from the base: stored
+	require.NoError(t, err)
+	require.EqualValues(t, 1, s.Written())
+	base.data[20] = 0xEE
+	_, err = s.ReadAt(got[:testChunk], 0)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1, 2, 3}, got[:3])
+	require.Equal(t, byte(0), got[20], "a stored chunk no longer follows the base")
+	require.Equal(t, byte(0xFF), got[10], "the copy-up took the base as it was then")
+}
+
+// A whole-chunk write does not need the base, so nopwrite must not make it fail when the base
+// cannot be read: the write is stored instead.
+func TestNopWriteSurvivesAnUnreadableBase(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(&broken{size: testSize}, filepath.Join(dir, "cow"), filepath.Join(dir, "cow.bitmap"), testChunk)
+	require.NoError(t, err)
+	defer s.Close()
+	s.SetNopWrite(true)
+	w := bytes.Repeat([]byte{0x5A}, testChunk)
+	_, err = s.WriteAt(w, testChunk)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, s.Written())
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, testChunk)
+	require.NoError(t, err)
+	require.Equal(t, w, got)
 }

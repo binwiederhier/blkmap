@@ -81,6 +81,9 @@ type Options struct {
 	// off), I/O waits and the next Serve of the same ID re-attaches. Only for processes a
 	// supervisor restarts; without one, I/O to a crashed device would hang.
 	Recovery bool
+	// NopWrite drops writes whose bytes equal what the device already reads
+	// there (see cow.Store.SetNopWrite).
+	NopWrite bool
 }
 
 // Device is a running blkmap block device.
@@ -173,7 +176,7 @@ func Serve(ctx context.Context, o *Options) (*Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	d, err := serveStore(ctx, o, store, pred, store)
+	d, err := serveStore(ctx, o, store, pred)
 	if err != nil {
 		closeStore(o.ID, store, pred)
 		return nil, err
@@ -229,6 +232,7 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 		unmarkServed(o.ID)
 		return nil, nil, err
 	}
+	store.SetNopWrite(o.NopWrite)
 	return store, pred, nil
 }
 
@@ -240,14 +244,13 @@ func closeStore(id string, store *cow.Store, pred *predecessor) {
 }
 
 // serveStore brings up the kernel device for an opened store, re-attaching to the predecessor
-// when there is one; io is what the kernel talks to (the store itself, or a group router in
-// front of it). The caller releases the store on failure.
-func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predecessor, io target) (*Device, error) {
+// when there is one. The caller releases the store on failure.
+func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predecessor) (*Device, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	statePath := filepath.Join(o.RunDir, o.ID)
-	b := &backend{store: io, id: o.ID}
+	b := &backend{store: store, id: o.ID}
 	// The recording starts before the kernel device, so it includes the partition scan
 	rec := startRecording(o, b)
 	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, NumQueues: queuesFor(o.Base)}

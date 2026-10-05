@@ -1,16 +1,21 @@
 package device
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"runtime/debug"
-	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"heckel.io/blkmap/cow"
@@ -45,157 +50,122 @@ func (b *bytesSource) Close() error { return nil }
 
 func openTestStore(t *testing.T, dir, id string, data []byte) *cow.Store {
 	t.Helper()
-	s, err := cow.Open(&bytesSource{data: data}, filepath.Join(dir, id+".cow"), filepath.Join(dir, id+".bitmap"), groupChunk)
+	return openTestStoreOver(t, dir, id, &bytesSource{data: data})
+}
+
+func openTestStoreOver(t *testing.T, dir, id string, base source.Source) *cow.Store {
+	t.Helper()
+	s, err := cow.Open(base, filepath.Join(dir, id+".cow"), filepath.Join(dir, id+".bitmap"), groupChunk)
 	require.NoError(t, err)
 	t.Cleanup(func() { s.Close() })
 	return s
 }
 
-// Device b aliases its second and third chunks onto a's fifth and sixth: reads there show
-// a's bytes, writes through either device land in a's store once, and b's own ranges are
-// untouched. Flushing b flushes a too.
-func TestRouterAliases(t *testing.T) {
-	dir := t.TempDir()
-	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
-	b := openTestStore(t, dir, "b", seeded(8*groupChunk, 2))
-	ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
-	routers := map[string]*router{"a": ra, "b": rb}
-	require.NoError(t, ra.setAliases(nil, routers))
-	require.NoError(t, rb.setAliases([]Alias{{Offset: groupChunk, Length: 2 * groupChunk, Target: "a", TargetOffset: 4 * groupChunk}}, routers))
-
-	// a read across own range, alias, own range
-	got := make([]byte, 4*groupChunk)
-	_, err := rb.ReadAt(got, 0)
+func readAt(t *testing.T, r io.ReaderAt, off int64, n int) []byte {
+	t.Helper()
+	p := make([]byte, n)
+	_, err := r.ReadAt(p, off)
 	require.NoError(t, err)
-	require.Equal(t, seeded(8*groupChunk, 2)[:groupChunk], got[:groupChunk], "own range before the alias")
-	require.Equal(t, seeded(8*groupChunk, 1)[4*groupChunk:6*groupChunk], got[groupChunk:3*groupChunk], "aliased range shows a")
-	require.Equal(t, seeded(8*groupChunk, 2)[3*groupChunk:4*groupChunk], got[3*groupChunk:], "own range after the alias")
-
-	// a write through b into the alias lands in a's store and is visible through both
-	w := bytes.Repeat([]byte{0xEE}, 100)
-	_, err = rb.WriteAt(w, groupChunk+10)
-	require.NoError(t, err)
-	require.EqualValues(t, 0, b.Written(), "nothing stored in b for an aliased write")
-	require.EqualValues(t, 1, a.Written())
-	back := make([]byte, 100)
-	_, err = ra.ReadAt(back, 4*groupChunk+10)
-	require.NoError(t, err)
-	require.Equal(t, w, back)
-	_, err = rb.ReadAt(back, groupChunk+10)
-	require.NoError(t, err)
-	require.Equal(t, w, back)
-
-	// a write through a is visible through b's alias
-	w2 := bytes.Repeat([]byte{0x11}, 50)
-	_, err = ra.WriteAt(w2, 5*groupChunk)
-	require.NoError(t, err)
-	_, err = rb.ReadAt(back[:50], 2*groupChunk)
-	require.NoError(t, err)
-	require.Equal(t, w2, back[:50])
-
-	// discard through the alias punches a's chunk, zeroes through the alias zero a
-	require.NoError(t, rb.Discard(groupChunk, groupChunk))
-	_, err = ra.ReadAt(back, 4*groupChunk+10)
-	require.NoError(t, err)
-	require.Equal(t, make([]byte, 100), back)
-	require.NoError(t, rb.WriteZeroes(2*groupChunk, groupChunk))
-	_, err = ra.ReadAt(back[:50], 5*groupChunk)
-	require.NoError(t, err)
-	require.Equal(t, make([]byte, 50), back[:50])
-
-	// flushing b flushes a as well
-	_, err = ra.WriteAt([]byte{7}, 7*groupChunk)
-	require.NoError(t, err)
-	require.True(t, a.Dirty())
-	require.NoError(t, rb.Flush())
-	require.False(t, a.Dirty())
+	return p
 }
 
-func TestRouterAliasValidation(t *testing.T) {
-	dir := t.TempDir()
-	a := openTestStore(t, dir, "a", make([]byte, 4*groupChunk))
-	b := openTestStore(t, dir, "b", make([]byte, 4*groupChunk))
-	ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
-	routers := map[string]*router{"a": ra, "b": rb}
-	for name, aliases := range map[string][]Alias{
-		"outside device": {{Offset: 3 * groupChunk, Length: 2 * groupChunk, Target: "a"}},
-		"unknown target": {{Offset: 0, Length: groupChunk, Target: "c"}},
-		"self":           {{Offset: 0, Length: groupChunk, Target: "b"}},
-		"outside target": {{Offset: 0, Length: groupChunk, Target: "a", TargetOffset: 4 * groupChunk}},
-		"overlapping":    {{Offset: 0, Length: 2 * groupChunk, Target: "a"}, {Offset: groupChunk, Length: groupChunk, Target: "a"}},
-		"empty":          {{Offset: 0, Length: 0, Target: "a"}},
-	} {
-		require.Error(t, rb.setAliases(aliases, routers), name)
+// lookupOf resolves device ids to their stores, as ServeGroup does for the Binders.
+func lookupOf(stores map[string]*cow.Store) source.Lookup {
+	return func(id string) (io.ReaderAt, bool) {
+		s, ok := stores[id]
+		if !ok {
+			return nil, false
+		}
+		return s, true
 	}
 }
 
-// A base that implements Binder gets a lookup of its siblings' live views and reads them
-// through their COW stores, so it sees what the guest wrote.
+// siblingSource is a base that implements Binder: a live view of the sibling device id, read
+// through its COW store, so it sees what the guest wrote there.
 type siblingSource struct {
+	id     string
+	size   int64
 	lookup source.Lookup
 }
 
 func (s *siblingSource) Bind(lookup source.Lookup) { s.lookup = lookup }
 func (s *siblingSource) ReadAt(p []byte, off int64) (int, error) {
-	a, ok := s.lookup("a")
+	if s.lookup == nil {
+		return 0, io.ErrUnexpectedEOF
+	}
+	a, ok := s.lookup(s.id)
 	if !ok {
 		return 0, io.ErrUnexpectedEOF
 	}
 	return a.ReadAt(p, off)
 }
-func (s *siblingSource) Size() int64  { return 8 * groupChunk }
+func (s *siblingSource) Size() int64  { return s.size }
 func (s *siblingSource) Close() error { return nil }
 
 func TestBinderSeesSiblingWrites(t *testing.T) {
 	dir := t.TempDir()
 	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
-	src := &siblingSource{}
-	b, err := cow.Open(src, filepath.Join(dir, "b.cow"), filepath.Join(dir, "b.bitmap"), groupChunk)
+	view := &siblingSource{id: "a", size: 8 * groupChunk}
+	b := openTestStoreOver(t, dir, "b", view)
+	view.Bind(lookupOf(map[string]*cow.Store{"a": a, "b": b}))
+	_, err := a.WriteAt([]byte{9, 9, 9}, 100)
 	require.NoError(t, err)
-	defer b.Close()
-	ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
-	routers := map[string]*router{"a": ra, "b": rb}
-	src.Bind(func(id string) (io.ReaderAt, bool) { r, ok := routers[id]; return r, ok })
-	_, err = ra.WriteAt([]byte{9, 9, 9}, 100)
-	require.NoError(t, err)
-	got := make([]byte, 3)
-	_, err = rb.ReadAt(got, 100)
-	require.NoError(t, err)
-	require.Equal(t, []byte{9, 9, 9}, got, "b's base reads a through its store, overlay included")
+	require.Equal(t, []byte{9, 9, 9}, readAt(t, b, 100, 3), "b's base reads a through its store, overlay included")
 }
 
-// An alias whose target range is itself aliased would forward again; a pair aliasing each
-// other forwards forever. Both are refused.
-func TestRouterRefusesAliasChains(t *testing.T) {
+// The mirror case: b's base is a live view of a and both skip identical writes (nopwrite). The guest
+// writes the same bytes to both plexes, then a resync copy that was read from a before the
+// guest's write lands on b alone. a must keep the guest's bytes: b's writes go to b's own
+// store. (Alias ranges, which forwarded b's writes into a's store, let that stale copy
+// overwrite a, the only copy of the data; they were removed for it.)
+func TestMirrorPlexNeverClobbersItsSibling(t *testing.T) {
 	dir := t.TempDir()
-	a := openTestStore(t, dir, "a", make([]byte, 4*groupChunk))
-	b := openTestStore(t, dir, "b", make([]byte, 4*groupChunk))
-	c := openTestStore(t, dir, "c", make([]byte, 4*groupChunk))
-	ra, rb, rc := &router{id: "a", store: a}, &router{id: "b", store: b}, &router{id: "c", store: c}
-	routers := map[string]*router{"a": ra, "b": rb, "c": rc}
-	opts := []*GroupOptions{
-		{Options: Options{ID: "a"}, Aliases: []Alias{{Offset: 0, Length: groupChunk, Target: "b"}}},
-		{Options: Options{ID: "b"}, Aliases: []Alias{{Offset: 0, Length: groupChunk, Target: "a"}}},
+	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
+	view := &siblingSource{id: "a", size: 8 * groupChunk}
+	b := openTestStoreOver(t, dir, "b", view)
+	a.SetNopWrite(true)
+	b.SetNopWrite(true)
+	view.Bind(lookupOf(map[string]*cow.Store{"a": a, "b": b}))
+	off := int64(3*groupChunk + 100)
+	x, y := bytes.Repeat([]byte{0xAA}, 200), bytes.Repeat([]byte{0xBB}, 200)
+	writeBoth := func(p []byte) {
+		for _, s := range []*cow.Store{a, b} {
+			_, err := s.WriteAt(p, off)
+			require.NoError(t, err)
+		}
 	}
-	require.Error(t, setAllAliases(opts, routers), "a cycle")
-	opts = []*GroupOptions{
-		{Options: Options{ID: "a"}, Aliases: []Alias{{Offset: 0, Length: groupChunk, Target: "b", TargetOffset: 2 * groupChunk}}},
-		{Options: Options{ID: "b"}, Aliases: []Alias{{Offset: 2 * groupChunk, Length: groupChunk, Target: "c"}}},
-		{Options: Options{ID: "c"}},
-	}
-	require.Error(t, setAllAliases(opts, routers), "a chain")
-	// Aliasing a range of the target next to (not inside) its own alias is fine
-	opts[0].Aliases[0].TargetOffset = groupChunk
-	require.NoError(t, setAllAliases(opts, routers))
+	writeBoth(x)
+	writeBoth(y)
+	require.EqualValues(t, 1, a.Written())
+	require.EqualValues(t, 0, b.Written(), "b's half of a mirrored write equals what b reads through a: skipped")
+	require.Equal(t, y, readAt(t, b, off, 200))
+	// the resync read x from a before the guest wrote y, and writes it to b now
+	_, err := b.WriteAt(x, off)
+	require.NoError(t, err)
+	require.Equal(t, y, readAt(t, a, off, 200), "a keeps the guest's bytes")
+	require.Equal(t, x, readAt(t, b, off, 200), "b is stale, as a real disk would be")
+	require.EqualValues(t, 1, b.Written())
+	// Windows re-copies the dirty region
+	_, err = b.WriteAt(y, off)
+	require.NoError(t, err)
+	require.Equal(t, y, readAt(t, b, off, 200))
+	// a resync of a range b never wrote stores nothing
+	_, err = b.WriteAt(readAt(t, a, 4*groupChunk, 4*groupChunk), 4*groupChunk)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, b.Written())
+	// and such a range keeps following a
+	_, err = a.WriteAt([]byte{7, 7, 7}, 5*groupChunk)
+	require.NoError(t, err)
+	require.Equal(t, []byte{7, 7, 7}, readAt(t, b, 5*groupChunk, 3), "an unwritten range of b follows a")
 }
 
 // Bases are usually stitched from parts (a config always yields a Concat): every Binder in
 // the tree gets the lookup, not only a Binder at the top.
 func TestBindReachesNestedSources(t *testing.T) {
-	nested := &siblingSource{}
+	nested := &siblingSource{id: "a", size: groupChunk}
 	concat, err := source.NewConcat([]*source.Segment{{Offset: 0, Source: nested}}, 0)
 	require.NoError(t, err)
-	top := &siblingSource{}
+	top := &siblingSource{id: "a", size: groupChunk}
 	bindAll([]source.Source{concat, top}, func(string) (io.ReaderAt, bool) { return nil, false })
 	require.NotNil(t, nested.lookup)
 	require.NotNil(t, top.lookup)
@@ -212,7 +182,7 @@ func TestServeCancelledTouchesNothing(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	_, statErr := os.Stat(filepath.Join(dir, "cx.cow"))
 	require.True(t, os.IsNotExist(statErr), "the cow file must not even be created")
-	_, err = ServeGroup(ctx, []*GroupOptions{{Options: Options{ID: "cy", Base: base, COWFile: filepath.Join(dir, "cy.cow"), RunDir: dir, DevDir: dir}}})
+	_, err = ServeGroup(ctx, []*Options{{ID: "cy", Base: base, COWFile: filepath.Join(dir, "cy.cow"), RunDir: dir, DevDir: dir}})
 	require.ErrorIs(t, err, context.Canceled)
 	_, statErr = os.Stat(filepath.Join(dir, "cy.cow"))
 	require.True(t, os.IsNotExist(statErr))
@@ -229,41 +199,39 @@ func (c *countingBase) Close() error {
 	return nil
 }
 
-// Through the kernel: b's second and third chunks are a's sixth and seventh. b is listed
-// first, so it comes up before its alias target, and writes through b's page cache are only
-// written out when b stops; the group must still have a's store open then.
+// Through the kernel: gb's base is a live view of ga. gb is listed first, so it comes up
+// before the device it reads, and a write buffered in gb's page cache is only written out
+// when gb stops; the group must still have ga's store open then. The write lands in gb's
+// store and never in ga's.
 func TestServeGroupThroughKernel(t *testing.T) {
 	requireUblk(t)
 	dir := t.TempDir()
-	opt := func(id string, data []byte) Options {
-		return Options{ID: id, Base: &bytesSource{data: data}, COWFile: filepath.Join(dir, id+".cow"), ChunkSize: groupChunk,
-			DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run")}
+	opt := func(id string, base source.Source) *Options {
+		return &Options{ID: id, Base: base, COWFile: filepath.Join(dir, id+".cow"), ChunkSize: groupChunk,
+			DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run"), NopWrite: true}
 	}
-	g, err := ServeGroup(context.Background(), []*GroupOptions{
-		{Options: opt("gb", seeded(8*groupChunk, 2)), Aliases: []Alias{{Offset: groupChunk, Length: 2 * groupChunk, Target: "ga", TargetOffset: 5 * groupChunk}}},
-		{Options: opt("ga", seeded(8*groupChunk, 1))},
+	g, err := ServeGroup(context.Background(), []*Options{
+		opt("gb", &siblingSource{id: "ga", size: 8 * groupChunk}),
+		opt("ga", &bytesSource{data: seeded(8*groupChunk, 1)}),
 	})
 	require.NoError(t, err)
-	// The aliased range of b shows a's bytes
 	fb, err := os.OpenFile(g.Devices["gb"].BlockPath, os.O_RDWR, 0)
 	require.NoError(t, err)
-	got := make([]byte, groupChunk)
-	_, err = fb.ReadAt(got, groupChunk)
-	require.NoError(t, err)
-	require.Equal(t, seeded(8*groupChunk, 1)[5*groupChunk:6*groupChunk], got)
-	// A buffered write through b, never flushed by us
+	require.Equal(t, seeded(8*groupChunk, 1)[5*groupChunk:6*groupChunk], readAt(t, fb, 5*groupChunk, groupChunk), "gb shows ga's bytes")
 	w := bytes.Repeat([]byte{0xC3}, groupChunk)
-	_, err = fb.WriteAt(w, 2*groupChunk)
+	_, err = fb.WriteAt(w, 2*groupChunk) // buffered, never flushed by us
 	require.NoError(t, err)
 	require.NoError(t, fb.Close())
 	require.NoError(t, g.Close())
-	// It reached a's store
+	b, err := cow.Open(&bytesSource{data: seeded(8*groupChunk, 1)}, filepath.Join(dir, "gb.cow"), filepath.Join(dir, "gb.cow.bitmap"), groupChunk)
+	require.NoError(t, err)
+	defer b.Close()
+	require.Equal(t, w, readAt(t, b, 2*groupChunk, groupChunk), "the write must survive the group's shutdown in gb's store")
+	require.EqualValues(t, 1, b.Written())
 	a, err := cow.Open(&bytesSource{data: seeded(8*groupChunk, 1)}, filepath.Join(dir, "ga.cow"), filepath.Join(dir, "ga.cow.bitmap"), groupChunk)
 	require.NoError(t, err)
 	defer a.Close()
-	_, err = a.ReadAt(got, 6*groupChunk)
-	require.NoError(t, err)
-	require.Equal(t, w, got, "a write through the alias must survive the group's shutdown")
+	require.EqualValues(t, 0, a.Written(), "nothing written through gb reaches ga")
 }
 
 // When the device cannot be published, Serve fails with the base closed exactly once.
@@ -278,62 +246,92 @@ func TestServeFailedPublishClosesOnce(t *testing.T) {
 	require.Equal(t, 1, base.closes)
 }
 
-// Requests through a router allocate nothing, like the single-device hot path: a group
-// device serves every guest request through it.
-func TestRouterNoAlloc(t *testing.T) {
+const groupHelperEnv = "BLKMAP_DEVICE_GROUP_HELPER" // the test directory
+
+// groupFailOptions is a mirror: fb's base is a live view of fa, with its own overlay.
+func groupFailOptions(dir string) []*Options {
+	opt := func(id string, base source.Source) *Options {
+		return &Options{ID: id, Base: base, COWFile: filepath.Join(dir, id+".cow"), ChunkSize: groupChunk,
+			DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run"), Recovery: true}
+	}
+	return []*Options{
+		opt("fb", &siblingSource{id: "fa", size: 8 * groupChunk}),
+		opt("fa", &bytesSource{data: seeded(8*groupChunk, 1)}),
+	}
+}
+
+// TestHelperServeGroupFailing serves the mirror until SIGUSR1, then fails fa's store and does
+// what an owner must: wait for the group to report it, abandon it and exit for a successor.
+func TestHelperServeGroupFailing(t *testing.T) {
+	dir := os.Getenv(groupHelperEnv)
+	if dir == "" {
+		t.Skip("helper process only")
+	}
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	g, err := ServeGroup(context.Background(), groupFailOptions(dir))
+	if err != nil {
+		fmt.Println("ERR", err)
+		os.Exit(1)
+	}
+	fmt.Println("DEV", g.Devices["fb"].BlockPath, g.Devices["fa"].BlockPath)
+	<-usr1
+	g.Devices["fa"].store.Fail(errors.New("injected"))
+	select {
+	case <-g.Done():
+	case <-time.After(5 * time.Second):
+		fmt.Println("ERR the group did not report the failure")
+		os.Exit(1)
+	}
+	fmt.Println("FAILED", g.Err())
+	if err := g.Abandon(); err != nil && !errors.Is(err, cow.ErrCOWFailed) {
+		fmt.Println("ERR abandon:", err)
+		os.Exit(1)
+	}
+	os.Exit(ExitDetached)
+}
+
+func TestGroupStoreFailureHandsOffToSuccessor(t *testing.T) {
+	requireUblk(t)
+	if !recoverySupported() {
+		t.Skip("no ublk user recovery")
+	}
 	dir := t.TempDir()
-	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
-	b := openTestStore(t, dir, "b", seeded(8*groupChunk, 2))
-	ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
-	routers := map[string]*router{"a": ra, "b": rb}
-	require.NoError(t, setAllAliases([]*GroupOptions{
-		{Options: Options{ID: "a"}},
-		{Options: Options{ID: "b"}, Aliases: []Alias{{Offset: groupChunk, Length: 2 * groupChunk, Target: "a", TargetOffset: 4 * groupChunk}}},
-	}, routers))
-	p := make([]byte, 4*groupChunk) // own range, alias, own range
-	_, err := rb.WriteAt(p, 0)      // first writes copy chunks up; measure steady state
+	cmd := exec.Command(os.Args[0], "-test.run", "TestHelperServeGroupFailing$")
+	cmd.Env = append(os.Environ(), groupHelperEnv+"="+dir)
+	out, err := cmd.StdoutPipe()
 	require.NoError(t, err)
-	require.Zero(t, testing.AllocsPerRun(100, func() { rb.ReadAt(p, 0) }), "read")
-	require.Zero(t, testing.AllocsPerRun(100, func() { rb.WriteAt(p, 0) }), "write")
-	require.Zero(t, testing.AllocsPerRun(100, func() { rb.WriteZeroes(0, 4*groupChunk) }), "write zeroes")
-}
-
-// TestReciprocalMirrorFlush: two mirrors with opposite primaries alias each other's
-// ranges; the byte routing is acyclic but the device graph is not, and Flush must not
-// recurse forever. The flush runs in a child with a small stack so an overflow is a
-// clean failure rather than a crash of the whole test binary.
-func TestReciprocalMirrorFlush(t *testing.T) {
-	if os.Getenv("BLKMAP_TEST_FLUSH_CHILD") == "1" {
-		debug.SetMaxStack(128 << 10)
-		dir := t.TempDir()
-		a := openTestStore(t, dir, "a", make([]byte, 4*groupChunk))
-		b := openTestStore(t, dir, "b", make([]byte, 4*groupChunk))
-		ra, rb := &router{id: "a", store: a}, &router{id: "b", store: b}
-		routers := map[string]*router{"a": ra, "b": rb}
-		require.NoError(t, setAllAliases([]*GroupOptions{
-			{Options: Options{ID: "a"}, Aliases: []Alias{{Offset: groupChunk, Length: groupChunk, Target: "b", TargetOffset: groupChunk}}},
-			{Options: Options{ID: "b"}, Aliases: []Alias{{Offset: 0, Length: groupChunk, Target: "a", TargetOffset: 0}}},
-		}, routers))
-		_, err := ra.WriteAt([]byte{0x42}, groupChunk)
-		require.NoError(t, err)
-		got := make([]byte, 1)
-		_, err = rb.ReadAt(got, groupChunk)
-		require.NoError(t, err)
-		require.Equal(t, byte(0x42), got[0])
-		require.NoError(t, ra.Flush())
-		return
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestReciprocalMirrorFlush$", "-test.timeout=10s")
-	cmd.Env = append(os.Environ(), "BLKMAP_TEST_FLUSH_CHILD=1")
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "flush of reciprocal aliases failed (stack overflow: %v): %s", bytes.Contains(out, []byte("stack overflow")), lastLines(out, 5))
-}
-
-// lastLines returns the last n lines of out, for a readable failure message.
-func lastLines(out []byte, n int) string {
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
-	}
-	return strings.Join(lines, "\n")
+	require.NoError(t, cmd.Start())
+	r := bufio.NewReader(out)
+	var fbPath, faPath string
+	_, err = fmt.Fscanf(r, "DEV %s %s\n", &fbPath, &faPath)
+	require.NoError(t, err)
+	fa, err := os.OpenFile(faPath, os.O_RDWR|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	defer fa.Close()
+	// One write flushed, one acknowledged but not flushed when the store fails
+	flushed := writeUnflushed(t, fa, 0, 'f')
+	require.NoError(t, fa.Sync())
+	writeUnflushed(t, fa, groupChunk, 'u')
+	require.NoError(t, cmd.Process.Signal(syscall.SIGUSR1))
+	rest, _ := io.ReadAll(r)
+	err = cmd.Wait()
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, "helper output: %s", rest)
+	require.Equal(t, ExitDetached, exit.ExitCode(), "helper output: %s", rest)
+	assert.Contains(t, string(rest), "FAILED fa: cow file failed")
+	// The successor re-attaches both devices and serves the last flushed state
+	g, err := ServeGroup(context.Background(), groupFailOptions(dir))
+	require.NoError(t, err)
+	assert.Equal(t, faPath, g.Devices["fa"].BlockPath)
+	assert.Equal(t, flushed, readBlock(t, fa, 0))
+	assert.Equal(t, seeded(8*groupChunk, 1)[groupChunk:groupChunk+4096], readBlock(t, fa, groupChunk), "the unflushed write may be lost with the failed store")
+	fb, err := os.OpenFile(fbPath, os.O_RDONLY|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	defer fb.Close()
+	assert.Equal(t, flushed, readBlock(t, fb, 0), "fb's view still shows fa")
+	// Deleting a kernel device waits for its openers
+	require.NoError(t, fb.Close())
+	require.NoError(t, fa.Close())
+	require.NoError(t, g.Close())
 }

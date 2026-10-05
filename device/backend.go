@@ -16,27 +16,11 @@ const (
 	maxLoggedErrors = 20
 )
 
-// target is what the kernel's requests are served from: a cow.Store, or a group router that
-// forwards aliased ranges to another device's store.
-type target interface {
-	io.ReaderAt
-	io.WriterAt
-	Size() int64
-	Flush() error
-	Discard(off, length int64) error
-	WriteZeroes(off, length int64) error
-}
-
-var (
-	_ target = (*cow.Store)(nil)
-	_ target = (*router)(nil)
-)
-
 // backend wraps the store so I/O failures are visible in the log (the ublk layer itself
 // only turns them into EIO for the kernel), so hydration can tell when the guest is busy,
 // and to count requests for the status socket. Counting is atomic and allocation-free.
 type backend struct {
-	store      target
+	store      *cow.Store
 	id         string
 	logged     atomic.Int64
 	inflight   atomic.Int64

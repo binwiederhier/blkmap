@@ -14,7 +14,7 @@ leave nothing behind.
 | `lib-dircache` | a fast cache tier implemented as a directory of block files (missing file = miss) in front of a slow source, with hydration and cache statistics |
 | `lib-custom-source` | a computed source with holes, presence and a content identity, registered as a `type: custom` segment of a YAML config, or served directly |
 | `lib-tiered` | fast and slow backends of your own (an in-memory block store, a remote with a round trip and abort) behind a cache tier with read-ahead and hydration |
-| `lib-ldm-mirror` | both disks of a Windows dynamic-disk mirror from a backup of one: a device group with an alias, and write elision so a resync stores nothing |
+| `lib-ldm-mirror` | both disks of a Windows dynamic-disk mirror from a backup of one: a device group with a `Binder` view of the sibling plex, and nopwrite so a resync stores nothing |
 | `grpc-remote` | a gRPC protocol exporting sparse files from a remote host: size, data-extent map, reads; the client is a `source.Source` with holes, so hydration never transfers zeros |
 
 ## Verified runs (2026-10-02)

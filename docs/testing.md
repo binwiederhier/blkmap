@@ -22,8 +22,9 @@ record the outcome in `docs/test-results/YYYY-MM-DD.md` (`make test-machine` wri
 | Power cuts under a verifying writer | `make powercut HOST=ip MODE=power CYCLES=10` | same; reboots the VM | 4 min |
 | Soak: verified I/O under chaos for hours | `make soak HOST=ip MINUTES=120` | same | 2 h |
 | Crash-point replay: every logged crash state of the COW filesystem | `make crashreplay HOST=ip [MODE=records\|fs] [N=3000] [CHECKS=0]` | same, plus `dm-log-writes` | 10 min (records), 30 min (fs, 300 states) |
-| Write errors under the COW file | `make faults HOST=ip` | same, plus `dm-flakey` | 1 min |
+| Faults under the COW file (write errors with and without a journal, bad blocks) | `make faults HOST=ip` | same, plus `dm-flakey` | 2 min |
 | Coverage of unit plus root tests | `make coverage HOST=ip` | same | 3 min |
+| Windows guests with SQL Server under kills, reloads, resets and power cuts | `scripts/windows/soak.sh HOURS VERSION...` (see `scripts/windows/README.md`) | the Windows soak VM (VM 900 on box12) with golden images | hours to days |
 
 Never run the root-level layers on a workstation. A bug in the ublk transport can wedge a
 kernel until reboot, and the power-cut test reboots the machine on purpose.
@@ -181,16 +182,31 @@ is read once without hydration and again after hydration completes, which catche
 marking that exposes unclaimed COW data (the old `MarkZero` fails 6 of 85 states), then
 the guest filesystem must fsck clean and hold each file as its last fsync left it.
 
-## Write errors under the COW file
+## Faults under the COW file
 
-`make faults` puts the COW filesystem on device-mapper and swaps in dm-flakey
-`error_writes` mid-write. After a failed fsync Linux marks the failed pages clean, so a
+`make faults` puts the COW filesystem on device-mapper and swaps in faulty tables mid-write
+(`scripts/faults-run.sh writeback|journaled|readerr` runs one scenario). Ubuntu's kernels lack
+dm-dust, so a bad block is a one-block `error` segment in a linear table. In the writeback
+scenario dm-flakey `error_writes` fails every write. After a failed fsync Linux marks the failed pages clean, so a
 retried flush would succeed without the data: the store must stop at the first failure
 (`cow.ErrCOWFailed`) and the server must restart from the last flushed state. The COW
 filesystem has no journal in this test, since ext4 with one aborts and goes read-only on
 the first failed commit, hiding the COW file's own failure; it gets a fsck before the last
 phase, like any filesystem after write errors. Before the fix the test lost 240 slots of
 base data.
+
+## Windows soak
+
+`scripts/windows/` runs real Windows (Server 2019, 2022, 2025, Windows 11, Windows 10 LTSC)
+with SQL Server 2022 Developer on blkmap devices, nested in a Linux VM. A client outside the
+crash domain commits checksummed transactions and logs every commit SQL Server acknowledged;
+after each disruption (blkmap kill -9 or reload, a hard reset of the guest, a power cut of
+the whole VM) every acknowledged commit must be there, `DBCC CHECKDB` and `chkdsk /scan`
+clean. The guests use an emulated NVMe disk: QEMU's AHCI never turns a guest's write-through
+(FUA) writes into flushes, so with it SQL Server commits reached blkmap unflushed and the
+first shakedown lost acknowledged commits in a power cut (2,083 commits a minute against 17
+flushes reaching blkmap). Any virtual controller in front of a blkmap device must pass FUA
+or flushes through.
 
 ## Older systemd
 
@@ -204,5 +220,5 @@ space without saying so; check with `virt-ls -a img /boot`.
 ## Not covered yet
 
 - Soak runs longer than two hours (days).
-- A device group (aliases) under chaos: groups are covered by unit tests and one
+- A device group (Binder bases) under chaos: groups are covered by unit tests and one
   kernel-level test only.

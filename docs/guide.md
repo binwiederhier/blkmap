@@ -448,6 +448,25 @@ dev, err := device.Serve(ctx, &device.Options{
 `ReadAt` is called from several goroutines at once (one per in-flight request on a slow
 source), so make it safe for concurrent use. Writes never reach the source.
 
+Watch `dev.Done()`: it closes when the device fails underneath, and `dev.Err()` says why.
+After a failed sync of the COW file (`errors.Is(err, cow.ErrCOWFailed)`) the writes since
+the last flush may be gone from the page cache, so the store refuses all further I/O. With
+`Recovery: true` and a supervisor that restarts the process, call `dev.Abandon()` and exit:
+the kernel device waits, and the next `Serve` of the same ID re-attaches and serves the last
+flushed state, the way `blkmap serve` does under systemd. Otherwise `dev.Close()` it.
+
+```go
+select {
+case <-ctx.Done():
+	dev.Close()
+case <-dev.Done():
+	if errors.Is(dev.Err(), cow.ErrCOWFailed) && dev.Abandon() == nil {
+		os.Exit(device.ExitDetached) // the supervisor restarts us
+	}
+	dev.Close()
+}
+```
+
 ### Give a source optional abilities
 
 A source can implement more interfaces; blkmap uses each when it is there, through any
@@ -604,60 +623,79 @@ cannot check that for you.
 A Windows mirrored volume is RAID-1 across two dynamic disks: each disk has its own
 partition table and LDM metadata, and the volume's data sits on both, byte for byte the same.
 With a backup of only one disk, both can be served again from one process: disk 0 from the
-backup, disk 1 as its own header plus an alias onto disk 0's data range.
+backup, disk 1 as its own header plus a live view of disk 0's data range, a small
+`source.Binder` that reads disk 0 through its device:
 
 ```go
+type plexView struct {
+	target         string
+	offset, length int64
+	lookup         source.Lookup
+}
+
+func (v *plexView) Bind(l source.Lookup) { v.lookup = l }
+func (v *plexView) ReadAt(p []byte, off int64) (int, error) {
+	r, _ := v.lookup(v.target)
+	return r.ReadAt(p, v.offset+off)
+}
+// Size and Close as usual
+
 dataOff, dataLen := int64(1<<20), size-(1<<20)-(1<<20) // up to the LDM database, last MiB
 disk1, _ := source.NewConcat([]*source.Segment{
-	{Offset: 0, Source: header1},                         // disk 1's own first MiB, or zeros
-	{Offset: dataOff, Source: source.NewZero(size - dataOff)}, // never read in the alias range
+	{Offset: 0, Source: header1}, // disk 1's own first MiB, or zeros
+	{Offset: dataOff, Source: &plexView{target: "ldm0", offset: dataOff, length: dataLen}},
+	{Offset: dataOff + dataLen, Source: source.NewZero(1 << 20)}, // its own LDM database
 }, size)
-g, err := device.ServeGroup(ctx, []*device.GroupOptions{
-	{Options: device.Options{ID: "ldm0", Base: disk0, COWFile: cow0}, ElideIdenticalWrites: true},
-	{Options: device.Options{ID: "ldm1", Base: disk1, COWFile: cow1}, ElideIdenticalWrites: true,
-		Aliases: []device.Alias{{Offset: dataOff, Length: dataLen, Target: "ldm0", TargetOffset: dataOff}}},
+g, err := device.ServeGroup(ctx, []*device.Options{
+	{ID: "ldm0", Base: disk0, COWFile: cow0, NopWrite: true},
+	{ID: "ldm1", Base: disk1, COWFile: cow1, NopWrite: true},
 })
 ```
 
-Reads of disk 1's data range see disk 0's bytes and writes there land in disk 0's store, so
-the plexes cannot diverge and nothing is stored twice. `ElideIdenticalWrites` handles what
-Windows does next: it does not trust the restored mirror and resyncs it, rewriting every
-block of disk 1 with disk 0's content. Those writes are identical to what the device already
-reads, and elision drops them before they reach the COW file:
+Each disk has its own overlay, so a write to disk 1 never changes disk 0, exactly as with
+two real disks. `NopWrite` handles what Windows does next: it does not trust the
+restored mirror and resyncs it, rewriting every block of disk 1 with disk 0's content. Those
+writes equal what disk 1 already reads through its view, nopwrite drops them before they
+reach the COW file, and the range keeps following disk 0. The same happens to disk 1's half
+of every mirrored write while the plexes agree. Only a write that differs from disk 0, such
+as a resync copy that is stale by the time it lands, is stored, on disk 1 alone:
 
 ```
 $ sudo ./lib-ldm-mirror -disk0 disk0.img -demo
 resync of 16 MiB onto ldm1: chunks stored before 0, after 0
-4 KiB change through ldm1: chunks stored 1; ldm0 reads it back: true
+4 KiB mirrored write to both disks: chunks stored 1; ldm1 reads it back: true
+4 KiB write to ldm1 alone: chunks stored 2; ldm0 keeps its bytes: true
 ```
 
-Elision works per device without groups too (`cow.Store.SetElision`). It compares against the
-base only when the base cannot change (no `Binder` in it), otherwise only against chunks
-already in the COW file, and a whole-chunk write never waits on reading the base. The full
-program is `examples/lib-ldm-mirror`.
+Do not route disk 1's writes into disk 0's store to save the second copy. The resync races
+the guest: a block read from plex 0 before a guest write and copied to plex 1 after it would
+land in plex 0's store and undo the write, on the only copy there is. blkmap offered exactly
+that as an alias range once and removed it for this reason.
+
+Nopwrite works per device without groups too (`cow.Store.SetNopWrite`). A whole-chunk write
+never waits on reading the base. The full program is `examples/lib-ldm-mirror`.
 
 ### Device groups
 
 `device.ServeGroup` serves several devices from one process, for sets whose members depend on
 each other (the disks of a software RAID restored from a backup that kept only the data):
 
-- **Aliases**: `Alias{Offset, Length, Target, TargetOffset}` makes a range of one device a view
-  of another device's range; reads and writes go to the target's store, so a mirror's second
-  plex needs no copy and the two stay identical. An alias must land in a range its target
-  serves itself (no chains or cycles), and a device with aliases cannot hydrate.
 - **Derived bases**: a base that implements `source.Binder` (anywhere in its tree) receives a
   `source.Lookup` of its siblings' live views, so a parity column computed from the data
   members sees what the guest wrote to them.
-- **Write elision** (`ElideIdenticalWrites`, or `cow.Store.SetElision`): a write equal to what
-  the device already reads is dropped, so a RAID resync after a restore costs no overlay
-  space. It compares against the base only when the base cannot change (no Binder in it),
-  otherwise only against chunks already in the COW file, and it never makes a whole-chunk
-  write depend on reading the base.
+- **Nopwrite** (`NopWrite`, or `cow.Store.SetNopWrite`; the name ZFS uses): a write equal to
+  what the device already reads is dropped, so a RAID resync after a restore costs no overlay
+  space. Over a derived base (a Binder) a skipped range keeps following the base until a write
+  there differs. It never makes a whole-chunk write depend on reading the base.
 - **Writeback** (`Device.Writeback`, `cow.Store.Writeback`) copies the overlay into a writable
   copy of the base, for a device that was a scratch view of files. Writing back into the base
   itself changes its identity: discard the COW file and bitmap afterwards.
 
-`Group.Close` ends every device's I/O before it closes any store.
+`Group.Close` ends every device's I/O before it closes any store. Watch `Group.Done` like
+`Device.Done`: it closes when any device fails. After a store failure (`errors.Is(g.Err(),
+cow.ErrCOWFailed)`: a sync of a COW file failed and its unflushed writes may be gone) call
+`Group.Abandon` and exit; with `Recovery` set, the next `ServeGroup` re-attaches to the same
+kernel devices and serves the last flushed state.
 
 ### A block device without the overlay
 
