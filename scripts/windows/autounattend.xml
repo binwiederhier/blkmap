@@ -48,6 +48,13 @@
     </component>
   </settings>
   <settings pass="specialize">
+    <!-- Windows 11 turns on device encryption by itself (TPM + Secure Boot); the soak boots
+         each guest with a fresh TPM, which a BitLocker-protected disk would refuse -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <ComputerName>@NAME@</ComputerName>
       <TimeZone>UTC</TimeZone>

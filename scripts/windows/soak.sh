@@ -8,10 +8,13 @@
 # Usage: soak.sh HOURS VERSION... (VERSION: a golden image; slot = position)
 #   env HOST (192.168.1.223), PVE (root@box12), VMID (900), GUEST_MEM (MiB, 4096)
 set -uo pipefail
+me="$(cd "$(dirname "$0")" && pwd)"
+# Run from a private copy: bash reads scripts as it goes, and a soak runs for days
+[ -n "${SOAK_COPY:-}" ] || { c=$(mktemp /tmp/soak.XXXX.sh); cp "$0" "$c"; SOAK_COPY=1 SOAK_DIR=$me exec bash "$c" "$@"; }
+me=${SOAK_DIR:-$me}
 hours=${1:?usage: soak.sh HOURS VERSION...}; shift
 guests=("$@")
 host=${HOST:-192.168.1.223} pve=${PVE:-root@box12} vmid=${VMID:-900}
-me="$(cd "$(dirname "$0")" && pwd)"
 logs="$me/../../logs/win-$(date +%Y%m%d-%H%M)"
 mkdir -p "$logs"
 ssh="ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o BatchMode=yes root@$host"

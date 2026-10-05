@@ -202,11 +202,12 @@ with SQL Server 2022 Developer on blkmap devices, nested in a Linux VM. A client
 crash domain commits checksummed transactions and logs every commit SQL Server acknowledged;
 after each disruption (blkmap kill -9 or reload, a hard reset of the guest, a power cut of
 the whole VM) every acknowledged commit must be there, `DBCC CHECKDB` and `chkdsk /scan`
-clean. The guests use an emulated NVMe disk: QEMU's AHCI never turns a guest's write-through
-(FUA) writes into flushes, so with it SQL Server commits reached blkmap unflushed and the
-first shakedown lost acknowledged commits in a power cut (2,083 commits a minute against 17
-flushes reaching blkmap). Any virtual controller in front of a blkmap device must pass FUA
-or flushes through.
+clean. The guests use VirtIO SCSI: QEMU's AHCI and NVMe emulation never turn a guest's
+write-through (FUA) writes into flushes, so SQL Server's commits reached blkmap unflushed and
+the first shakedown lost acknowledged commits in a power cut. Measured over a minute of
+commits from one client: AHCI 2,083 commits and 17 flushes reaching blkmap, NVMe 446 and 121,
+VirtIO SCSI 300 and 520. Any virtual controller in front of a blkmap device must pass FUA or
+flushes through; for QEMU that means VirtIO SCSI (or virtio-blk), not AHCI or NVMe.
 
 ## Older systemd
 

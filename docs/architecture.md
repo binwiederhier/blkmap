@@ -88,14 +88,15 @@ The types a reader meets first, and what owns what.
 | `Sparse`, `Present`, `DirectReader`, `Aborter`, `Identifier`, `Binder` | `source` | optional abilities: tell holes; tell what it holds (a cache's fast tier misses on the rest); read around a cache; fail blocked reads at shutdown; fingerprint content; read sibling devices in a group |
 | `Concat`, `File`, `Zero`, `HTTP`, `RAID5`, `Cache`, `Mapped`, `ReadAhead`, `Swappable` | `source` | the source types; `Mapped` attaches a `Map` of data extents to any of them |
 | `Range`, `Map`, `Access` | `source` | a byte range; sorted merged data extents; one recorded request (`Millis`, `Write`, `Offset`, `Length`) |
-| `Store` | `cow` | the ublk backend: base + COW file + `Bitmap` + chunk locks; `ReadAt`, `WriteAt`, `Flush`, `Discard`, `WriteZeroes`, `HydrateRun`, `MarkZero`, `Writeback`, `SetNopWrite`, `OnDemandRead`, `SourceStats`, `Failed`/`Err`/`Fail` (fail-stop after a failed COW sync, `ErrCOWFailed`) |
+| `Store` | `cow` | the ublk backend: base + COW file + `Bitmap` + chunk locks; `ReadAt`, `WriteAt`, `Flush`, `Discard`, `WriteZeroes`, `HydrateRun`, `MarkZero`, `Writeback`, `SetNopWrite`, `EnableReclaim`/`Reclaim`/`ReclaimStats` (reclaim state allocated only once enabled), `OnDemandRead`, `SourceStats`, `Failed`/`Err`/`Fail` (fail-stop after a failed COW sync, `ErrCOWFailed`) |
 | `Bitmap` | `cow` | one bit per chunk, 4 KiB header (magic, geometry, identity), dirty pages, optional live file in `/run` |
-| `Options`, `Device` | `device` | the library entry (`ID`, `Base`, `COWFile`, `Hydrate`, `Record`, `Recovery`, `NopWrite`, ...) and the running device (`Path`, `BlockPath`, `Close`, `Detach`, `Abandon`, `Status`, `Done`, `Err`, `Writeback`) |
+| `Options`, `Device` | `device` | the library entry (`ID`, `Base`, `COWFile`, `Hydrate`, `Record`, `Recovery`, `NopWrite`, `Reclaim`, ...) and the running device (`Path`, `BlockPath`, `Close`, `Detach`, `Abandon`, `Status`, `Done`, `Err`, `Writeback`) |
 | `Hydrate`, `Progress`, `Schedule` | `device` | the hydration plan (prefetch ranges and their times, rest, rate, cache policy, concurrency); a snapshot (phase, chunks, copied, errors, late); ahead/behind a timed list |
 | `Record`, `RecordStatus` | `device` | recording options (file, max duration and size) and its state |
 | `Group` | `device` | several devices from one process whose bases may read each other's live views (`source.Binder`); `Close`, `Done`, `Err`, `Abandon` |
 | `Status`, `IOStats`, `Histogram` | `device` | what the status socket and `blkmap status` report |
 | `backend` (unexported) | `device` | wraps the store for the kernel: counters, latency histograms, the busy signal, the recorder |
+| `sweeper` (unexported) | `device` | runs `Store.Reclaim`: full batches while the guest is idle, a trickle under load (`Options.Reclaim`) |
 | `Params`, `Device`, `Backend`, `Discarder`, `ZeroWriter`, `Info` | `ublk` | create/recover/stop/delete a kernel device over a `Backend` |
 
 Ownership: `device.Serve` owns the `Base` it was given (closes it even on failure); the
@@ -274,8 +275,13 @@ to what the device already reads is dropped.
 
 **Flush.** A bit on disk never describes data that is not: `Flush` snapshots the dirty
 bitmap pages, `fdatasync`s the COW file, then writes that snapshot and syncs the bitmap. A
-bit set between snapshot and sync stays dirty for the next flush. Flush runs on every guest
-flush, on the 5 s timer when dirty, and at shutdown.
+bit set between snapshot and sync stays dirty for the next flush. Chunks reclaim dropped are
+punched last, once the commit is on disk and only while the bit is clear both in memory and in
+the file (the bitmap keeps a copy of the file's state for that): a cleared bit over stale data
+reads the base, which holds the same bytes, while a set bit over a punched chunk would read
+zeros. Each punch excludes reads of the COW file (a read that found the bit set and had not
+read yet would see the hole). Flush runs on every guest flush, on the 5 s timer when dirty,
+and at shutdown.
 
 **Discard and write-zeroes.** `Discard` punches a hole for every whole chunk already in the
 COW file (it keeps its bit, reads as zeros, stops using space); partial and unwritten chunks
@@ -294,18 +300,27 @@ atomics; each page has a dirty flag; `Sync` rewrites only dirty pages. A 1 TiB d
 
 **Live bitmap.** With recovery on, the in-memory words are a shared mapping of
 `/run/blkmap/<id>.bitmap` on tmpfs. Bits reach the live map before a write is acknowledged
-and the disk bitmap only at flush, so the live map is a superset of the disk file. A
-successor adopts a live file with the same geometry; a freshly created disk bitmap never
-adopts one. Like the page cache it describes, the live file does not survive a reboot.
+and the disk bitmap only at flush, so the live map is the current state, set and cleared
+bits alike, and the disk file lags behind it. A successor adopts a live file with the same
+geometry; a freshly created disk bitmap never adopts one. Like the page cache it describes,
+the live file does not survive a reboot.
 
 **Identity.** The header records `source.Identity` of the base (file: size and mtime; HTTP:
 ETag or Last-Modified; RAID-5: geometry plus ordered member identities; concat: offset and
 identity of every segment). Once chunks are written, a different identity is refused;
 `blkmap pin` rewrites it.
 
-**Nopwrite and writeback** exist for device groups: `SetNopWrite(true)` drops writes equal to
-what the device already reads (over a derived base the skipped range keeps following it),
-`Writeback(dst)` copies every written chunk into a writable copy of the base.
+**Nopwrite, reclaim and writeback** exist for device groups: `SetNopWrite(true)` drops writes
+equal to what the device already reads (over a derived base the skipped range keeps following
+it), `Reclaim(ctx, budget)` examines up to budget chunks written since it last looked (a second
+in-memory bitmap records them, one atomic or per write, repeated writes to a stored chunk
+included) and clears the bit of every one that holds exactly what its base reads now, so a
+chunk nopwrite froze by timing follows the base again; one that differs is looked at once more
+after a settle time, then forgotten until written again. The chunk is punched by the flush
+that commits the clear; the first call also queues chunks a crashed predecessor dropped but
+never punched (allocated in the COW file with a clear bit). The recorded set is process memory:
+chunks frozen before a restart stay stored until written again. `Writeback(dst)` copies every
+written chunk into a writable copy of the base.
 
 **Hydration primitives.** `HydrateRun(first, count, direct)` copies up to 1 MiB of consecutive
 unwritten chunks in one read; `MarkZero(chunk)` marks a hole chunk without copying. Both skip
@@ -413,7 +428,10 @@ parity derived from the data members sees guest writes, and a mirror's second pl
 of the first. Every device keeps its own store, so a write to one device never lands in
 another's. `NopWrite` turns nopwrite on per device; over a derived base a skipped
 range keeps following the base until a write there differs, so a RAID resync or parity
-regeneration stores nothing while the members agree. `Group.Close` halts all I/O before
+regeneration stores nothing while the members agree. `Reclaim` adds a sweeper that drops
+stored chunks that equal the base again (a mirrored write whose halves landed out of order
+froze them), in full batches while the guest is idle and a trickle under load. `Group.Close`
+halts all I/O, the sweepers included, before
 closing any store.
 
 ```mermaid

@@ -3,6 +3,33 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## v0.4.0 (2026-10-05)
+
+- **Reclaim** (library, `device.Options.Reclaim`, `cow.Store.Reclaim`): a background sweeper
+  that drops stored chunks which have become identical to their base again. With nopwrite
+  over a derived base a chunk freezes in the overlay the first time a write to it differs from
+  the base at that instant, and for a mirror plex that happens by timing alone: the halves of
+  a mirrored write land in either order, the plex whose half comes first sees its sibling
+  still holding the old bytes and stores its half, and every later write to that chunk is
+  compared against the stored copy, so a hot chunk stays stored on both plexes for good. The
+  sweeper walks the chunks written since it last looked (a repeated write to a stored chunk
+  counts too), compares each with its base and clears the bit of every one that equals it; a
+  chunk that differs gets one second look a second later, when the other half of a mirrored
+  write has landed. The chunk is punched by the Flush that puts the cleared bit on disk
+  (`cow.Bitmap.Clear`), the mirror image of the data-then-bit order for a set bit, so a crash
+  never finds a recorded chunk that was punched; a read in flight on the chunk is waited for;
+  punches a crashed predecessor owed are found in the COW file and done. Costs one overlay
+  read and one base read per examined chunk: full batches while the guest is idle, a trickle
+  of 64 chunks per 100 ms under load. Counters in `Status.Reclaim`, `blkmap status` and the
+  metrics. Refused together with `Hydrate`, which copies the base on purpose. Its state
+  (about four bits per chunk) is allocated only when reclaim is on (`cow.Store.EnableReclaim`,
+  which `device.Options.Reclaim` calls before the device serves I/O).
+- **Windows soak harness**: guests boot from VirtIO SCSI. QEMU's AHCI and NVMe emulation drop
+  a guest's write-through (FUA) writes, so SQL Server's commits never reached blkmap as
+  flushes and a power cut lost acknowledged commits; whatever virtual controller fronts a
+  blkmap device must pass FUA or flushes through. Windows 11 builds prevent BitLocker device
+  encryption and set up WinRM without a network.
+
 ## v0.3.0 (2026-10-05)
 
 - **Alias ranges removed, nopwrite over derived bases** (breaking, library): a device range

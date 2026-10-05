@@ -93,6 +93,69 @@ func TestBitmapPersistsOnlyOnSync(t *testing.T) {
 	require.NoError(t, b.Close())
 }
 
+// Clear takes a bit back, in memory until the next Sync like Set; committed reports a bit as
+// the file holds it, which follows a successful Commit.
+func TestBitmapClear(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bits")
+	b, err := OpenBitmap(path, 1000*4096, 4096)
+	require.NoError(t, err)
+	b.trackCommitted()
+	b.Set(5)
+	b.Set(6)
+	assert.False(t, b.committed(5), "set in memory only")
+	require.NoError(t, b.Sync())
+	assert.True(t, b.committed(5))
+	b.Clear(5)
+	b.Clear(7) // clearing a clear bit is fine
+	assert.False(t, b.Test(5))
+	assert.True(t, b.Test(6))
+	assert.Equal(t, int64(1), b.Count())
+	assert.True(t, b.Pending())
+	assert.True(t, b.committed(5), "cleared in memory only")
+	pages := b.Snapshot()
+	require.NoError(t, b.Commit(pages))
+	assert.False(t, b.committed(5))
+	assert.True(t, b.committed(6))
+	require.NoError(t, b.Close())
+	b, err = OpenBitmap(path, 1000*4096, 4096)
+	require.NoError(t, err)
+	b.trackCommitted()
+	assert.False(t, b.Test(5))
+	assert.True(t, b.Test(6))
+	assert.True(t, b.committed(6), "read from the file at open")
+	require.NoError(t, b.Close())
+}
+
+// After a Commit that failed, the bits it tried to write count as committed (the file may
+// hold them) until a later Commit succeeds, so a punch never trusts a clear that may not be
+// on disk.
+func TestBitmapFailedCommitCountsAsSet(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bits")
+	b, err := OpenBitmap(path, 1000*4096, 4096)
+	require.NoError(t, err)
+	b.trackCommitted()
+	b.Set(5)
+	require.NoError(t, b.Sync())
+	b.Clear(5)
+	b.Set(9)
+	pages := b.Snapshot()
+	f := b.f
+	b.f, err = os.OpenFile(path, os.O_RDONLY, 0) // writes fail
+	require.NoError(t, err)
+	require.Error(t, b.Commit(pages))
+	b.f.Close()
+	b.f = f
+	assert.True(t, b.committed(5), "a clear a failed commit tried to write is not trusted")
+	assert.True(t, b.committed(9), "nor is a set bit assumed absent")
+	assert.True(t, b.Pending(), "the pages are dirty again")
+	require.NoError(t, b.Sync())
+	assert.False(t, b.committed(5))
+	assert.True(t, b.committed(9))
+	require.NoError(t, b.Close())
+}
+
 func TestBitmapNoAlloc(t *testing.T) {
 	b, err := OpenBitmap(filepath.Join(t.TempDir(), "bits"), 1<<30, 64<<10)
 	require.NoError(t, err)

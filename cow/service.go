@@ -4,6 +4,7 @@ package cow
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +27,9 @@ const (
 	// MaxRunBytes is the largest HydrateRun served from a pooled buffer; the hydrator sizes
 	// its runs to it.
 	MaxRunBytes = 1 << 20
+	// reclaimSettle is how long Reclaim waits before it looks a second time at a chunk that
+	// differed from its base: long enough for the other half of a mirrored write to land.
+	reclaimSettle = time.Second
 )
 
 var (
@@ -85,6 +89,30 @@ type Store struct {
 	failOnce    sync.Once
 	flushMu     sync.Mutex              // Serializes Flush, whose data-then-bitmap order must not interleave
 	locks       [lockStripes]sync.Mutex // Serializes read-modify-write per chunk stripe
+	// readMu is held shared by a read of the COW file, from the bitmap test that chose it to the
+	// read itself, and exclusively by the punch of a chunk Reclaim dropped (see punchFreed)
+	readMu  sync.RWMutex
+	readGap func() // called by a read between its bitmap test and its COW read; tests widen the race there
+	punchMu sync.Mutex
+	punches []int64 // chunks Reclaim dropped from the overlay, punched once their cleared bits are on disk
+	// recent has one bit per chunk, set when a write changes the chunk's overlay content (or
+	// repeats it, see writeChunk) and taken by Reclaim when it examines the chunk. A chunk
+	// that differed from its base is collected in again for a second look; due is the set
+	// being looked at again, filled from again once empty and examined once dueAt, when it
+	// was filled, lies settle back, so every chunk waits at least settle. recentCount counts
+	// all three; Reclaim alone touches all but recent (see Reclaim).
+	recent, again, due   []uint32
+	recentCount          atomic.Int64
+	againCount, dueCount int
+	recentNext           int64 // the chunk Reclaim scans from next
+	dueAt                time.Time
+	settle               time.Duration // reclaimSettle, shorter in tests
+	reclaimOn            atomic.Bool   // EnableReclaim was called; the sets exist
+	reclaimMu            sync.Mutex    // Serializes Reclaim and EnableReclaim
+	scanned              bool          // the first Reclaim looked for orphans (see scanOrphans)
+	examined             atomic.Int64
+	reclaimed            atomic.Int64
+	reclaimedBytes       atomic.Int64
 }
 
 // Open opens or creates the COW file and bitmap for base. The Store takes ownership of base.
@@ -137,6 +165,7 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 	}
 	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size}
 	s.syncCOW, s.failed = cow.Sync, make(chan struct{})
+	s.settle = reclaimSettle
 	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
 	s.bufs.New = func() any {
 		b := make([]byte, chunkSize)
@@ -231,9 +260,13 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 	}
 	n := len(p)
 	// Serve runs of chunks with the same state in one call each, so a request that spans
-	// many unwritten chunks reaches the base source once (one round trip for a remote one)
+	// many unwritten chunks reaches the base source once (one round trip for a remote one).
+	// The bitmap test and the COW read of a written run happen under readMu, so a chunk
+	// Reclaim dropped is not punched in between (it would read as zeros); a base read is not
+	// covered, it may block for as long as a remote source takes.
 	for len(p) > 0 {
 		chunk := off / s.chunkSize
+		s.readMu.RLock()
 		written := s.bitmap.Test(chunk)
 		end := (chunk + 1) * s.chunkSize
 		for end < off+int64(len(p)) && s.bitmap.Test(end/s.chunkSize) == written {
@@ -243,8 +276,13 @@ func (s *Store) ReadAt(p []byte, off int64) (int, error) {
 		var read int
 		var err error
 		if written {
+			if s.readGap != nil {
+				s.readGap()
+			}
 			read, err = s.cow.ReadAt(p[:m], off)
-		} else {
+		}
+		s.readMu.RUnlock()
+		if !written {
 			read, err = s.readBase(p[:m], off)
 			s.demandReads.Add(1)
 			s.demandBytes.Add(int64(read))
@@ -306,7 +344,9 @@ func (s *Store) Abort() {
 
 // Flush makes all completed writes durable: the bitmap pages are snapshotted first, then the
 // COW data is synced, then the snapshot is written, so a bit on disk never describes data
-// that is not (a write landing between the two syncs stays dirty for the next Flush).
+// that is not (a write landing between the two syncs stays dirty for the next Flush). Chunks
+// Reclaim dropped from the overlay are punched last, once the snapshot holding their cleared
+// bits is on disk: the mirror image of the order for a set bit.
 func (s *Store) Flush() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
@@ -316,6 +356,7 @@ func (s *Store) Flush() error {
 	if !s.dirty.Swap(false) {
 		return nil
 	}
+	punches := s.takePunches() // before the snapshot, so it holds every clear they wait for
 	pages := s.bitmap.Snapshot()
 	if err := s.syncCOW(); err != nil {
 		// A retry would find the failed pages clean and succeed without their data
@@ -323,9 +364,48 @@ func (s *Store) Flush() error {
 	}
 	if err := s.bitmap.Commit(pages); err != nil {
 		s.dirty.Store(true)
+		s.queuePunches(punches...)
 		return err
 	}
+	s.punchFreed(punches)
 	return nil
+}
+
+// takePunches hands out the chunks waiting to be punched.
+func (s *Store) takePunches() []int64 {
+	s.punchMu.Lock()
+	defer s.punchMu.Unlock()
+	punches := s.punches
+	s.punches = nil
+	return punches
+}
+
+// queuePunches queues chunks to be punched by a Flush, once their cleared bits are durable.
+func (s *Store) queuePunches(chunks ...int64) {
+	s.punchMu.Lock()
+	defer s.punchMu.Unlock()
+	s.punches = append(s.punches, chunks...)
+}
+
+// punchFreed punches chunks that Reclaim dropped from the overlay, now that the bitmap commit
+// is on disk. A chunk is punched only if its bit is clear both in memory and in the file: one
+// written meanwhile holds live data again, and one still set in the file (written and dropped
+// once more since the snapshot) was queued again by that drop and waits for the next flush.
+// Both bits are read under the chunk lock, which every Set and Clear holds. The punch itself
+// also excludes readers (readMu): a read that found the bit set and is about to read the COW
+// file would otherwise read the hole. A failed punch leaves unreachable data behind, nothing
+// worse, so it does not fail the flush.
+func (s *Store) punchFreed(punches []int64) {
+	for _, chunk := range punches {
+		mu := &s.locks[chunk%lockStripes]
+		mu.Lock()
+		if !s.bitmap.Test(chunk) && !s.bitmap.committed(chunk) {
+			s.readMu.Lock()
+			s.punch(chunk)
+			s.readMu.Unlock()
+		}
+		mu.Unlock()
+	}
 }
 
 // Failed is closed once a COW sync failed (see ErrCOWFailed). The store then answers every
@@ -422,7 +502,7 @@ func (s *Store) Writeback(dst io.WriterAt) (int64, error) {
 // following the base until a later write there differs. That is what a RAID member does
 // anyway, since every write to the array rewrites the dependent member too, and it keeps a
 // resynchronisation or parity regeneration from freezing a copy of the whole range in the
-// overlay.
+// overlay. A chunk that did freeze and later equals its base again is dropped by Reclaim.
 func (s *Store) SetNopWrite(on bool) {
 	s.nopwrite.Store(on)
 }
@@ -464,6 +544,10 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 			same = bytes.Equal(buf[off-start:off-start+int64(len(p))], p)
 		}
 		if same {
+			if written {
+				// The guest repeated the stored bytes; the base may hold them too by now
+				s.recordWrite(chunk)
+			}
 			return nil
 		}
 	}
@@ -477,7 +561,242 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 	}
 	s.bitmap.Set(chunk)
 	s.dirty.Store(true)
+	s.recordWrite(chunk)
 	return nil
+}
+
+// recordWrite notes for Reclaim that chunk's overlay content changed, or that a write repeated
+// it. Callers hold the chunk lock. One atomic or, so the write path stays allocation-free.
+func (s *Store) recordWrite(chunk int64) {
+	if s.reclaimOn.Load() {
+		s.record(s.recent, chunk)
+	}
+}
+
+// record sets chunk's bit in set, counting it if it was clear, which it reports.
+func (s *Store) record(set []uint32, chunk int64) bool {
+	mask := uint32(1) << (chunk % bitmapWordBits)
+	if atomic.OrUint32(&set[chunk/bitmapWordBits], mask)&mask != 0 {
+		return false
+	}
+	s.recentCount.Add(1)
+	return true
+}
+
+// EnableReclaim turns Reclaim on: from now on writes are recorded for it. Its state (three
+// chunk sets and the bitmap's copy of the file) costs about four bits per chunk, so a store
+// allocates it only here. Call it before the store serves I/O, or writes before it are never
+// examined.
+func (s *Store) EnableReclaim() {
+	s.reclaimMu.Lock()
+	defer s.reclaimMu.Unlock()
+	if s.reclaimOn.Load() {
+		return
+	}
+	words := (s.bitmap.Chunks() + bitmapWordBits - 1) / bitmapWordBits
+	s.recent, s.again, s.due = make([]uint32, words), make([]uint32, words), make([]uint32, words)
+	s.bitmap.trackCommitted()
+	s.reclaimOn.Store(true)
+}
+
+// ReclaimStats counts what Reclaim did and has left to do.
+type ReclaimStats struct {
+	Pending  int64 `json:"pending"`  // chunks waiting to be examined, or examined again
+	Examined int64 `json:"examined"` // chunks compared with their base so far
+	Chunks   int64 `json:"chunks"`   // chunks dropped from the overlay
+	Bytes    int64 `json:"bytes"`
+}
+
+// ReclaimStats returns the Reclaim counters.
+func (s *Store) ReclaimStats() ReclaimStats {
+	return ReclaimStats{Pending: s.recentCount.Load(), Examined: s.examined.Load(), Chunks: s.reclaimed.Load(), Bytes: s.reclaimedBytes.Load()}
+}
+
+// Reclaim examines up to budget chunks written since it last examined them and drops from the
+// overlay every one that holds exactly what its base reads now: the bit is cleared, so reads
+// follow the base again, and the chunk is queued to be punched by the Flush that puts the
+// cleared bit on disk. It reports how many chunks it examined; 0 means none was waiting.
+//
+// It exists for nopwrite over a derived base (see SetNopWrite). A chunk freezes in the overlay
+// the first time a write to it differs from the base at that instant, and over a mirror plex
+// that happens by timing alone: the halves of a mirrored write land in either order, and the
+// plex whose half comes first sees the other still holding the old bytes. A moment later the
+// plexes agree again and the stored chunk is a redundant copy of its base, but every later
+// write to it is compared against that copy instead of the base, so a hot chunk stays stored
+// on both plexes for good. Reclaim compares later, once the other half has landed, and undoes
+// the freeze; a parity chunk written before its data chunks thaws the same way.
+//
+// Each examined chunk costs one overlay read and one base read under its chunk lock; a base
+// that cannot be read leaves the chunk as it is. A chunk that differs is looked at once more
+// after a settle time (a second, so the other half of a mirrored write has landed; an
+// examination between the halves would otherwise miss a chunk the guest never touches again)
+// and then forgotten until a write records it again. A write that repeats a stored chunk's
+// bytes records it too, with nopwrite: the guest touching the chunk is the sign that its
+// sibling got the same bytes. Chunks hydration copies are never recorded: they duplicate the
+// base on purpose. The base must be the content the overlay was written over; a stand-in for
+// a complete overlay (a zero source) would absorb chunks that happen to read like it. The
+// punch waits for the flush because it could otherwise reach the disk before the cleared bit
+// does, and a set bit on disk over a punched chunk would read zeros after a crash, while a
+// cleared bit over stale data reads the base, which holds the same bytes. A predecessor that
+// died owing punches (its queue was process memory) left the chunks allocated: the first call
+// finds them in the COW file and queues them. Calls are serialized.
+func (s *Store) Reclaim(ctx context.Context, budget int) int {
+	s.reclaimMu.Lock()
+	defer s.reclaimMu.Unlock()
+	if !s.reclaimOn.Load() || s.Err() != nil {
+		return 0
+	}
+	if !s.scanned {
+		s.scanned = true
+		s.scanOrphans()
+	}
+	if s.recentCount.Load() == 0 {
+		return 0
+	}
+	stored, base := s.bufs.Get().(*[]byte), s.bufs.Get().(*[]byte)
+	defer s.bufs.Put(stored)
+	defer s.bufs.Put(base)
+	examined := 0
+	for examined < budget && ctx.Err() == nil {
+		chunk, second, ok := s.nextRecent()
+		if !ok {
+			break
+		}
+		examined++
+		if s.reclaimChunk(chunk, *stored, *base) {
+			s.forget(chunk)
+		} else if !second && s.bitmap.Test(chunk) && s.record(s.again, chunk) {
+			s.againCount++
+		}
+	}
+	s.examined.Add(int64(examined))
+	return examined
+}
+
+// nextRecent takes the first recorded chunk at or after the scan position and moves the
+// position past it, wrapping around once. A chunk recorded behind the position (one written
+// again right after it was examined) waits for the wrap, so a hot chunk cannot starve the
+// rest. When nothing is recorded it takes a chunk due for its second look, if the set waiting
+// for one has settled (second is then true); false when there is nothing to examine. The
+// caller holds reclaimMu.
+func (s *Store) nextRecent() (chunk int64, second, ok bool) {
+	words := int64(len(s.recent))
+	for n := int64(0); n <= words; n++ {
+		w := (s.recentNext/bitmapWordBits + n) % words
+		word := atomic.LoadUint32(&s.recent[w])
+		if n == 0 {
+			word &= ^uint32(0) << (s.recentNext % bitmapWordBits) // only chunks at or after the position
+		}
+		if word == 0 {
+			continue
+		}
+		bit := bits.TrailingZeros32(word)
+		atomic.AndUint32(&s.recent[w], ^(uint32(1) << bit))
+		s.recentCount.Add(-1)
+		chunk = w*bitmapWordBits + int64(bit)
+		s.recentNext = (chunk + 1) % (words * bitmapWordBits)
+		return chunk, false, true
+	}
+	if chunk, ok := s.nextDue(); ok {
+		return chunk, true, true
+	}
+	return 0, false, false
+}
+
+// scanOrphans queues every allocated chunk of the COW file whose bit is clear: a chunk a
+// predecessor dropped whose punch never happened (the crash came before the flush, or between
+// the bitmap commit and the punch), so the next flush punches it. Allocation is read with
+// SEEK_DATA, a few calls per extent; a filesystem without it reports nothing. The bits are
+// read without the chunk locks, the flush checks them again under those (see punchFreed).
+func (s *Store) scanOrphans() {
+	fd := int(s.cow.Fd())
+	var orphans []int64
+	for pos := int64(0); pos < s.size; {
+		data, err := unix.Seek(fd, pos, unix.SEEK_DATA)
+		if err != nil || data >= s.size { // ENXIO: no data up to the end
+			break
+		}
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		if err != nil {
+			break
+		}
+		for chunk := data / s.chunkSize; chunk*s.chunkSize < min(hole, s.size); chunk++ {
+			if !s.bitmap.Test(chunk) {
+				orphans = append(orphans, chunk)
+			}
+		}
+		pos = hole
+	}
+	if len(orphans) > 0 {
+		s.queuePunches(orphans...)
+		s.dirty.Store(true)
+	}
+}
+
+// forget drops a chunk Reclaim just freed from the sets waiting for a second look.
+func (s *Store) forget(chunk int64) {
+	mask := uint32(1) << (chunk % bitmapWordBits)
+	for _, set := range []struct {
+		bits  []uint32
+		count *int
+	}{{s.again, &s.againCount}, {s.due, &s.dueCount}} {
+		if set.bits[chunk/bitmapWordBits]&mask != 0 {
+			set.bits[chunk/bitmapWordBits] &^= mask
+			*set.count--
+			s.recentCount.Add(-1)
+		}
+	}
+}
+
+// nextDue takes the lowest chunk due for a second look. An empty due set is refilled from
+// again and then left alone for settle, so every chunk waits at least that long, and nothing
+// is added to a due set, so no chunk is looked at a third time. The caller holds reclaimMu.
+func (s *Store) nextDue() (int64, bool) {
+	if s.dueCount == 0 {
+		if s.againCount == 0 {
+			return 0, false
+		}
+		s.due, s.again, s.dueCount, s.againCount, s.dueAt = s.again, s.due, s.againCount, 0, time.Now()
+	}
+	if time.Since(s.dueAt) < s.settle {
+		return 0, false
+	}
+	for w := range s.due {
+		if word := s.due[w]; word != 0 {
+			bit := bits.TrailingZeros32(word)
+			s.due[w] &^= uint32(1) << bit
+			s.dueCount--
+			s.recentCount.Add(-1)
+			return int64(w)*bitmapWordBits + int64(bit), true
+		}
+	}
+	return 0, false
+}
+
+// reclaimChunk drops chunk from the overlay if it holds exactly what its base reads now (see
+// Reclaim); stored and base are chunk-sized scratch buffers.
+func (s *Store) reclaimChunk(chunk int64, stored, base []byte) bool {
+	start := chunk * s.chunkSize
+	length := min(s.chunkSize, s.size-start)
+	stored, base = stored[:length], base[:length]
+	mu := &s.locks[chunk%lockStripes]
+	mu.Lock()
+	defer mu.Unlock()
+	if !s.bitmap.Test(chunk) {
+		return false
+	}
+	if read, err := s.cow.ReadAt(stored, start); fullRead(read, int(length), err) != nil {
+		return false
+	}
+	if read, err := s.readBase(base, start); fullRead(read, int(length), err) != nil || !bytes.Equal(stored, base) {
+		return false
+	}
+	s.bitmap.Clear(chunk)
+	s.queuePunches(chunk)
+	s.dirty.Store(true)
+	s.reclaimed.Add(1)
+	s.reclaimedBytes.Add(length)
+	return true
 }
 
 // Discard drops a range: whole chunks already in the COW file are punched out, so they read
@@ -499,6 +818,7 @@ func (s *Store) Discard(off, length int64) error {
 		if s.bitmap.Test(chunk) {
 			err = s.punch(chunk)
 			s.dirty.Store(true)
+			s.recordWrite(chunk)
 		}
 		mu.Unlock()
 		if err != nil {
@@ -532,6 +852,7 @@ func (s *Store) WriteZeroes(off, length int64) error {
 			} else if err = s.punch(chunk); err == nil {
 				s.bitmap.Set(chunk)
 				s.dirty.Store(true)
+				s.recordWrite(chunk)
 			}
 			mu.Unlock()
 		} else {
@@ -665,7 +986,8 @@ func (s *Store) Dirty() bool {
 
 // HydrateRun copies the unwritten chunks among [first, first+count) from the base with one
 // read, so a remote source sees one request per run instead of one per chunk. It reports the
-// bytes copied; chunks the guest wrote meanwhile keep the guest's data.
+// bytes copied; chunks the guest wrote meanwhile keep the guest's data. Hydrated chunks are
+// not recorded for Reclaim (nor are MarkZero's): they duplicate the base on purpose.
 func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
 	if err := s.Err(); err != nil {
 		return 0, err

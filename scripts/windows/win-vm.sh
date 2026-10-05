@@ -1,11 +1,13 @@
 #!/bin/bash
 # Starts a Windows guest under QEMU/KVM on the soak host (root), daemonized: q35 with
-# Secure Boot OVMF and a TPM 2.0 (swtpm), the disk on NVMe (or AHCI with BUS=ahci) and an
-# e1000e NIC (all native to Windows, no drivers needed), user networking with WinRM on
+# Secure Boot OVMF and a TPM 2.0 (swtpm), the disk on VirtIO SCSI (BUS=ahci or nvme for
+# images without the vioscsi driver) and an e1000e NIC, user networking with WinRM on
 # 15985+SLOT and SQL Server on 11433+SLOT. Control: /run/win/NAME.mon (QEMU monitor),
-# NAME.pid. NVMe, because QEMU's AHCI never turns a guest's write-through (FUA) writes into
-# flushes: SQL Server commits would reach the disk unflushed. Usage:
-#   win-vm.sh NAME SLOT DISK [CDROM...]      env MEM (MiB, 4096), CPUS (4), BUS (nvme|ahci)
+# NAME.pid. VirtIO SCSI, because QEMU's AHCI and NVMe emulation never turn a guest's
+# write-through (FUA) writes into flushes: SQL Server's commits would reach the disk
+# unflushed (measured: 2,083 commits a minute against 17 flushes on AHCI, 446 against 121 on
+# NVMe, 300 against 520 on VirtIO SCSI). Usage:
+#   win-vm.sh NAME SLOT DISK [CDROM...]      env MEM (MiB, 4096), CPUS (4), BUS (scsi|ahci|nvme)
 #   win-vm.sh stop|reset|kill NAME | shot NAME FILE.png | keys NAME KEY SECONDS
 set -euo pipefail
 run=/run/win
@@ -25,8 +27,15 @@ vars=/srv/win/vars/$name.fd
 [ -f $vars ] || cp /usr/share/OVMF/OVMF_VARS_4M.ms.fd $vars
 pkill -f "swtpm socket --tpmstate dir=$tpmdir " 2>/dev/null || true
 swtpm socket --tpmstate dir=$tpmdir --ctrl type=unixio,path=$tpmsock --tpm2 -d
-disk_dev=(-device "nvme,drive=d0,serial=blkmap-$name")
-[ "${BUS:-nvme}" = ahci ] && disk_dev=(-device ide-hd,drive=d0,bus=ahci.0,rotation_rate=1)
+disk_dev=(-device virtio-scsi-pci,id=scsi0 -device scsi-hd,drive=d0,bus=scsi0.0)
+[ "${BUS:-scsi}" = ahci ] && disk_dev=(-device ide-hd,drive=d0,bus=ahci.0,rotation_rate=1)
+[ "${BUS:-scsi}" = nvme ] && disk_dev=(-device "nvme,drive=d0,serial=blkmap-$name")
+# SCSI_PROBE=1 adds a small VirtIO SCSI disk, so Windows installs vioscsi as a boot driver
+# before the boot disk moves there
+if [ -n "${SCSI_PROBE:-}" ]; then
+  [ -f /srv/win/scsi-probe.img ] || truncate -s 64M /srv/win/scsi-probe.img
+  disk_dev+=(-device virtio-scsi-pci,id=scsi9 -drive file=/srv/win/scsi-probe.img,if=none,id=probe,format=raw -device scsi-hd,drive=probe,bus=scsi9.0)
+fi
 cds=() n=1
 for iso in "$@"; do
   cds+=(-drive "file=$iso,if=none,id=cd$n,media=cdrom,readonly=on" -device "ide-cd,drive=cd$n,bus=ahci.$n")

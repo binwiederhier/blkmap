@@ -54,6 +54,7 @@ var (
 type Bitmap struct {
 	f        *os.File
 	words    []uint32
+	disk     []uint32 // the bits as the file holds them, as of the last Commit (see committed); nil until trackCommitted
 	chunks   int64
 	dirty    []atomic.Bool // one per bitmapPageSize of the bit area
 	live     *os.File      // nil without a live file
@@ -68,8 +69,8 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 }
 
 // OpenLiveBitmap is OpenBitmap with a live file at livePath (see Bitmap). A live file left
-// by a crashed predecessor with the same geometry is adopted; its bits are a superset of the
-// file's, since bits only ever reach the file after the live map.
+// by a crashed predecessor with the same geometry is adopted; its bits are the predecessor's
+// memory, set and cleared alike, since every change reaches the live map before the file.
 func OpenLiveBitmap(path, livePath string, size, chunkSize int64) (*Bitmap, error) {
 	chunks := (size + chunkSize - 1) / chunkSize
 	words := (chunks + bitmapWordBits - 1) / bitmapWordBits
@@ -255,6 +256,18 @@ func (b *Bitmap) Set(i int64) {
 	b.dirty[word*bitmapWordSize/bitmapPageSize].Store(true)
 }
 
+// Clear marks chunk i as not written, so reads go to the base again. The bit is in memory
+// until the next Sync, like Set; the chunk's data must stay in the COW file until then, since
+// a set bit on disk over a punched chunk would read zeros after a crash (see Store.Flush).
+func (b *Bitmap) Clear(i int64) {
+	if i < 0 || i >= b.chunks {
+		return
+	}
+	word := i / bitmapWordBits
+	atomic.AndUint32(&b.words[word], ^uint32(1<<(i%bitmapWordBits)))
+	b.dirty[word*bitmapWordSize/bitmapPageSize].Store(true)
+}
+
 // Pending reports whether any bits are not yet in the file.
 func (b *Bitmap) Pending() bool {
 	for i := range b.dirty {
@@ -305,6 +318,20 @@ func (b *Bitmap) Snapshot() []page {
 	return pages
 }
 
+// committed reports chunk i's bit as the file holds it: what Commit last wrote, or what was
+// read at open. For a caller about to punch the chunk a set bit is the safe answer, so after a
+// failed Commit, which may have written some pages without making them durable, the bits it
+// tried to write count as set too until a later Commit succeeds.
+func (b *Bitmap) committed(i int64) bool {
+	if i < 0 || i >= b.chunks {
+		return false
+	}
+	if b.disk == nil {
+		return true // not tracked: never let a caller punch on a guess
+	}
+	return atomic.LoadUint32(&b.disk[i/bitmapWordBits])&(1<<(i%bitmapWordBits)) != 0
+}
+
 // Commit writes snapshotted pages to the file and makes it durable. On failure the pages are
 // marked dirty again so a later Sync retries them.
 func (b *Bitmap) Commit(pages []page) error {
@@ -316,14 +343,55 @@ func (b *Bitmap) Commit(pages []page) error {
 	for _, p := range pages {
 		if _, err := b.f.WriteAt(p.data, int64(bitmapHeaderSize+p.index*bitmapPageSize)); err != nil {
 			b.Redirty(pages)
+			b.record(pages, false)
 			return err
 		}
 	}
 	if err := b.f.Sync(); err != nil {
 		b.Redirty(pages)
+		b.record(pages, false)
 		return err
 	}
+	b.record(pages, true)
 	return nil
+}
+
+// record updates disk with what Commit wrote from pages: the pages themselves when they are
+// durable, else their union with the old state, since either may be what the file holds.
+func (b *Bitmap) record(pages []page, durable bool) {
+	if b.disk == nil {
+		return
+	}
+	for _, p := range pages {
+		first := p.index * bitmapPageSize / bitmapWordSize
+		for w := 0; w < bitmapPageSize/bitmapWordSize; w++ {
+			word := binary.LittleEndian.Uint32(p.data[w*bitmapWordSize:])
+			if durable {
+				atomic.StoreUint32(&b.disk[first+w], word)
+			} else {
+				atomic.OrUint32(&b.disk[first+w], word)
+			}
+		}
+	}
+}
+
+// trackCommitted starts keeping a copy of the bits as the file holds them (see committed),
+// read from the file now. Only Reclaim needs it; it costs one bit per chunk.
+func (b *Bitmap) trackCommitted() {
+	b.syncMu.Lock()
+	defer b.syncMu.Unlock()
+	area := make([]byte, len(b.words)*bitmapWordSize)
+	disk := make([]uint32, len(b.words))
+	if _, err := b.f.ReadAt(area, bitmapHeaderSize); err == nil {
+		for w := range disk {
+			disk[w] = binary.LittleEndian.Uint32(area[w*bitmapWordSize:])
+		}
+	} else {
+		for w := range disk {
+			disk[w] = ^uint32(0) // unreadable: every bit counts as set, so nothing is punched
+		}
+	}
+	b.disk = disk
 }
 
 // Redirty marks snapshotted pages dirty again, when their data sync failed.

@@ -17,11 +17,16 @@ golden=/srv/win/golden/$version.raw
 mkdir -p $w/cd /srv/win/golden
 [ -e $golden ] && { echo "$golden exists; delete it to rebuild"; exit 1; }
 sed -e "s/@INDEX@/$index/" -e "s/@NAME@/$(echo "$version" | tr -cd 'a-z0-9' | cut -c1-15)/" $me/autounattend.xml > $w/cd/autounattend.xml
-cp $me/setup.ps1 $me/sql-install.ps1 $w/cd/
+cp $me/setup.ps1 $me/sql-install.ps1 $me/vioscsi.ps1 $w/cd/
 xorriso -as mkisofs -quiet -V UNATTEND -J -r -o $w/unattend.iso $w/cd
 truncate -s 48G $golden.part
 rm -f /srv/win/vars/golden-$version.fd; rm -rf /var/lib/swtpm/golden-$version
-$me/win-vm.sh golden-$version $slot $golden.part /srv/win/iso/$version.iso $w/unattend.iso /srv/win/iso/${SQL:-sql2022}.iso
+# Installed on AHCI (no drivers needed); setup.ps1 adds vioscsi for the soak's VirtIO SCSI,
+# which the probe disk makes Windows register as a boot driver
+BUS=ahci SCSI_PROBE=1 $me/win-vm.sh golden-$version $slot $golden.part /srv/win/iso/$version.iso $w/unattend.iso /srv/win/iso/${SQL:-sql2022}.iso /srv/win/iso/virtio-win.iso
+# No network during the build: Windows 11's OOBE can hang checking for updates, and nothing
+# here needs the internet (SQL Server installs from the attached ISO)
+echo "set_link n0 off" | socat - UNIX-CONNECT:/run/win/golden-$version.mon >/dev/null
 # The installer's boot loader waits for a key before it boots from the DVD
 $me/win-vm.sh keys golden-$version ret 20
 start=$(date +%s)

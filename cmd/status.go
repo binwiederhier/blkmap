@@ -104,6 +104,9 @@ func printStatus(w io.Writer, st *device.Status) {
 			fmt.Fprintf(w, "  prefetch: %s\n", h.Schedule.String())
 		}
 	}
+	if r := st.Reclaim; r != nil {
+		fmt.Fprintf(w, "  reclaim: %d chunks (%s) dropped, %d examined, %d pending\n", r.Chunks, util.FormatSize(r.Bytes), r.Examined, r.Pending)
+	}
 	if r := st.Recording; r != nil {
 		state := "done"
 		if r.Active {

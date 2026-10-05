@@ -121,8 +121,10 @@ func TestBinderSeesSiblingWrites(t *testing.T) {
 func TestMirrorPlexNeverClobbersItsSibling(t *testing.T) {
 	dir := t.TempDir()
 	a := openTestStore(t, dir, "a", seeded(8*groupChunk, 1))
+	a.EnableReclaim()
 	view := &siblingSource{id: "a", size: 8 * groupChunk}
 	b := openTestStoreOver(t, dir, "b", view)
+	b.EnableReclaim()
 	a.SetNopWrite(true)
 	b.SetNopWrite(true)
 	view.Bind(lookupOf(map[string]*cow.Store{"a": a, "b": b}))
@@ -157,6 +159,14 @@ func TestMirrorPlexNeverClobbersItsSibling(t *testing.T) {
 	_, err = a.WriteAt([]byte{7, 7, 7}, 5*groupChunk)
 	require.NoError(t, err)
 	require.Equal(t, []byte{7, 7, 7}, readAt(t, b, 5*groupChunk, 3), "an unwritten range of b follows a")
+	// a sweep finds the chunk the re-copy wrote identical to what b reads through a again and
+	// drops it, so b follows a there once more and the next mirrored write is a nopwrite again
+	require.Equal(t, 1, b.Reclaim(context.Background(), 256), "one chunk was written since the last sweep")
+	require.EqualValues(t, 0, b.Written(), "the re-copied chunk equals plex 0 again: reclaimed")
+	require.Equal(t, y, readAt(t, b, off, 200))
+	_, err = a.WriteAt([]byte{8, 8, 8}, off)
+	require.NoError(t, err)
+	require.Equal(t, []byte{8, 8, 8}, readAt(t, b, off, 3), "the reclaimed chunk follows a again")
 }
 
 // Bases are usually stitched from parts (a config always yields a Concat): every Binder in

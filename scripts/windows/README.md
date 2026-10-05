@@ -8,8 +8,9 @@ reloads, guest crashes and power cuts. The plan and status live in
 |---|---|---|
 | `host-setup.sh DEB` | soak VM | installs the deb, copies the harness to `/srv/win/bin`, pywinrm venv |
 | `golden.sh VERSION INDEX [SLOT]` | soak VM | unattended install of `/srv/win/iso/VERSION.iso` into `/srv/win/golden/VERSION.raw` (read-only when done) |
-| `autounattend.xml`, `setup.ps1`, `sql-install.ps1` | the guest | the unattended install and its first logon: WinRM, no updates, no sleep, SQL Server Developer from the attached ISO (`/srv/win/iso/sql2022.iso` or `SQL=sql2025`), then shutdown |
-| `win-vm.sh` | soak VM | starts a guest (q35, Secure Boot, TPM 2.0, NVMe disk or `BUS=ahci`, e1000e, WinRM on 15985+SLOT, SQL on 11433+SLOT); `shot NAME FILE.png` takes a screenshot |
+| `autounattend.xml`, `setup.ps1`, `sql-install.ps1`, `vioscsi.ps1` | the guest | the unattended install and its first logon: WinRM, no updates, no sleep, no BitLocker, the VirtIO SCSI driver, SQL Server Developer from the attached ISO (`/srv/win/iso/sql2022.iso` or `SQL=sql2025`), then shutdown |
+| `driver-fix.sh VERSION [SLOT] [FROM]` | soak VM | adds the VirtIO SCSI driver to a golden image built without it and proves it boots from VirtIO SCSI with SQL Server |
+| `win-vm.sh` | soak VM | starts a guest (q35, Secure Boot, TPM 2.0, VirtIO SCSI disk or `BUS=ahci|nvme`, e1000e, WinRM on 15985+SLOT, SQL on 11433+SLOT); `shot NAME FILE.png` takes a screenshot |
 | `wr.py PORT CMD` | soak VM | a PowerShell command in a guest over WinRM |
 | `sqlsoak/` | codebox | Go client (own module): `init`, `run` (prints `ack N` per committed transaction), `verify -acked N` |
 | `soak.sh HOURS VERSION...` | codebox | the soak: devices, guests, load, disruptions, verification; logs in `logs/win-*` |
@@ -26,10 +27,17 @@ Gotchas:
 - The Windows boot loader waits for a key before it boots the DVD: `golden.sh` sends Enter
   for 20 s through the QEMU monitor.
 - Builds that run at the same time need different slots (port forwards collide otherwise).
-- Soak guests use NVMe: QEMU's AHCI drops a guest's FUA writes, so SQL Server's commits never
-  reach blkmap as flushes (measured: 2,083 commits a minute, 17 flushes) and a power cut loses
-  acknowledged commits. Golden images need `stornvme` set to boot-start (setup.ps1 does it;
-  images built before that need it set once while booted on AHCI).
+- Soak guests use VirtIO SCSI: QEMU's AHCI and NVMe emulation drop a guest's write-through
+  (FUA) writes, so SQL Server's commits never reach blkmap as flushes and a power cut loses
+  acknowledged commits (measured per minute of commits: AHCI 2,083 commits and 17 flushes,
+  NVMe 446 and 121, VirtIO SCSI 300 and 520). Windows registers vioscsi as a boot driver only
+  when it sees a VirtIO SCSI device, hence the probe disk (`SCSI_PROBE=1`).
+- Windows 11 turns on BitLocker device encryption by itself (TPM + Secure Boot), and a soak
+  guest with a fresh TPM would stop at the recovery screen: autounattend.xml prevents it.
+- Switching a Windows boot disk between controllers: a driver needs `Start 0` and no
+  `StartOverride` key, or the boot ends in INACCESSIBLE_BOOT_DEVICE.
+- Never edit a script on the soak VM while it runs (bash reads scripts as it goes); golden.sh
+  runs from a private copy for that reason.
 - Windows 11's OOBE stops at the region screen unless the oobeSystem pass sets the locale
   (autounattend.xml does) and can hang at "Checking for updates": cut the guest's link with
   `set_link n0 off` in the QEMU monitor until OOBE is past it.

@@ -2,6 +2,8 @@ package cow
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,9 +17,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"heckel.io/blkmap/source"
 )
@@ -893,20 +897,25 @@ func TestStoreCountsDemandReads(t *testing.T) {
 	assert.Zero(t, testing.AllocsPerRun(50, func() { s.ReadAt(buf, testChunk) }))
 }
 
-// storeModel is what a Store must read back: the device content and which chunks the
-// bitmap holds, plus the bits the last successful flush made durable.
+// storeModel is what a Store must read back: the COW file's bytes and which chunks the bitmap
+// holds (a chunk reads the COW file if it does, the base if not; content is that view), plus
+// the bits the last successful flush made durable, the chunks written since Reclaim last
+// examined them, and the chunks Reclaim dropped that wait for a flush to punch them.
 type storeModel struct {
 	base      []byte
+	cow       []byte
 	content   []byte
 	written   []bool
 	committed []bool
+	recent    []bool
+	punches   []int64
 	chunk     int64
 	nopwrite  bool
 }
 
 func newStoreModel(base []byte, chunk int64) *storeModel {
 	chunks := (int64(len(base)) + chunk - 1) / chunk
-	return &storeModel{base: base, content: bytes.Clone(base), written: make([]bool, chunks), committed: make([]bool, chunks), chunk: chunk}
+	return &storeModel{base: base, cow: make([]byte, len(base)), content: bytes.Clone(base), written: make([]bool, chunks), committed: make([]bool, chunks), recent: make([]bool, chunks), chunk: chunk}
 }
 
 func (m *storeModel) span(chunk int64) (int64, int64) {
@@ -914,14 +923,28 @@ func (m *storeModel) span(chunk int64) (int64, int64) {
 	return start, min(start+m.chunk, int64(len(m.content)))
 }
 
+// refresh recomputes what chunk reads from its bit.
+func (m *storeModel) refresh(chunk int64) {
+	start, end := m.span(chunk)
+	if m.written[chunk] {
+		copy(m.content[start:end], m.cow[start:end])
+	} else {
+		copy(m.content[start:end], m.base[start:end])
+	}
+}
+
 func (m *storeModel) write(p []byte, off int64) {
 	for len(p) > 0 {
 		chunk := off / m.chunk
-		_, end := m.span(chunk)
+		start, end := m.span(chunk)
 		n := min(int64(len(p)), end-off)
 		if !m.nopwrite || !bytes.Equal(m.content[off:off+n], p[:n]) {
-			copy(m.content[off:], p[:n])
-			m.written[chunk] = true
+			copy(m.cow[start:end], m.content[start:end]) // the copy-up, a no-op for a stored chunk
+			copy(m.cow[off:], p[:n])
+			m.written[chunk], m.recent[chunk] = true, true
+			m.refresh(chunk)
+		} else if m.written[chunk] {
+			m.recent[chunk] = true // a repeated write to a stored chunk is recorded all the same
 		}
 		p, off = p[n:], off+n
 	}
@@ -931,7 +954,9 @@ func (m *storeModel) discard(off, length int64) {
 	for chunk := (off + m.chunk - 1) / m.chunk; chunk < (off+length)/m.chunk; chunk++ {
 		if m.written[chunk] {
 			start, end := m.span(chunk)
-			clear(m.content[start:end])
+			clear(m.cow[start:end])
+			m.recent[chunk] = true
+			m.refresh(chunk)
 		}
 	}
 }
@@ -943,8 +968,9 @@ func (m *storeModel) writeZeroes(off, length int64) {
 		n := min(end, chunkEnd) - off
 		if off == start && n == chunkEnd-start {
 			if !(m.nopwrite && !m.written[chunk] && isZero(m.base[start:chunkEnd])) {
-				clear(m.content[start:chunkEnd])
-				m.written[chunk] = true
+				clear(m.cow[start:chunkEnd])
+				m.written[chunk], m.recent[chunk] = true, true
+				m.refresh(chunk)
 			}
 		} else {
 			m.write(make([]byte, n), off)
@@ -953,23 +979,79 @@ func (m *storeModel) writeZeroes(off, length int64) {
 	}
 }
 
+// hydrate and markZero copy the base (or mark a zero chunk) without recording the chunk for
+// Reclaim, like the store.
 func (m *storeModel) hydrate(first, count int64) {
 	for chunk := first; chunk < min(first+count, int64(len(m.written))); chunk++ {
+		if !m.written[chunk] {
+			start, end := m.span(chunk)
+			copy(m.cow[start:end], m.base[start:end])
+			m.written[chunk] = true
+		}
+	}
+}
+
+func (m *storeModel) markZero(chunk int64) {
+	if !m.written[chunk] {
+		start, end := m.span(chunk)
+		clear(m.cow[start:end])
 		m.written[chunk] = true
 	}
 }
 
-// crash forgets every bit the last flush did not make durable, unless a live bitmap kept it.
+// reclaim is Reclaim over every recorded chunk, whatever the order: a stored one that holds
+// its base's bytes is dropped and its stale bytes stay in the COW file until a flush punches
+// them; one that differs is examined a second time (the store's settle time is zero in the
+// model) and then forgotten. It reports how many chunks were examined.
+func (m *storeModel) reclaim() int {
+	n := 0
+	for chunk, recent := range m.recent {
+		if !recent {
+			continue
+		}
+		m.recent[chunk], n = false, n+1
+		if start, end := m.span(int64(chunk)); m.written[chunk] && bytes.Equal(m.cow[start:end], m.base[start:end]) {
+			m.written[chunk] = false
+			m.punches = append(m.punches, int64(chunk))
+			m.refresh(int64(chunk))
+		} else if m.written[chunk] {
+			n++ // the second look finds it unchanged
+		}
+	}
+	return n
+}
+
+// flush makes the bits durable, then punches the dropped chunks whose bits are still clear.
+func (m *storeModel) flush() {
+	copy(m.committed, m.written)
+	for _, chunk := range m.punches {
+		if !m.written[chunk] {
+			start, end := m.span(chunk)
+			clear(m.cow[start:end])
+		}
+	}
+	m.punches = nil
+}
+
+// reopen is what a clean reopen changes: a fresh store has recorded nothing for Reclaim.
+func (m *storeModel) reopen() {
+	m.flush()
+	clear(m.recent)
+}
+
+// crash forgets every bit change the last flush did not make durable, unless a live bitmap
+// kept it: a chunk whose bit is set on disk reads the COW file, stale bytes included. The
+// punches a flush owed and the chunks recorded for Reclaim are forgotten either way; the data
+// the punches would free stays unreachable.
 func (m *storeModel) crash(live bool) {
+	m.punches = nil
+	clear(m.recent)
 	if live {
 		return
 	}
+	copy(m.written, m.committed)
 	for chunk := range m.written {
-		if !m.committed[chunk] {
-			start, end := m.span(int64(chunk))
-			copy(m.content[start:end], m.base[start:end])
-			m.written[chunk] = false
-		}
+		m.refresh(int64(chunk))
 	}
 }
 
@@ -1049,10 +1131,13 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 		s, err := OpenWith(&mem{data: baseData}, o)
 		require.NoError(t, err)
 		s.SetNopWrite(m.nopwrite)
+		s.EnableReclaim()
+		s.settle = 0 // a second look at once, so a reclaim pass is deterministic
 		return s
 	}
 	s := open()
 	defer func() { s.Close() }()
+	ctx := context.Background()
 	var log []string
 	fail := func(format string, args ...any) {
 		t.Helper()
@@ -1101,7 +1186,7 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 				fail("write %d+%d: %d, %v", off, length, n, err)
 			}
 			m.write(p, off)
-		case op < 55: // read a range
+		case op < 50: // read a range
 			off, length := randRange()
 			p := make([]byte, length)
 			if n, err := s.ReadAt(p, off); err != nil || n != len(p) {
@@ -1110,6 +1195,16 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 			if !bytes.Equal(p, m.content[off:off+length]) {
 				log = append(log, fmt.Sprintf("read %d+%d", off, length))
 				fail("read %d+%d differs from the model", off, length)
+			}
+		case op < 55: // sweep everything recorded, in passes of a random budget
+			budget := 1 + r.IntN(int(chunks))
+			log = append(log, fmt.Sprintf("reclaim %d", budget))
+			examined := 0
+			for n := s.Reclaim(ctx, budget); n > 0; n = s.Reclaim(ctx, budget) {
+				examined += n
+			}
+			if want := m.reclaim(); examined != want {
+				fail("reclaim examined %d chunks, the model %d", examined, want)
 			}
 		case op < 60:
 			off, length := randRange()
@@ -1140,7 +1235,7 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 			}
 			log = append(log, fmt.Sprintf("markzero %d", c))
 			s.MarkZero(c)
-			m.written[c] = true // the base is zero there, so the content must not change
+			m.markZero(c)
 		case op < 80:
 			m.nopwrite = !m.nopwrite
 			log = append(log, fmt.Sprintf("nopwrite %v", m.nopwrite))
@@ -1150,13 +1245,13 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 			if err := s.Flush(); err != nil {
 				fail("flush: %v", err)
 			}
-			copy(m.committed, m.written)
+			m.flush()
 		case op < 92:
 			log = append(log, "close+open")
 			if err := s.Close(); err != nil {
 				fail("close: %v", err)
 			}
-			copy(m.committed, m.written)
+			m.reopen()
 			s = open()
 			check("after reopen")
 		case op < 97:
@@ -1171,7 +1266,7 @@ func runStoreModel(t *testing.T, seed uint64, ops int, paranoid bool) {
 			if _, err := s.Writeback(&sliceWriter{dst}); err != nil {
 				fail("writeback: %v", err)
 			}
-			copy(m.committed, m.written)
+			m.flush()
 			for c := range m.written {
 				start, end := m.span(int64(c))
 				if m.written[c] && !bytes.Equal(dst[start:end], m.content[start:end]) {
@@ -1193,12 +1288,19 @@ func (w *sliceWriter) WriteAt(p []byte, off int64) (int, error) {
 	return copy(w.b[off:], p), nil
 }
 
-// TestStoreModelConcurrent races writers on their own chunks against hydration, flushes and
-// readers across the whole device, then crashes: every chunk must read what its writer left,
-// and after the crash either that or, for a bit no flush persisted, the base.
+// TestStoreModelConcurrent races writers on their own chunks against hydration, flushes,
+// readers and (every other seed) a sweeper across the whole device, then crashes: every chunk
+// must read what its writer left, and after the crash either that or, for a bit no flush
+// persisted, the base.
 func TestStoreModelConcurrent(t *testing.T) {
 	t.Parallel()
-	for seed := range uint64(20) {
+	seeds := 20
+	if env := os.Getenv("BLKMAP_MODEL_SEEDS"); env != "" { // a longer hunt
+		n, err := strconv.Atoi(env)
+		require.NoError(t, err)
+		seeds = n
+	}
+	for seed := range uint64(seeds) {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			t.Parallel()
 			runStoreModelConcurrent(t, seed)
@@ -1220,13 +1322,25 @@ func runStoreModelConcurrent(t *testing.T, seed uint64) {
 	s, err := OpenWith(&mem{data: baseData}, o)
 	require.NoError(t, err)
 	s.SetNopWrite(seed%3 == 0)
+	s.EnableReclaim()
+	s.settle = time.Duration(seed%5) * 20 * time.Millisecond
 	m := newStoreModel(baseData, chunk)
 	m.nopwrite = seed%3 == 0
+	sweep := seed%4 < 2
 	var stop atomic.Bool
 	var bg, wg sync.WaitGroup
-	errs := make(chan error, writers+3)
-	// Hydration, zero marking, flushes and unverified reads across every chunk
+	errs := make(chan error, writers+4)
+	// Hydration, zero marking, flushes, unverified reads and reclaim passes across every chunk
 	bg.Add(3)
+	if sweep {
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			for !stop.Load() {
+				s.Reclaim(context.Background(), 1+int(seed%7))
+			}
+		}()
+	}
 	go func() {
 		defer bg.Done()
 		r := rand.New(rand.NewPCG(seed, 1))
@@ -1279,9 +1393,12 @@ func runStoreModelConcurrent(t *testing.T, seed uint64) {
 				length := 1 + r.Int64N(end-off)
 				switch r.IntN(10) {
 				case 0:
-					// Bits never clear, so a whole chunk written before the discard is punched;
-					// any other may gain its bit from the hydrator concurrently, so skip it
-					if !s.IsWritten(c) || end-start != chunk {
+					// Only the sweeper clears bits, so without it a whole chunk written before
+					// the discard is punched; any other may gain its bit from the hydrator
+					// concurrently, so skip it. With the sweeper the bit may clear between the
+					// check and the discard, which then leaves the chunk reading the base (what
+					// discard semantics allow), so skip the case altogether
+					if sweep || !s.IsWritten(c) || end-start != chunk {
 						continue
 					}
 					if err := s.Discard(start, end-start); err != nil {
@@ -1295,6 +1412,12 @@ func runStoreModelConcurrent(t *testing.T, seed uint64) {
 						return
 					}
 					clear(own[off : off+length])
+				case 2, 3: // the base's bytes: with nopwrite skipped, otherwise stored and the sweeper's to drop
+					if _, err := s.WriteAt(baseData[off:off+length], off); err != nil {
+						errs <- err
+						return
+					}
+					copy(own[off:], baseData[off:off+length])
 				default:
 					p := make([]byte, length)
 					fillRandom(r, p)
@@ -1471,4 +1594,907 @@ func TestNopWriteSurvivesAnUnreadableBase(t *testing.T) {
 	_, err = s.ReadAt(got, testChunk)
 	require.NoError(t, err)
 	require.Equal(t, w, got)
+}
+
+// Reclaim undoes a freeze over a derived base: a chunk stored because this plex's half of a
+// mirrored write landed first (the base still showed the old bytes) is dropped once the base
+// has caught up, follows the base again, is a nopwrite target again, and costs no space after
+// the next Flush.
+func TestReclaimOverADerivedBase(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := &derived{data: pattern(testSize)}
+	s := newTestStore(t, dir, base)
+	s.EnableReclaim()
+	defer s.Close()
+	s.SetNopWrite(true)
+	ctx := context.Background()
+	_, err := s.WriteAt([]byte{1, 2, 3}, 10) // this plex's half lands first
+	require.NoError(t, err)
+	require.EqualValues(t, 1, s.Written(), "a write that differs from the base is stored")
+	require.Equal(t, ReclaimStats{Pending: 1}, s.ReclaimStats())
+	assert.Equal(t, 1, s.Reclaim(ctx, 256), "examined, but it still differs")
+	require.EqualValues(t, 1, s.Written())
+	copy(base.data[10:], []byte{1, 2, 3}) // the other half lands
+	assert.Zero(t, s.Reclaim(ctx, 256), "not examined again until written again or settled")
+	assert.Equal(t, ReclaimStats{Pending: 1, Examined: 1}, s.ReclaimStats(), "waiting for its second look")
+	_, err = s.WriteAt([]byte{4}, 100) // the next mirrored write, this plex first again
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.Reclaim(ctx, 256), "recorded by the write: examined at once")
+	assert.EqualValues(t, 1, s.Written(), "still differs: the other half is not there yet")
+	base.data[100] = 4
+	_, err = s.WriteAt([]byte{4}, 100) // a nopwrite against the stored copy: recorded all the same
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.Reclaim(ctx, 256))
+	assert.EqualValues(t, 0, s.Written(), "the stored chunk equals its base: dropped")
+	assert.Equal(t, ReclaimStats{Examined: 3, Chunks: 1, Bytes: testChunk}, s.ReclaimStats(), "nothing waits for a second look once dropped")
+	assert.True(t, s.Dirty(), "the cleared bit waits for a flush")
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, base.data[:testChunk], got)
+	base.data[20] = 0xEE // a sibling changes
+	_, err = s.ReadAt(got, 0)
+	require.NoError(t, err)
+	assert.Equal(t, byte(0xEE), got[20], "the chunk follows the base again")
+	base.data[30] = 0xDD // a mirrored write whose other half landed first
+	_, err = s.WriteAt([]byte{0xDD}, 30)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, s.Written(), "a write equal to the base is a nopwrite again")
+	st, err := os.Stat(filepath.Join(dir, "d.cow"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(testChunk), st.Sys().(*syscall.Stat_t).Blocks*512, "the stale bytes stay until a flush")
+	require.NoError(t, s.Flush())
+	st, err = os.Stat(filepath.Join(dir, "d.cow"))
+	require.NoError(t, err)
+	assert.Zero(t, st.Sys().(*syscall.Stat_t).Blocks, "the flush punched the dropped chunk")
+	assert.False(t, s.Dirty())
+}
+
+// A chunk that still differs from its base is kept, at the cost of one base read; one whose
+// base cannot be read is kept too. Restoring a chunk's bytes piecemeal frees it with the write
+// that completes the match, nopwrite or not.
+func TestReclaimKeepsAChunkThatDiffers(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	s.EnableReclaim()
+	defer s.Close()
+	ctx := context.Background()
+	start := int64(2 * testChunk)
+	_, err := s.WriteAt(bytes.Repeat([]byte{0xAB}, 300), start+100)
+	require.NoError(t, err)
+	reads := base.reads
+	assert.Equal(t, 1, s.Reclaim(ctx, 256))
+	assert.EqualValues(t, 1, s.Written(), "the chunk still differs from the base")
+	assert.Equal(t, 1, base.reads-reads, "one base read per examined chunk")
+	assert.Equal(t, ReclaimStats{Pending: 1, Examined: 1}, s.ReclaimStats(), "kept, and waiting for a second look")
+	_, err = s.WriteAt(base.data[start+100:start+250], start+100) // restores half of the change
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.Reclaim(ctx, 256))
+	assert.EqualValues(t, 1, s.Written())
+	_, err = s.WriteAt(base.data[start+250:start+400], start+250) // restores the rest
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.Reclaim(ctx, 256))
+	assert.EqualValues(t, 0, s.Written(), "the chunk equals the base again")
+	assert.Equal(t, ReclaimStats{Examined: 3, Chunks: 1, Bytes: testChunk}, s.ReclaimStats(), "dropped: no second look left to take")
+	assert.Equal(t, base.data, readAll(t, s))
+	// a chunk whose base cannot be read stays as it is
+	u := newTestStore(t, t.TempDir(), &broken{size: testSize})
+	u.EnableReclaim()
+	defer u.Close()
+	w := bytes.Repeat([]byte{0x5A}, testChunk)
+	_, err = u.WriteAt(w, testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, 1, u.Reclaim(ctx, 256))
+	assert.EqualValues(t, 1, u.Written())
+	assert.Equal(t, ReclaimStats{Pending: 1, Examined: 1}, u.ReclaimStats())
+}
+
+// A chunk that differs from its base when examined gets one more look once the set of such
+// chunks has settled (the other half of a mirrored write lands within moments), then is
+// forgotten until a write records it again: a chunk whose sibling never catches up costs two
+// examinations, not one per pass.
+func TestReclaimLooksAgainAfterSettling(t *testing.T) {
+	t.Parallel()
+	base := &derived{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	s.EnableReclaim()
+	defer s.Close()
+	s.SetNopWrite(true)
+	ctx := context.Background()
+	_, err := s.WriteAt([]byte{1, 2, 3}, 10) // this plex's half lands first
+	require.NoError(t, err)
+	_, err = s.WriteAt([]byte{9}, 5*testChunk) // a chunk whose sibling never gets the write
+	require.NoError(t, err)
+	assert.Equal(t, 2, s.Reclaim(ctx, 256), "both differ")
+	assert.EqualValues(t, 2, s.Written())
+	assert.Equal(t, ReclaimStats{Pending: 2, Examined: 2}, s.ReclaimStats())
+	copy(base.data[10:], []byte{1, 2, 3}) // the other half lands
+	assert.Zero(t, s.Reclaim(ctx, 256), "not settled yet")
+	s.settle = 0
+	assert.Equal(t, 2, s.Reclaim(ctx, 256), "the second look")
+	assert.EqualValues(t, 1, s.Written(), "the chunk the sibling caught up with is dropped")
+	assert.True(t, s.IsWritten(5))
+	assert.Equal(t, ReclaimStats{Examined: 4, Chunks: 1, Bytes: testChunk}, s.ReclaimStats(), "the other is forgotten: no third look")
+	assert.Zero(t, s.Reclaim(ctx, 256))
+	s.settle = time.Hour
+	_, err = s.WriteAt([]byte{9}, 5*testChunk) // repeated by the guest: looked at again
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.Reclaim(ctx, 256))
+	assert.Equal(t, ReclaimStats{Pending: 1, Examined: 5, Chunks: 1, Bytes: testChunk}, s.ReclaimStats(), "and waits for a second look again")
+}
+
+// Reclaim examines at most budget chunks per call, resumes where it stopped, wraps around, and
+// stops at a cancelled context; hydrated and zero-marked chunks are never examined.
+func TestReclaimBudgetAndOrder(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(128 * testChunk)}
+	s := newTestStore(t, t.TempDir(), base)
+	s.EnableReclaim()
+	defer s.Close()
+	ctx := context.Background()
+	_, err := s.HydrateRun(100, 20, false)
+	require.NoError(t, err)
+	assert.Zero(t, s.Reclaim(ctx, 256), "hydrated chunks are not examined")
+	for c := int64(0); c < 80; c++ { // identical whole-chunk writes: stored, since nopwrite is off
+		_, err := s.WriteAt(base.data[c*testChunk:(c+1)*testChunk], c*testChunk)
+		require.NoError(t, err)
+	}
+	assert.EqualValues(t, 100, s.Written())
+	assert.EqualValues(t, 80, s.ReclaimStats().Pending)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	assert.Zero(t, s.Reclaim(cancelled, 256), "a cancelled context examines nothing")
+	assert.Equal(t, 50, s.Reclaim(ctx, 50))
+	assert.EqualValues(t, 50, s.Written(), "the first 50 examined and dropped")
+	assert.EqualValues(t, 30, s.ReclaimStats().Pending)
+	_, err = s.WriteAt([]byte{1}, 5) // recorded again, behind the scan position: seen after the wrap
+	require.NoError(t, err)
+	assert.Equal(t, 31, s.Reclaim(ctx, 256))
+	assert.EqualValues(t, 21, s.Written(), "the hydrated chunks and the one that differs")
+	assert.True(t, s.IsWritten(0))
+	assert.Zero(t, s.Reclaim(ctx, 256))
+	assert.Equal(t, ReclaimStats{Pending: 1, Examined: 81, Chunks: 80, Bytes: 80 * testChunk}, s.ReclaimStats(), "the one that differs waits for its second look")
+}
+
+// The bit is cleared first and the chunk punched only once that clear is on disk. A chunk
+// punched while the disk bitmap still records it would read zeros after a crash; a cleared
+// bit over the stale bytes reads the base, which holds the same bytes. So before the flush
+// the COW file still holds the dropped chunk, a flush whose COW sync fails leaves it in place
+// for the successor, and a successful flush punches it after committing the bitmap.
+func TestReclaimPunchesAfterTheClearIsOnDisk(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cowPath, bitmapPath := filepath.Join(dir, "d.cow"), filepath.Join(dir, "d.cow.bitmap")
+	base := pattern(testSize)
+	s, err := Open(&mem{data: base}, cowPath, bitmapPath, testChunk)
+	require.NoError(t, err)
+	s.EnableReclaim()
+	ctx := context.Background()
+	same := base[4*testChunk : 5*testChunk]
+	_, err = s.WriteAt(bytes.Repeat([]byte{'o'}, testChunk), 4*testChunk)
+	require.NoError(t, err)
+	_, err = s.WriteAt(same, 4*testChunk) // restored to the base's bytes, still stored
+	require.NoError(t, err)
+	require.NoError(t, s.Flush()) // the disk bitmap records chunk 4, the COW file holds its bytes
+	require.Equal(t, 1, s.Reclaim(ctx, 256))
+	require.EqualValues(t, 0, s.Written())
+	inCOW := make([]byte, testChunk)
+	_, err = s.cow.ReadAt(inCOW, 4*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, same, inCOW, "the dropped chunk keeps its bytes until the cleared bit is on disk")
+	s.syncCOW = func() error { return syscall.EIO }
+	require.ErrorIs(t, s.Flush(), syscall.EIO)
+	_, err = s.cow.ReadAt(inCOW, 4*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, same, inCOW, "a failed flush must not punch")
+	info, err := Inspect(bitmapPath)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, info.Written, "the disk bitmap still records the chunk")
+	assert.ErrorIs(t, s.Close(), ErrCOWFailed)
+	// The successor serves the last durable state: the chunk's bytes, never zeros
+	s, err = Open(&mem{data: base}, cowPath, bitmapPath, testChunk)
+	require.NoError(t, err)
+	s.EnableReclaim()
+	assert.True(t, s.IsWritten(4))
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, 4*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, same, got)
+	assert.Zero(t, s.Reclaim(ctx, 256), "a fresh store has recorded nothing")
+	_, err = s.WriteAt(same[:1], 4*testChunk) // written again: recorded again
+	require.NoError(t, err)
+	require.Equal(t, 1, s.Reclaim(ctx, 256))
+	require.EqualValues(t, 0, s.Written())
+	require.NoError(t, s.Flush())
+	info, err = Inspect(bitmapPath)
+	require.NoError(t, err)
+	assert.Zero(t, info.Written, "the cleared bit reached the disk")
+	_, err = s.cow.ReadAt(inCOW, 4*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, make([]byte, testChunk), inCOW, "and the chunk was punched")
+	require.NoError(t, s.Close())
+}
+
+// A chunk written again while its punch waits for a flush holds live data, which the flush
+// must leave alone.
+func TestReclaimThenRewriteKeepsTheNewData(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	s.EnableReclaim()
+	defer s.Close()
+	_, err := s.WriteAt([]byte{1, 2, 3}, testChunk)
+	require.NoError(t, err)
+	_, err = s.WriteAt(base.data[testChunk:testChunk+3], testChunk)
+	require.NoError(t, err)
+	require.Equal(t, 1, s.Reclaim(context.Background(), 256)) // dropped, punch pending
+	require.EqualValues(t, 0, s.Written())
+	fresh := []byte{4, 5, 6}
+	_, err = s.WriteAt(fresh, testChunk) // stored again before the flush
+	require.NoError(t, err)
+	require.EqualValues(t, 1, s.Written())
+	require.NoError(t, s.Flush())
+	got := make([]byte, testChunk)
+	_, err = s.ReadAt(got, testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, fresh, got[:3])
+	assert.Equal(t, base.data[testChunk+3:2*testChunk], got[3:])
+}
+
+// The live bitmap carries a cleared bit across a crash like a set one: the successor reads
+// the base for the dropped chunk, and its next flush puts the clear on disk.
+func TestReclaimSurvivesCrashWithLiveBitmap(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := pattern(testSize)
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), LiveBitmap: filepath.Join(dir, "d.live"), ChunkSize: testChunk}
+	s, err := OpenWith(&mem{data: base}, o)
+	require.NoError(t, err)
+	s.EnableReclaim()
+	_, err = s.WriteAt(bytes.Repeat([]byte{'w'}, testChunk), 3*testChunk)
+	require.NoError(t, err)
+	require.NoError(t, s.Flush())
+	_, err = s.WriteAt(base[3*testChunk:4*testChunk], 3*testChunk)
+	require.NoError(t, err)
+	require.Equal(t, 1, s.Reclaim(context.Background(), 256))
+	require.EqualValues(t, 0, s.Written())
+	s.abandon()
+	s, err = OpenWith(&mem{data: base}, o)
+	require.NoError(t, err)
+	s.EnableReclaim()
+	defer s.Close()
+	assert.False(t, s.IsWritten(3), "the live bitmap kept the clear")
+	assert.Equal(t, base, readAll(t, s))
+	assert.Zero(t, s.Reclaim(context.Background(), 256), "nothing is recorded, but the orphaned chunk is found")
+	assert.True(t, s.Dirty())
+	require.NoError(t, s.Flush())
+	info, err := Inspect(o.Bitmap)
+	require.NoError(t, err)
+	assert.Zero(t, info.Written)
+	st, err := s.Stat()
+	require.NoError(t, err)
+	assert.Zero(t, st.Blocks, "the punch the predecessor owed is done once the clear is on disk")
+}
+
+// A punch lost between the bitmap commit and the punch itself (the clear is on disk, the
+// chunk still allocated) is found by the successor's first Reclaim, with or without a live
+// bitmap, and done at its next flush; chunks with their bit set are left alone.
+func TestReclaimPunchesWhatAPredecessorLeftAllocated(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := pattern(testSize)
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), ChunkSize: testChunk}
+	s, err := OpenWith(&mem{data: base}, o)
+	require.NoError(t, err)
+	s.EnableReclaim()
+	for _, c := range []int64{3, 7} { // identical, stored (nopwrite off)
+		_, err = s.WriteAt(base[c*testChunk:(c+1)*testChunk], c*testChunk)
+		require.NoError(t, err)
+	}
+	_, err = s.WriteAt([]byte{1, 2, 3}, 9*testChunk) // differs: stays stored
+	require.NoError(t, err)
+	require.NoError(t, s.Flush())
+	require.Equal(t, 3, s.Reclaim(context.Background(), 256))
+	require.EqualValues(t, 1, s.Written())
+	s.punches = nil                                          // the punches are lost
+	require.NoError(t, s.bitmap.Commit(s.bitmap.Snapshot())) // but the clears are on disk
+	s.abandon()
+	s, err = OpenWith(&mem{data: base}, o)
+	require.NoError(t, err)
+	s.EnableReclaim()
+	defer s.Close()
+	st, err := s.Stat()
+	require.NoError(t, err)
+	require.Equal(t, int64(3*testChunk/512), st.Blocks, "the dropped chunks are still allocated")
+	assert.Zero(t, s.Reclaim(context.Background(), 256))
+	assert.Equal(t, 2, s.pendingPunches())
+	require.NoError(t, s.Flush())
+	st, err = s.Stat()
+	require.NoError(t, err)
+	assert.Equal(t, int64(testChunk/512), st.Blocks, "only the stored chunk keeps its space")
+	got := make([]byte, 3)
+	_, err = s.ReadAt(got, 9*testChunk)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{1, 2, 3}, got)
+}
+
+// A punch whose clear an earlier flush already committed must still happen: Reclaim can queue
+// a chunk after a flush has taken the queue but before it snapshots the bitmap, so that flush
+// commits the clear and the next one finds the chunk's page clean. The punch waits for that
+// next flush and must not be skipped for want of a snapshot of its page.
+func TestReclaimPunchSurvivesAnEarlierFlush(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, dir, base)
+	s.EnableReclaim()
+	defer s.Close()
+	_, err := s.WriteAt(base.data[2*testChunk:3*testChunk], 2*testChunk) // identical, stored (nopwrite off)
+	require.NoError(t, err)
+	require.NoError(t, s.Flush())
+	require.Equal(t, 1, s.Reclaim(context.Background(), 256))
+	require.EqualValues(t, 0, s.Written())
+	// The interleaving: the flush took the queue before this reclaim queued the chunk
+	taken := s.takePunches()
+	require.Equal(t, []int64{2}, taken)
+	require.NoError(t, s.Flush()) // commits the clear without the punch
+	s.queuePunches(taken...)
+	s.dirty.Store(true)
+	require.NoError(t, s.Flush())
+	st, err := s.Stat()
+	require.NoError(t, err)
+	assert.Zero(t, st.Blocks, "the clear is on disk, so the punch must happen")
+}
+
+// The scan moves on past a chunk that is written again while it is being examined, instead of
+// taking that chunk again before the rest of its word (a hot chunk would starve the sweep).
+func TestReclaimScanAdvancesPastAHotChunk(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	s.EnableReclaim()
+	defer s.Close()
+	ctx := context.Background()
+	for c := int64(0); c < 4; c++ { // identical whole-chunk writes: stored, since nopwrite is off
+		_, err := s.WriteAt(base.data[c*testChunk:(c+1)*testChunk], c*testChunk)
+		require.NoError(t, err)
+	}
+	for c := int64(0); c < 4; c++ {
+		require.Equal(t, 1, s.Reclaim(ctx, 1))
+		assert.False(t, s.IsWritten(c), "chunk %d examined and dropped", c)
+		_, err := s.WriteAt([]byte{0xFF}, c*testChunk) // written again: recorded again, behind the cursor
+		require.NoError(t, err)
+	}
+	assert.EqualValues(t, 4, s.Written())
+	assert.EqualValues(t, 4, s.ReclaimStats().Pending)
+	assert.Equal(t, 4, s.Reclaim(ctx, 256), "the rewritten chunks are seen after the wrap")
+}
+
+// A read that found a chunk's bit set is about to read the COW file when a flush punches the
+// chunk Reclaim dropped: it must not read the hole. The punch waits for the read to finish
+// (readMu), and the read sees the chunk's bytes, which equal the base's.
+func TestReclaimPunchWaitsForAReadInFlight(t *testing.T) {
+	t.Parallel()
+	base := &mem{data: pattern(testSize)}
+	s := newTestStore(t, t.TempDir(), base)
+	s.EnableReclaim()
+	defer s.Close()
+	want := base.data[2*testChunk : 3*testChunk]
+	_, err := s.WriteAt(want, 2*testChunk) // identical, stored (nopwrite off)
+	require.NoError(t, err)
+	require.NoError(t, s.Flush())
+	require.Equal(t, 1, s.Reclaim(context.Background(), 256))
+	require.EqualValues(t, 0, s.Written(), "dropped, the punch waits for a flush")
+	inGap, proceed := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	s.readGap = func() {
+		once.Do(func() {
+			close(inGap)
+			<-proceed
+		})
+	}
+	// The bit was set when this read tested it, before the reclaim: a reader stalled between
+	// its bitmap test and its COW read
+	got := make([]byte, testChunk)
+	readErr := make(chan error, 1)
+	s.bitmap.Set(2) // the read must take the COW path, as one that raced the clear did
+	go func() {
+		_, err := s.ReadAt(got, 2*testChunk)
+		readErr <- err
+	}()
+	<-inGap
+	s.bitmap.Clear(2) // the reclaim's clear, from the reader's point of view, lands now
+	flushed := make(chan error, 1)
+	go func() { flushed <- s.Flush() }()
+	select {
+	case err := <-flushed:
+		t.Fatalf("the flush punched (%v) while a read of the chunk was in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(proceed)
+	require.NoError(t, <-readErr)
+	assert.Equal(t, want, got, "the read in flight sees the chunk's bytes, never the hole")
+	require.NoError(t, <-flushed)
+	st, err := s.Stat()
+	require.NoError(t, err)
+	assert.Zero(t, st.Blocks, "punched once the read was done")
+}
+
+// liveView is a mirror plex's base: a live view of the sibling plex, read through its store.
+type liveView struct{ of *Store }
+
+func (v *liveView) ReadAt(p []byte, off int64) (int, error) { return v.of.ReadAt(p, off) }
+func (v *liveView) Size() int64                             { return v.of.Size() }
+func (v *liveView) Close() error                            { return nil }
+func (v *liveView) Bind(source.Lookup)                      {}
+
+// xorView is a parity column's base: the XOR of the data columns, read live through their
+// stores.
+type xorView struct{ a, b *Store }
+
+func (v *xorView) ReadAt(p []byte, off int64) (int, error) {
+	n, err := v.a.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, err
+	}
+	q := make([]byte, n)
+	m, err2 := v.b.ReadAt(q, off)
+	if err2 != nil && !errors.Is(err2, io.EOF) {
+		return 0, err2
+	}
+	for i := range q[:m] {
+		p[i] ^= q[i]
+	}
+	return min(n, m), err
+}
+func (v *xorView) Size() int64        { return v.a.Size() }
+func (v *xorView) Close() error       { return nil }
+func (v *xorView) Bind(source.Lookup) {}
+
+// nonZero fills p with random bytes none of which is zero, so a hole reads apart from data.
+func nonZero(r *rand.Rand, p []byte) {
+	for i := range p {
+		p[i] = 1 + byte(r.UintN(255))
+	}
+}
+
+// tortureDuration is how long a torture test keeps its workload running.
+func tortureDuration() time.Duration {
+	if testing.Short() {
+		return 300 * time.Millisecond
+	}
+	return 3 * time.Second
+}
+
+// mirroredWrite writes p to first and then to second, with a short pause between the halves now
+// and then, like a guest whose mirrored write lands on the plexes in either order.
+func mirroredWrite(r *rand.Rand, p []byte, off int64, first, second *Store) error {
+	if _, err := first.WriteAt(p, off); err != nil {
+		return err
+	}
+	if r.IntN(4) == 0 {
+		time.Sleep(time.Duration(r.IntN(500)) * time.Microsecond)
+	}
+	_, err := second.WriteAt(p, off)
+	return err
+}
+
+// settleAndReclaim examines everything the store has recorded, including the chunks waiting
+// for a second look, until nothing is left.
+func settleAndReclaim(s *Store) {
+	for range 2 {
+		time.Sleep(s.settle)
+		for s.Reclaim(context.Background(), 256) > 0 {
+		}
+	}
+}
+
+// pendingPunches reports how many chunks wait to be punched.
+func (s *Store) pendingPunches() int {
+	s.punchMu.Lock()
+	defer s.punchMu.Unlock()
+	return len(s.punches)
+}
+
+// allocatedChunks lists the chunks that have data allocated in the COW file (SEEK_DATA), which
+// unlike Stat's block count leaves out filesystem metadata such as extent index blocks.
+func allocatedChunks(t *testing.T, s *Store) []int64 {
+	t.Helper()
+	var chunks []int64
+	fd := int(s.cow.Fd())
+	for pos := int64(0); pos < s.size; {
+		data, err := unix.Seek(fd, pos, unix.SEEK_DATA)
+		if errors.Is(err, unix.ENXIO) || data >= s.size {
+			break
+		}
+		require.NoError(t, err)
+		hole, err := unix.Seek(fd, data, unix.SEEK_HOLE)
+		require.NoError(t, err)
+		for c := data / s.chunkSize; c*s.chunkSize < min(hole, s.size); c++ {
+			chunks = append(chunks, c)
+		}
+		pos = hole
+	}
+	return chunks
+}
+
+// storedChunks lists the chunks whose bit is set.
+func storedChunks(s *Store) []int64 {
+	var chunks []int64
+	for c := range s.Chunks() {
+		if s.IsWritten(c) {
+			chunks = append(chunks, c)
+		}
+	}
+	return chunks
+}
+
+// The mirror under torture: plex a over a fixed base, plex b over a live view of a, nopwrite on
+// both. Writers mirror random writes to both plexes in either order while a sweeper reclaims b
+// with small budgets and a flusher flushes both. Whenever a chunk is quiet it reads the same
+// on both plexes and holds what was written; once everything is quiet and swept, b stores
+// nothing, owes no punch and its COW file is empty.
+func TestReclaimMirrorTorture(t *testing.T) {
+	t.Parallel()
+	const chunks, writers = 64, 4
+	r := rand.New(rand.NewPCG(11, 1))
+	baseData := make([]byte, chunks*testChunk)
+	nonZero(r, baseData)
+	dir := t.TempDir()
+	a, err := Open(&mem{data: baseData}, filepath.Join(dir, "a.cow"), filepath.Join(dir, "a.bitmap"), testChunk)
+	require.NoError(t, err)
+	a.EnableReclaim()
+	b, err := Open(&liveView{of: a}, filepath.Join(dir, "b.cow"), filepath.Join(dir, "b.bitmap"), testChunk)
+	require.NoError(t, err)
+	b.EnableReclaim()
+	a.SetNopWrite(true)
+	b.SetNopWrite(true)
+	b.settle = 100 * time.Millisecond
+	contents := runMirrorTorture(t, a, b, baseData, writers, tortureDuration(), 11, nil)
+	want := assembleChunks(contents, chunks, testChunk)
+	assert.Equal(t, want, readAll(t, a), "a holds every write")
+	assert.Equal(t, want, readAll(t, b), "b reads what a reads")
+	settleAndReclaim(b)
+	assert.EqualValues(t, 0, b.Written(), "every chunk of b equals a: all reclaimed")
+	assert.Zero(t, b.ReclaimStats().Pending)
+	require.NoError(t, b.Flush())
+	assert.Zero(t, b.pendingPunches(), "the flush punched everything that was queued")
+	assert.Empty(t, allocatedChunks(t, b), "b's COW file holds nothing")
+	assert.Equal(t, want, readAll(t, b))
+	rs := b.ReclaimStats()
+	t.Logf("b: %d examined, %d dropped (%d bytes); a: %d chunks stored", rs.Examined, rs.Chunks, rs.Bytes, a.Written())
+	assert.Positive(t, rs.Chunks, "the workload froze chunks on b for the sweeper to drop")
+	require.NoError(t, b.Close())
+	require.NoError(t, a.Close())
+}
+
+// runMirrorTorture runs the mirror workload for d against a and b: writers each own the chunks
+// c with c%writers == w and check their own chunks after every mirrored write, a sweeper
+// reclaims both stores, a flusher flushes both. It returns what each writer wrote; when seen is
+// given, every content a chunk had after a mirrored write is added to it.
+func runMirrorTorture(t *testing.T, a, b *Store, baseData []byte, writers int, d time.Duration, seed uint64, seen []map[[32]byte]bool) [][]byte {
+	t.Helper()
+	chunks := int64(len(baseData)) / testChunk
+	var stop atomic.Bool
+	var wg, bg sync.WaitGroup
+	var seenMu sync.Mutex
+	errs := make(chan error, writers+2)
+	bg.Add(2)
+	go func() {
+		defer bg.Done()
+		r := rand.New(rand.NewPCG(seed, 100))
+		for !stop.Load() {
+			b.Reclaim(context.Background(), 1+r.IntN(8))
+			a.Reclaim(context.Background(), 4)
+		}
+	}()
+	go func() {
+		defer bg.Done()
+		r := rand.New(rand.NewPCG(seed, 101))
+		for !stop.Load() {
+			time.Sleep(time.Duration(r.IntN(20)) * time.Millisecond)
+			if err := errors.Join(a.Flush(), b.Flush()); err != nil {
+				errs <- fmt.Errorf("flush: %w", err)
+				return
+			}
+		}
+	}()
+	contents := make([][]byte, writers)
+	for w := range writers {
+		contents[w] = bytes.Clone(baseData)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := rand.New(rand.NewPCG(seed, uint64(10+w)))
+			own := contents[w]
+			for !stop.Load() {
+				c := int64(w) + int64(writers)*r.Int64N(chunks/int64(writers))
+				start, end := c*testChunk, (c+1)*testChunk
+				off, length := start, int64(testChunk)
+				if r.IntN(2) == 0 { // a sub-chunk range, 512-aligned
+					off = start + r.Int64N(testChunk/512)*512
+					length = (1 + r.Int64N((end-off)/512)) * 512
+				}
+				p := make([]byte, length)
+				nonZero(r, p)
+				first, second := a, b
+				if r.IntN(2) == 0 {
+					first, second = b, a
+				}
+				if err := mirroredWrite(r, p, off, first, second); err != nil {
+					errs <- err
+					return
+				}
+				copy(own[off:], p)
+				if seen != nil {
+					seenMu.Lock()
+					seen[c][sha256.Sum256(own[start:end])] = true
+					seenMu.Unlock()
+				}
+				ga, gb := make([]byte, testChunk), make([]byte, testChunk)
+				if _, err := a.ReadAt(ga, start); err != nil && !errors.Is(err, io.EOF) {
+					errs <- err
+					return
+				}
+				if _, err := b.ReadAt(gb, start); err != nil && !errors.Is(err, io.EOF) {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(ga, own[start:end]) {
+					errs <- fmt.Errorf("writer %d: chunk %d of a differs from what was written", w, c)
+					return
+				}
+				if !bytes.Equal(gb, ga) {
+					errs <- fmt.Errorf("writer %d: chunk %d of b differs from a while quiet", w, c)
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(d)
+	stop.Store(true)
+	wg.Wait()
+	bg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	return contents
+}
+
+// assembleChunks builds the device content from the writers' chunks.
+func assembleChunks(contents [][]byte, chunks, chunk int64) []byte {
+	want := make([]byte, chunks*chunk)
+	for c := range chunks {
+		copy(want[c*chunk:(c+1)*chunk], contents[c%int64(len(contents))][c*chunk:(c+1)*chunk])
+	}
+	return want
+}
+
+// The mirror under torture with crashes of plex b between rounds: b's process dies without
+// flushing and a successor reopens its files over the same view of a. With a live bitmap the
+// successor reads exactly what b read before (a stored chunk its data, a dropped chunk the
+// view of a), and the punches the predecessor owed are done at its first flush. Without one,
+// a chunk whose bit is still set on disk reads the bytes the COW file holds: some content the
+// chunk had at an earlier point (what its base held when it was dropped), never zeros, and
+// never anything that was not written there.
+func TestReclaimMirrorCrashTorture(t *testing.T) {
+	t.Parallel()
+	for _, live := range []bool{true, false} {
+		t.Run(fmt.Sprintf("live=%v", live), func(t *testing.T) {
+			t.Parallel()
+			const chunks, writers, rounds = 32, 4, 4
+			r := rand.New(rand.NewPCG(13, 1))
+			baseData := make([]byte, chunks*testChunk)
+			nonZero(r, baseData)
+			dir := t.TempDir()
+			a, err := Open(&mem{data: baseData}, filepath.Join(dir, "a.cow"), filepath.Join(dir, "a.bitmap"), testChunk)
+			require.NoError(t, err)
+			a.SetNopWrite(true)
+			o := &Options{COWFile: filepath.Join(dir, "b.cow"), Bitmap: filepath.Join(dir, "b.bitmap"), ChunkSize: testChunk}
+			if live {
+				o.LiveBitmap = filepath.Join(dir, "b.live")
+			}
+			open := func() *Store {
+				b, err := OpenWith(&liveView{of: a}, o)
+				require.NoError(t, err)
+				b.SetNopWrite(true)
+				b.settle = 50 * time.Millisecond
+				return b
+			}
+			b := open()
+			// Every content a chunk ever had, as the mirror saw it: what a crash may revert to
+			seen := make([]map[[32]byte]bool, chunks)
+			for c := range seen {
+				seen[c] = map[[32]byte]bool{sha256.Sum256(baseData[c*testChunk : (c+1)*testChunk]): true}
+			}
+			want := bytes.Clone(baseData)
+			for round := range rounds {
+				runMirrorTorture(t, a, b, want, writers, tortureDuration()/rounds, uint64(100+round), seen)
+				want = readAll(t, a)
+				require.Equal(t, want, readAll(t, b), "round %d: b reads what a reads while quiet", round)
+				b.abandon() // the crash: nothing flushed, the punch queue and the recorded set are gone
+				b = open()
+				got := readAll(t, b)
+				if live {
+					require.Equal(t, want, got, "round %d: with a live bitmap the successor reads what b read", round)
+					continue
+				}
+				resynced := 0
+				for c := range chunks {
+					chunk := got[c*testChunk : (c+1)*testChunk]
+					require.NotContains(t, chunk, byte(0), "round %d: chunk %d reads zeros after the crash", round, c)
+					require.True(t, seen[c][sha256.Sum256(chunk)], "round %d: chunk %d (stored %v) reads bytes it never held", round, c, b.IsWritten(int64(c)))
+					if !bytes.Equal(chunk, want[c*testChunk:(c+1)*testChunk]) {
+						// b's unflushed writes are gone, as without a live bitmap they are for any
+						// write: the mirror resyncs the plex from a, as a RAID layer would after an
+						// unclean shutdown; the copy freezes on b and is the sweeper's to drop
+						_, err := b.WriteAt(want[c*testChunk:(c+1)*testChunk], int64(c)*testChunk)
+						require.NoError(t, err)
+						resynced++
+					}
+				}
+				t.Logf("round %d: %d chunks resynced after the crash", round, resynced)
+				require.Equal(t, want, readAll(t, b))
+			}
+			// The recorded set died with each predecessor, so chunks frozen before a crash stay
+			// stored until written again; but nothing stays allocated beyond them once the
+			// successor's first sweep has found the punches its predecessors owed
+			settleAndReclaim(b)
+			require.NoError(t, b.Flush())
+			assert.Zero(t, b.pendingPunches())
+			assert.Equal(t, storedChunks(b), allocatedChunks(t, b), "the allocated chunks are exactly the stored ones")
+			rs := b.ReclaimStats()
+			t.Logf("live=%v: final b: %d stored (frozen before a crash), %d examined, %d dropped", live, b.Written(), rs.Examined, rs.Chunks)
+			require.NoError(t, b.Close())
+			require.NoError(t, a.Close())
+		})
+	}
+}
+
+// A parity column under torture: p's base is the XOR of data columns d1 and d2 read live, all
+// three nopwrite. Writers write a range to d1, d2 and the matching parity to p in random
+// order, a sweeper reclaims p, a flusher flushes all three. A quiet chunk of p always reads
+// the live XOR, and once everything is quiet and swept, p stores nothing.
+func TestReclaimParityTorture(t *testing.T) {
+	t.Parallel()
+	const chunks, writers = 64, 4
+	r := rand.New(rand.NewPCG(17, 1))
+	base1, base2 := make([]byte, chunks*testChunk), make([]byte, chunks*testChunk)
+	nonZero(r, base1)
+	nonZero(r, base2)
+	dir := t.TempDir()
+	d1, err := Open(&mem{data: base1}, filepath.Join(dir, "d1.cow"), filepath.Join(dir, "d1.bitmap"), testChunk)
+	require.NoError(t, err)
+	d1.EnableReclaim()
+	d2, err := Open(&mem{data: base2}, filepath.Join(dir, "d2.cow"), filepath.Join(dir, "d2.bitmap"), testChunk)
+	require.NoError(t, err)
+	d2.EnableReclaim()
+	p, err := Open(&xorView{a: d1, b: d2}, filepath.Join(dir, "p.cow"), filepath.Join(dir, "p.bitmap"), testChunk)
+	require.NoError(t, err)
+	p.EnableReclaim()
+	for _, s := range []*Store{d1, d2, p} {
+		s.SetNopWrite(true)
+	}
+	p.settle = 100 * time.Millisecond
+	var stop atomic.Bool
+	var wg, bg sync.WaitGroup
+	errs := make(chan error, writers+2)
+	bg.Add(2)
+	go func() {
+		defer bg.Done()
+		r := rand.New(rand.NewPCG(17, 100))
+		for !stop.Load() {
+			p.Reclaim(context.Background(), 1+r.IntN(8))
+		}
+	}()
+	go func() {
+		defer bg.Done()
+		r := rand.New(rand.NewPCG(17, 101))
+		for !stop.Load() {
+			time.Sleep(time.Duration(r.IntN(20)) * time.Millisecond)
+			if err := errors.Join(d1.Flush(), d2.Flush(), p.Flush()); err != nil {
+				errs <- fmt.Errorf("flush: %w", err)
+				return
+			}
+		}
+	}()
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := rand.New(rand.NewPCG(17, uint64(10+w)))
+			for !stop.Load() {
+				c := int64(w) + int64(writers)*r.Int64N(chunks/writers)
+				start := c * testChunk
+				off := start + r.Int64N(testChunk/512)*512
+				length := (1 + r.Int64N((start+testChunk-off)/512)) * 512
+				x1, x2, xp := make([]byte, length), make([]byte, length), make([]byte, length)
+				nonZero(r, x1)
+				nonZero(r, x2)
+				for i := range xp {
+					xp[i] = x1[i] ^ x2[i]
+				}
+				writes := []struct {
+					s *Store
+					p []byte
+				}{{d1, x1}, {d2, x2}, {p, xp}}
+				for _, i := range r.Perm(3) {
+					if _, err := writes[i].s.WriteAt(writes[i].p, off); err != nil {
+						errs <- err
+						return
+					}
+					if r.IntN(4) == 0 {
+						time.Sleep(time.Duration(r.IntN(500)) * time.Microsecond)
+					}
+				}
+				g1, g2, gp := make([]byte, testChunk), make([]byte, testChunk), make([]byte, testChunk)
+				for _, read := range []struct {
+					s *Store
+					p []byte
+				}{{d1, g1}, {d2, g2}, {p, gp}} {
+					if _, err := read.s.ReadAt(read.p, start); err != nil && !errors.Is(err, io.EOF) {
+						errs <- err
+						return
+					}
+				}
+				for i := range gp {
+					if gp[i] != g1[i]^g2[i] {
+						errs <- fmt.Errorf("writer %d: chunk %d of p is not the XOR of the data columns while quiet", w, c)
+						return
+					}
+				}
+			}
+		}()
+	}
+	time.Sleep(tortureDuration())
+	stop.Store(true)
+	wg.Wait()
+	bg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	settleAndReclaim(p)
+	assert.EqualValues(t, 0, p.Written(), "every chunk of p equals the live XOR: all reclaimed")
+	require.NoError(t, p.Flush())
+	assert.Zero(t, p.pendingPunches())
+	assert.Empty(t, allocatedChunks(t, p), "p's COW file holds nothing")
+	want := readAll(t, d1)
+	for i, x := range readAll(t, d2) {
+		want[i] ^= x
+	}
+	assert.Equal(t, want, readAll(t, p), "p reads the live XOR")
+	rs := p.ReclaimStats()
+	t.Logf("p: %d examined, %d dropped; d1 %d, d2 %d chunks stored", rs.Examined, rs.Chunks, d1.Written(), d2.Written())
+	assert.Positive(t, rs.Chunks, "the workload froze parity chunks for the sweeper to drop")
+	require.NoError(t, p.Close())
+	require.NoError(t, d1.Close())
+	require.NoError(t, d2.Close())
+}
+
+// Reclaim's state (the recorded sets and the bitmap's copy of the file) costs about four
+// bits per chunk, 64 MiB on an 8 TiB device: a store allocates it only once reclaim is on.
+func TestReclaimStateOnlyWhenEnabled(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s := newTestStore(t, dir, &mem{data: pattern(testSize)})
+	_, err := s.WriteAt(pattern(testChunk), 0) // what the base holds: reclaimable once enabled
+	require.NoError(t, err)
+	assert.Nil(t, s.recent)
+	assert.Nil(t, s.again)
+	assert.Nil(t, s.due)
+	assert.Nil(t, s.bitmap.disk)
+	assert.Zero(t, s.Reclaim(context.Background(), 100), "off: nothing recorded, nothing examined")
+	require.NoError(t, s.Flush())
+	s.EnableReclaim()
+	assert.NotNil(t, s.recent)
+	assert.True(t, s.bitmap.committed(0), "the copy of the file is read when reclaim turns on")
+	_, err = s.WriteAt(pattern(testChunk), 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, s.Reclaim(context.Background(), 100))
+	assert.EqualValues(t, 0, s.Written())
+	require.NoError(t, s.Close())
 }

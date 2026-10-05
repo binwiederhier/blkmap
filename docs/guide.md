@@ -687,6 +687,22 @@ each other (the disks of a software RAID restored from a backup that kept only t
   what the device already reads is dropped, so a RAID resync after a restore costs no overlay
   space. Over a derived base (a Binder) a skipped range keeps following the base until a write
   there differs. It never makes a whole-chunk write depend on reading the base.
+- **Reclaim** (`Reclaim`, or `cow.Store.EnableReclaim` before I/O and then `cow.Store.Reclaim`): a background sweeper that drops stored
+  chunks which equal their base again. A chunk freezes in the overlay the first time a write
+  to it differs from the base at that instant, and for a mirror plex that is a matter of
+  timing: the guest writes the same bytes to both plexes at once, and the plex whose half
+  lands first sees the other still holding the old bytes, so it stores its half. A moment
+  later the plexes agree again and the stored chunk is a redundant copy, but from then on
+  every write to it is compared against that copy, so a hot chunk ends up stored on both
+  plexes (twice the overlay). The same happens to a parity chunk written before its data
+  chunks. The sweeper examines the chunks written since its last pass (one overlay read and
+  one base read each), in batches of 256 while the guest is idle and 16 per 100 ms while it is
+  busy, clears the bit of every chunk that equals its base and lets the next flush punch it,
+  once the cleared bit is on disk; a chunk that differs is looked at once more a second later,
+  when the other half of the mirrored write has landed, and a repeated write to a stored chunk
+  has it looked at again. It needs
+  nopwrite to be useful and cannot be combined with hydration, which copies the base on
+  purpose. `blkmap status` and the metrics show chunks examined, dropped and pending.
 - **Writeback** (`Device.Writeback`, `cow.Store.Writeback`) copies the overlay into a writable
   copy of the base, for a device that was a scratch view of files. Writing back into the base
   itself changes its identity: discard the COW file and bitmap afterwards.

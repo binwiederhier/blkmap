@@ -84,6 +84,11 @@ type Options struct {
 	// NopWrite drops writes whose bytes equal what the device already reads
 	// there (see cow.Store.SetNopWrite).
 	NopWrite bool
+	// Reclaim drops stored chunks that have become identical to the base again, in the
+	// background (full batches while the guest is idle, a trickle under load); needs NopWrite
+	// to be useful, see cow.Store.Reclaim. It contradicts Hydrate, which copies the base into
+	// the COW file: Serve refuses both.
+	Reclaim bool
 }
 
 // Device is a running blkmap block device.
@@ -100,6 +105,7 @@ type Device struct {
 	base      source.Source
 	backend   *backend
 	hydrator  *hydrator   // nil without hydration
+	sweeper   *sweeper    // nil without Options.Reclaim
 	recorder  *ioRecorder // nil without a recording
 	started   time.Time
 	recovered bool          // re-attached to a running device
@@ -199,6 +205,10 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 		o.Base.Close()
 		return nil, nil, errors.New("a cow file is required")
 	}
+	if o.Reclaim && o.Hydrate != nil {
+		o.Base.Close()
+		return nil, nil, errors.New("reclaim and hydration contradict each other: one drops chunks that equal the base, the other copies them")
+	}
 	o.defaults()
 	if !markServed(o.ID) {
 		o.Base.Close()
@@ -233,6 +243,9 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 		return nil, nil, err
 	}
 	store.SetNopWrite(o.NopWrite)
+	if o.Reclaim {
+		store.EnableReclaim() // before the kernel device exists, so every write is recorded
+	}
 	return store, pred, nil
 }
 
@@ -318,6 +331,15 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		go func() {
 			defer d.bg.Done()
 			h.run(bgCtx)
+		}()
+	}
+	if o.Reclaim {
+		w := newSweeper(store, b.busy)
+		d.sweeper = w
+		d.bg.Add(1)
+		go func() {
+			defer d.bg.Done()
+			w.run(bgCtx)
 		}()
 	}
 	return d, nil
@@ -565,6 +587,10 @@ func (d *Device) Status() *Status {
 		p := d.hydrator.progress()
 		st.Hydration = &p
 	}
+	if d.sweeper != nil {
+		rs := d.store.ReclaimStats()
+		st.Reclaim = &rs
+	}
 	if d.recorder != nil {
 		rs := d.recorder.status()
 		st.Recording = &rs
@@ -653,8 +679,9 @@ func (d *Device) Close() error {
 	return errors.Join(errs...)
 }
 
-// stopBackground ends hydration and the periodic flush. The source is aborted before the
-// wait: a hydration read blocked in it would otherwise hold up the shutdown indefinitely.
+// stopBackground ends hydration, the sweeper and the periodic flush. The source is aborted
+// before the wait: a hydration or sweeper read blocked in it would otherwise hold up the
+// shutdown indefinitely.
 func (d *Device) stopBackground() {
 	if d.stop != nil {
 		d.stop()

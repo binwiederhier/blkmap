@@ -55,6 +55,7 @@ type Status struct {
 	Source         cow.SourceStats    `json:"source"`
 	Cache          *source.CacheStats `json:"cache,omitempty"`
 	Hydration      *Progress          `json:"hydration,omitempty"`
+	Reclaim        *cow.ReclaimStats  `json:"reclaim,omitempty"` // nil unless Options.Reclaim
 	Recording      *RecordStatus      `json:"recording,omitempty"`
 }
 
@@ -173,6 +174,26 @@ var metrics = []metric{
 	{"blkmap_hydration_done", "gauge", "Hydration has ended.", func(st *Status, emit func(string, float64)) {
 		if st.Hydration != nil {
 			emit("", boolValue(st.Hydration.Done))
+		}
+	}},
+	{"blkmap_reclaim_examined_total", "counter", "Chunks the sweeper compared with their base.", func(st *Status, emit func(string, float64)) {
+		if st.Reclaim != nil {
+			emit("", float64(st.Reclaim.Examined))
+		}
+	}},
+	{"blkmap_reclaim_chunks_total", "counter", "Stored chunks dropped from the COW file because they equalled their base again.", func(st *Status, emit func(string, float64)) {
+		if st.Reclaim != nil {
+			emit("", float64(st.Reclaim.Chunks))
+		}
+	}},
+	{"blkmap_reclaim_bytes_total", "counter", "Bytes those chunks held.", func(st *Status, emit func(string, float64)) {
+		if st.Reclaim != nil {
+			emit("", float64(st.Reclaim.Bytes))
+		}
+	}},
+	{"blkmap_reclaim_pending_chunks", "gauge", "Chunks written since the sweeper last examined them.", func(st *Status, emit func(string, float64)) {
+		if st.Reclaim != nil {
+			emit("", float64(st.Reclaim.Pending))
 		}
 	}},
 }
