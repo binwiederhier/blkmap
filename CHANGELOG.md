@@ -3,6 +3,18 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## v0.4.5 (2026-10-06)
+
+- **A read-only device without hydration has no COW file.** Nothing is ever stored on such
+  a device, yet it created a COW file, a bitmap and a live bitmap, flushed them, and logged
+  "0/N chunks in cow file". Now the store reads the base straight through
+  (`cow.Options.COWFile` empty, `cow.ErrNoOverlay` for anything that would change it), no
+  file is created, and serve and `blkmap status` say "read-only, no cow file". COW files
+  left by earlier versions are no longer touched; delete them by hand. `blkmap validate`
+  shows no COW and `blkmap pin` has nothing to pin. A read-only device that hydrates keeps
+  its COW file (the local copy) and reports "read-only, N/M chunks hydrated to FILE".
+  Library: `device.Options.COWFile` may be empty only with `ReadOnly` and no `Hydrate`.
+
 ## v0.4.4 (2026-10-06)
 
 - **A reload can no longer hang a VM's disk.** In the 24 h Windows soak, a reload under SQL

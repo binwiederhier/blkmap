@@ -69,7 +69,7 @@ var (
 type Options struct {
 	ID        string        // device name; the symlink is <DevDir>/<ID>
 	Base      source.Source // read-only base image; Serve takes ownership and closes it
-	COWFile   string        // overlay file; created if missing
+	COWFile   string        // overlay file; created if missing. Empty only for ReadOnly without Hydrate: no overlay
 	Bitmap    string        // defaults to COWFile + ".bitmap"
 	ChunkSize int64         // COW granularity; defaults to config.DefaultChunkSize
 	BlockSize int           // 512 (default) or 4096
@@ -117,6 +117,8 @@ type Device struct {
 	recovery  bool          // the kernel device outlives this process (Options.Recovery)
 	failed    chan struct{} // closed when the kernel device or the store fails
 	status    io.Closer     // the status socket; nil if it could not be opened
+	readOnly  bool
+	cowFile   string // empty without an overlay
 }
 
 // Start opens the sources and COW store for c and serves them as a block device, publishing
@@ -138,13 +140,25 @@ func recordFromConfig(r *config.Record) *Record {
 	return &Record{File: r.File, MaxDuration: r.MaxDuration, MaxSize: r.MaxSize}
 }
 
+// overlayFiles returns the COW file and bitmap a config's device keeps: none for a read-only
+// device that does not hydrate, since nothing would ever be stored.
+func overlayFiles(c *config.Config, hydrate *Hydrate) (cowFile, bitmap string) {
+	if c.ReadOnly && hydrate == nil {
+		return "", ""
+	}
+	return c.COW.File, c.COW.Bitmap
+}
+
 // startWithHydrate is Start with an explicit run directory and hydration plan.
 func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir string, hydrate *Hydrate) (*Device, error) {
 	var base source.Source
 	var identity string // stays empty when detached: there are no sources to check
-	size, chunkSize, complete, err := cow.Complete(c.COW.Bitmap)
-	if err != nil {
-		return nil, err
+	cowFile, bitmap := overlayFiles(c, hydrate)
+	size, chunkSize, complete, err := int64(0), int64(0), false, error(nil)
+	if cowFile != "" {
+		if size, chunkSize, complete, err = cow.Complete(bitmap); err != nil {
+			return nil, err
+		}
 	}
 	if complete && chunkSize == c.COW.ChunkSize && (c.Size == 0 || c.Size == size) {
 		log.Printf("%s: fully hydrated (%s in %s), not opening the sources", c.ID, util.FormatSize(size), c.COW.File)
@@ -158,8 +172,8 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 	return Serve(ctx, &Options{
 		ID:        c.ID,
 		Base:      base,
-		COWFile:   c.COW.File,
-		Bitmap:    c.COW.Bitmap,
+		COWFile:   cowFile,
+		Bitmap:    bitmap,
 		ChunkSize: c.COW.ChunkSize,
 		BlockSize: c.BlockSize,
 		ReadOnly:  c.ReadOnly,
@@ -206,9 +220,9 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 		o.Base.Close()
 		return nil, nil, fmt.Errorf("invalid device id %q", o.ID)
 	}
-	if o.COWFile == "" {
+	if o.COWFile == "" && (!o.ReadOnly || o.Hydrate != nil) {
 		o.Base.Close()
-		return nil, nil, errors.New("a cow file is required")
+		return nil, nil, errors.New("a cow file is required (only a read-only device without hydration has none)")
 	}
 	if o.Reclaim && o.Hydrate != nil {
 		o.Base.Close()
@@ -238,7 +252,9 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 			unmarkServed(o.ID)
 			return nil, nil, err
 		}
-		livePath = filepath.Join(o.RunDir, o.ID+liveBitmapExt)
+		if o.COWFile != "" { // without an overlay there are no bits to carry over
+			livePath = filepath.Join(o.RunDir, o.ID+liveBitmapExt)
+		}
 	}
 	store, err := cow.OpenWith(o.Base, &cow.Options{COWFile: o.COWFile, Bitmap: o.Bitmap, LiveBitmap: livePath, ChunkSize: o.ChunkSize, Identity: o.Identity, LegacyIdentity: source.LegacyIdentity(o.Identity)})
 	if err != nil {
@@ -284,7 +300,7 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
 	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev,
-		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered, recovery: o.Recovery, failed: make(chan struct{})}
+		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered, recovery: o.Recovery, readOnly: o.ReadOnly, cowFile: o.COWFile, failed: make(chan struct{})}
 	if err := os.WriteFile(filepath.Join("/sys/block", filepath.Base(dev.BlockPath), "queue", "read_ahead_kb"), []byte(strconv.Itoa(readAheadKB)), 0); err != nil {
 		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
 	}
@@ -390,7 +406,7 @@ func queuesFor(base source.Source) int {
 
 // defaults fills in the zero-value options.
 func (o *Options) defaults() {
-	if o.Bitmap == "" {
+	if o.Bitmap == "" && o.COWFile != "" {
 		o.Bitmap = o.COWFile + config.BitmapExt
 	}
 	if o.ChunkSize == 0 {
@@ -578,6 +594,11 @@ func (d *Device) Detach() error {
 	return d.ublk.Release()
 }
 
+// COWFile returns the overlay file, or "" for a device without one.
+func (d *Device) COWFile() string {
+	return d.cowFile
+}
+
 // Status returns a snapshot of the device's state and counters.
 func (d *Device) Status() *Status {
 	queues := d.ublk.Stats()
@@ -588,6 +609,8 @@ func (d *Device) Status() *Status {
 		PID:            os.Getpid(),
 		Started:        d.started,
 		Recovered:      d.recovered,
+		ReadOnly:       d.readOnly,
+		COWFile:        d.cowFile,
 		Size:           d.store.Size(),
 		ChunkSize:      d.store.ChunkSize(),
 		Chunks:         d.store.Chunks(),

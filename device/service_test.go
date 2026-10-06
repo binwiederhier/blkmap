@@ -847,3 +847,46 @@ func TestPredecessorWithAnotherConfigIsReplaced(t *testing.T) {
 	assert.Nil(t, dev, "the caller creates a fresh device")
 	assert.EqualValues(t, 1, deletes.Load())
 }
+
+func TestOpenStoreReadOnlyWithoutCOWFile(t *testing.T) {
+	// A read-only device that does not hydrate has nothing to store: no COW file, bitmap or
+	// live bitmap
+	dir := t.TempDir()
+	o := &Options{ID: "ro", Base: source.NewZero(1 << 20), ReadOnly: true, DevDir: dir, RunDir: filepath.Join(dir, "run")}
+	store, pred, err := openStore(o)
+	require.NoError(t, err)
+	assert.False(t, store.Overlay())
+	closeStore(o.ID, store, pred)
+	var files []string
+	filepath.WalkDir(dir, func(path string, e os.DirEntry, err error) error {
+		if err == nil && !e.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	})
+	assert.Empty(t, files)
+}
+
+func TestOpenStoreNeedsACOWFileToChange(t *testing.T) {
+	dir := t.TempDir()
+	for name, o := range map[string]*Options{
+		"writable": {ID: "rw", Base: source.NewZero(1 << 20)},
+		"hydrated": {ID: "rh", Base: source.NewZero(1 << 20), ReadOnly: true, Hydrate: &Hydrate{Rest: true}},
+	} {
+		o.DevDir, o.RunDir = dir, filepath.Join(dir, "run")
+		_, _, err := openStore(o)
+		assert.Error(t, err, name)
+	}
+}
+
+func TestReadOnlyConfigWithoutHydrationHasNoOverlay(t *testing.T) {
+	c := &config.Config{ID: "x", ReadOnly: true, COW: &config.COW{File: "/var/lib/blkmap/x.cow", Bitmap: "/var/lib/blkmap/x.cow.bitmap"}}
+	cowFile, bitmap := overlayFiles(c, nil)
+	assert.Empty(t, cowFile)
+	assert.Empty(t, bitmap)
+	cowFile, _ = overlayFiles(c, &Hydrate{Rest: true})
+	assert.Equal(t, c.COW.File, cowFile, "hydration copies the base into the COW file")
+	c.ReadOnly = false
+	cowFile, _ = overlayFiles(c, nil)
+	assert.Equal(t, c.COW.File, cowFile)
+}

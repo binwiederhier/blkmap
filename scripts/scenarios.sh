@@ -275,9 +275,17 @@ segments:
   - type: file
     path: $dir/img64
 YML
+  rm -f /var/lib/blkmap/sc-ro.cow*
+  local s=$(since)
   unit start sc-ro && wait_dev sc-ro || { bad read_only_device "start"; return; }
   dd if=/dev/zero of=/dev/blkmap/sc-ro bs=4k count=1 oflag=direct status=none 2>/dev/null && { bad read_only_device "write succeeded"; unit stop sc-ro; return; }
-  [ "$(blockdev --getro /dev/blkmap/sc-ro)" = 1 ] && ok read_only_device || bad read_only_device "not flagged read-only"
+  [ "$(blockdev --getro /dev/blkmap/sc-ro)" = 1 ] || { bad read_only_device "not flagged read-only"; unit stop sc-ro; return; }
+  # Nothing is stored, so nothing is kept: no cow file, bitmap or live bitmap, across a crash and a reload
+  systemctl kill -s KILL blkmap@sc-ro; sleep 2; wait_dev sc-ro; systemctl reload blkmap@sc-ro; sleep 2
+  cmp -s /dev/blkmap/sc-ro $dir/img64 || { bad read_only_device "content differs from the image"; unit stop sc-ro; return; }
+  local st; st=$(blkmap status sc-ro 2>&1)
+  ls /var/lib/blkmap/sc-ro.cow* /run/blkmap/sc-ro.bitmap >/dev/null 2>&1 && { bad read_only_device "a cow file or bitmap was created"; unit stop sc-ro; return; }
+  grep -q "read-only, no cow file" <<<"$st" && [ "$(journal sc-ro "$s" | grep -c re-attached)" -ge 2 ] && ok read_only_device || bad read_only_device "status or re-attach: $(head -2 <<<"$st" | tail -1), $(journal sc-ro "$s" | grep -c re-attached) re-attaches"
   unit stop sc-ro
 }
 sc_bad_configs_rejected() {

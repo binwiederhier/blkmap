@@ -41,8 +41,8 @@ func execServe(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("serving %s (%s): %s, %d segments, %d/%d chunks in cow file %s",
-		d.Path, d.BlockPath, util.FormatSize(d.Size()), len(conf.Segments), d.Written(), d.Chunks(), conf.COW.File)
+	log.Printf("serving %s (%s): %s, %d segments, %s",
+		d.Path, d.BlockPath, util.FormatSize(d.Size()), len(conf.Segments), describeOverlay(conf.ReadOnly, d.COWFile(), d.Written(), d.Chunks()))
 	if _, err := util.SdNotify(util.NotifyReady); err != nil {
 		log.Printf("sd_notify failed: %s", err.Error())
 	}
@@ -81,7 +81,7 @@ func execServe(c *cli.Context) error {
 	if err := d.Close(); err != nil {
 		return errors.Join(failure, err)
 	}
-	log.Printf("stopped %s, %d chunks in cow file", d.Path, written)
+	log.Printf("stopped %s, %s", d.Path, describeOverlay(conf.ReadOnly, d.COWFile(), written, d.Chunks()))
 	return failure
 }
 

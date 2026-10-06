@@ -34,6 +34,9 @@ const (
 
 var (
 	errOutOfRange = errors.New("range beyond device end")
+	// ErrNoOverlay is what a store without a COW file (see Options.COWFile) answers to
+	// anything that would change the device.
+	ErrNoOverlay = errors.New("no COW file: the device is read-only")
 	// ErrSourceChanged means the base no longer has the content the COW file was written
 	// over; see Options.Identity.
 	ErrSourceChanged = errors.New("source changed")
@@ -44,6 +47,9 @@ var (
 
 // Options locates a store's files.
 type Options struct {
+	// COWFile is the overlay; empty means none: a read-only store that reads the base,
+	// keeps no file and refuses changes (ErrNoOverlay), for a read-only device that does not
+	// hydrate. Bitmap, LiveBitmap and Identity are then ignored.
 	COWFile    string
 	Bitmap     string
 	LiveBitmap string // on tmpfs, optional; see Bitmap
@@ -145,6 +151,9 @@ func Open(base source.Source, cowPath, bitmapPath string, chunkSize int64) (*Sto
 func OpenWith(base source.Source, o *Options) (*Store, error) {
 	cowPath, bitmapPath, livePath, chunkSize := o.COWFile, o.Bitmap, o.LiveBitmap, o.ChunkSize
 	size := base.Size()
+	if cowPath == "" {
+		return newStore(base, nil, memoryBitmap(size, chunkSize), chunkSize), nil
+	}
 	cow, err := os.OpenFile(cowPath, os.O_RDWR|os.O_CREATE|unix.O_NOFOLLOW, cowFileMode)
 	if err != nil {
 		return nil, err
@@ -179,10 +188,17 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 			return fail(fmt.Errorf("cow file %s: %w", cowPath, err))
 		}
 	}
-	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: size, mutableBase: source.Mutable(base)}
-	s.syncCOW, s.failed = cow.Sync, make(chan struct{})
-	s.settle = reclaimSettle
+	s := newStore(base, cow, bitmap, chunkSize)
+	s.syncCOW = cow.Sync
 	s.dirty.Store(bitmap.Pending()) // bits adopted from a predecessor's live bitmap
+	return s, nil
+}
+
+// newStore assembles a store; cow is nil for one without an overlay.
+func newStore(base source.Source, cow *os.File, bitmap *Bitmap, chunkSize int64) *Store {
+	s := &Store{base: base, cow: cow, bitmap: bitmap, chunkSize: chunkSize, size: base.Size(), mutableBase: source.Mutable(base)}
+	s.syncCOW, s.failed = func() error { return nil }, make(chan struct{})
+	s.settle = reclaimSettle
 	s.bufs.New = func() any {
 		b := make([]byte, chunkSize)
 		return &b
@@ -191,7 +207,20 @@ func OpenWith(base source.Source, o *Options) (*Store, error) {
 		b := make([]byte, MaxRunBytes)
 		return &b
 	}
-	return s, nil
+	return s
+}
+
+// changeable returns why the store cannot change: it failed, or it has no overlay.
+func (s *Store) changeable() error {
+	if s.cow == nil {
+		return ErrNoOverlay
+	}
+	return s.Err()
+}
+
+// Overlay reports whether the store has a COW file (see Options.COWFile).
+func (s *Store) Overlay() bool {
+	return s.cow != nil
 }
 
 // SourceStats counts the reads a store made from its base source.
@@ -333,7 +362,7 @@ func fullRead(n, want int, err error) error {
 }
 
 func (s *Store) WriteAt(p []byte, off int64) (int, error) {
-	if err := s.Err(); err != nil {
+	if err := s.changeable(); err != nil {
 		return 0, err
 	}
 	if off < 0 || off+int64(len(p)) > s.size {
@@ -368,6 +397,9 @@ func (s *Store) Abort() {
 // Reclaim dropped from the overlay are punched last, once the snapshot holding their cleared
 // bits is on disk: the mirror image of the order for a set bit.
 func (s *Store) Flush() error {
+	if s.cow == nil {
+		return nil
+	}
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 	if err := s.Err(); err != nil {
@@ -483,6 +515,9 @@ func (s *Store) Written() int64 {
 // not be made durable, pending bits are dropped rather than written ahead of it; after a
 // failed COW sync the live bitmap goes too, since the page cache it vouches for may be gone.
 func (s *Store) Close() error {
+	if s.cow == nil {
+		return s.base.Close()
+	}
 	err := s.Flush()
 	closeBitmap := s.bitmap.Close
 	if s.Err() != nil {
@@ -636,6 +671,9 @@ func (s *Store) record(set []uint32, chunk int64) bool {
 // allocates it only here. Call it before the store serves I/O, or writes before it are never
 // examined.
 func (s *Store) EnableReclaim() {
+	if s.cow == nil { // nothing is ever stored, so nothing to reclaim
+		return
+	}
 	s.reclaimMu.Lock()
 	defer s.reclaimMu.Unlock()
 	if s.reclaimOn.Load() {
@@ -654,6 +692,9 @@ func (s *Store) EnableReclaim() {
 // it needs (a bit per chunk) and answers false until a flush has completed, since changes
 // before it were not tracked. Must not allocate after the first call.
 func (s *Store) Durable(off, length int64) bool {
+	if s.cow == nil {
+		return s.baseDurable(off, min(off+length, s.size)-off)
+	}
 	s.durOnce.Do(s.trackDurability)
 	if !s.durReady.Load() || s.Err() != nil {
 		return false
@@ -936,7 +977,7 @@ func (s *Store) reclaimChunk(chunk int64, stored, base []byte) (freed, retry boo
 // as zeros and stop using space. Partial chunks and unwritten chunks are left alone, which
 // discard semantics allow.
 func (s *Store) Discard(off, length int64) error {
-	if err := s.Err(); err != nil {
+	if err := s.changeable(); err != nil {
 		return err
 	}
 	if err := s.checkRange(off, length); err != nil {
@@ -964,7 +1005,7 @@ func (s *Store) Discard(off, length int64) error {
 // WriteZeroes zeroes a range: whole chunks are punched out and marked written (reading as
 // zeros from the sparse COW file); partial chunks go through the normal write path.
 func (s *Store) WriteZeroes(off, length int64) error {
-	if err := s.Err(); err != nil {
+	if err := s.changeable(); err != nil {
 		return err
 	}
 	if err := s.checkRange(off, length); err != nil {
@@ -1056,7 +1097,7 @@ func (s *Store) IsWritten(chunk int64) bool {
 // zeros. It reports whether the bit was newly set. The chunk is punched first: after a crash
 // the COW file can still hold data whose bit never reached the disk.
 func (s *Store) MarkZero(chunk int64) bool {
-	if chunk < 0 || chunk >= s.bitmap.Chunks() || s.Err() != nil {
+	if chunk < 0 || chunk >= s.bitmap.Chunks() || s.changeable() != nil {
 		return false
 	}
 	mu := &s.locks[chunk%lockStripes]
@@ -1123,7 +1164,7 @@ func (s *Store) Dirty() bool {
 // bytes copied; chunks the guest wrote meanwhile keep the guest's data. Hydrated chunks are
 // not recorded for Reclaim (nor are MarkZero's): they duplicate the base on purpose.
 func (s *Store) HydrateRun(first, count int64, direct bool) (int64, error) {
-	if err := s.Err(); err != nil {
+	if err := s.changeable(); err != nil {
 		return 0, err
 	}
 	chunks := s.bitmap.Chunks()

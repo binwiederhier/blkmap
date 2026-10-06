@@ -13,7 +13,7 @@ import (
 
 func TestStatusAndMetrics(t *testing.T) {
 	dir := t.TempDir()
-	st := &device.Status{ID: "disk1", Path: "/dev/blkmap/disk1", BlockPath: "/dev/ublkb3", Size: 1 << 30, Chunks: 16384, Written: 4096, Queues: 2,
+	st := &device.Status{ID: "disk1", Path: "/dev/blkmap/disk1", BlockPath: "/dev/ublkb3", Size: 1 << 30, COWFile: "/var/lib/blkmap/disk1.cow", Chunks: 16384, Written: 4096, Queues: 2,
 		Hydration: &device.Progress{Phase: "rest", Hydrated: 4096, Total: 16384, Copied: 256 << 20},
 		Reclaim:   &cow.ReclaimStats{Pending: 7, Examined: 40, Chunks: 3, Bytes: 192 << 10}}
 	l, err := device.ListenStatus(filepath.Join(dir, "disk1.sock"), func() *device.Status { return st })
@@ -35,4 +35,10 @@ func TestStatusAndMetrics(t *testing.T) {
 	app, stdout, _ = newTestApp()
 	require.NoError(t, app.Run([]string{"blkmap", "metrics", "--run-dir", dir}))
 	assert.Contains(t, stdout.String(), `blkmap_up{device="disk1"} 1`)
+}
+
+func TestDescribeOverlay(t *testing.T) {
+	assert.Equal(t, "read-only, no cow file", describeOverlay(true, "", 0, 100))
+	assert.Equal(t, "read-only, 25/100 chunks hydrated to /var/lib/blkmap/x.cow (25%)", describeOverlay(true, "/var/lib/blkmap/x.cow", 25, 100))
+	assert.Equal(t, "25/100 chunks in the cow file (25%)", describeOverlay(false, "/var/lib/blkmap/x.cow", 25, 100))
 }

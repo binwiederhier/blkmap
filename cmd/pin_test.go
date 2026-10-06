@@ -50,3 +50,15 @@ func TestPin(t *testing.T) {
 	assert.Contains(t, err.Error(), "in use")
 	require.NoError(t, s.Close())
 }
+
+func TestPinReadOnlyWithoutCOW(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "ro.yml")
+	require.NoError(t, os.WriteFile(conf, []byte("read-only: true\ncow:\n  file: "+filepath.Join(dir, "ro.cow")+"\nsegments:\n  - type: zero\n    size: 1M\n"), 0600))
+	app, stdout, _ := newTestApp()
+	require.NoError(t, app.Run([]string{"blkmap", "pin", "--config", conf, "ro"}))
+	assert.Contains(t, stdout.String(), "no cow file")
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "only the config: pin creates nothing")
+}

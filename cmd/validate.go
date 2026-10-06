@@ -38,7 +38,11 @@ func execValidate(c *cli.Context) error {
 	}
 	fmt.Fprintf(c.App.Writer, "Device:  %s -> %s/%s\n", conf.ID, device.DevDir, conf.ID)
 	fmt.Fprintf(c.App.Writer, "Size:    %s (block size %d, %s)\n", util.FormatSize(src.Size()), conf.BlockSize, mode)
-	fmt.Fprintf(c.App.Writer, "COW:     %s (bitmap %s, chunk %s)\n", conf.COW.File, conf.COW.Bitmap, util.FormatSize(conf.COW.ChunkSize))
+	if conf.HasOverlay() {
+		fmt.Fprintf(c.App.Writer, "COW:     %s (bitmap %s, chunk %s)\n", conf.COW.File, conf.COW.Bitmap, util.FormatSize(conf.COW.ChunkSize))
+	} else {
+		fmt.Fprintln(c.App.Writer, "COW:     none (read-only, no hydration)")
+	}
 	if conf.Hydrate != nil {
 		line, err := describeHydrate(conf.Hydrate)
 		if err != nil {

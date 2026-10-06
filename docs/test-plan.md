@@ -65,7 +65,7 @@ device must appear as `/dev/blkmap/ID` before the command returns.
 | O1 | Writes persist across restart | write through the device, `systemctl restart`, read back | the written data is there; the base is untouched | e2e "blob survived restart" |
 | O2 | Filesystems | mkfs, mount, write files, fstrim, unmount, fsck, restart, mount again: ext4, xfs, btrfs | fsck clean, files intact, trim reclaims COW space | stress "filesystems" |
 | O3 | Discard and write-zeroes | `blkdiscard` a device with 64 MiB written | COW file allocation drops to about nothing; zeros read back | scenario `discard_reclaims_space` |
-| O4 | Read-only device | `read-only: true` | writes fail; `blockdev --getro` is 1 | scenario `read_only_device` |
+| O4 | Read-only device | `read-only: true` without `hydrate:`; a kill -9 and a reload | writes fail; `blockdev --getro` is 1; the content is the image's; no cow file, bitmap or live bitmap is created; `status` says "read-only, no cow file"; both restarts re-attach; `validate` shows no COW, `pin` has nothing to pin | scenario `read_only_device`, `TestStoreWithoutOverlay`, `TestOpenStoreReadOnlyWithoutCOWFile`, `TestOpenStoreNeedsACOWFileToChange`, `TestReadOnlyConfigWithoutHydrationHasNoOverlay`, `TestHasOverlay`, `TestDescribeOverlay`, `TestValidateReadOnlyWithoutCOW`, `TestPinReadOnlyWithoutCOW` |
 | O5 | 4 KiB logical blocks | `block-size: 4096` | `blockdev --getbsz`/`getss` report 4096; content matches | stress "4k block size" |
 | O6 | Huge device | `size: 8T` over a zero segment; write at the very end | the write reads back; bitmap about 16 MiB; server RSS reasonable | scenario `huge_device` |
 | O7 | Many devices at once | 12 devices started in parallel | all appear with the right content; all stop | scenario `many_devices` |

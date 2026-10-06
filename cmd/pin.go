@@ -26,6 +26,10 @@ func execPin(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	if !conf.HasOverlay() {
+		fmt.Fprintf(c.App.Writer, "%s is read-only without hydration: no cow file, nothing to pin\n", conf.ID)
+		return nil
+	}
 	base, err := source.FromConfig(conf)
 	if err != nil {
 		return err

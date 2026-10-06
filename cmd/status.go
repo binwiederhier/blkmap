@@ -77,6 +77,19 @@ func execMetrics(c *cli.Context) error {
 }
 
 // printStatus writes one device's status for people.
+// describeOverlay says what the device keeps locally, for serve's log and status.
+func describeOverlay(readOnly bool, cowFile string, written, chunks int64) string {
+	percent := 100 * written / max(chunks, 1)
+	switch {
+	case cowFile == "":
+		return "read-only, no cow file"
+	case readOnly: // only hydration writes the cow file: a local copy of the base
+		return fmt.Sprintf("read-only, %d/%d chunks hydrated to %s (%d%%)", written, chunks, cowFile, percent)
+	default:
+		return fmt.Sprintf("%d/%d chunks in the cow file (%d%%)", written, chunks, percent)
+	}
+}
+
 func printStatus(w io.Writer, st *device.Status) {
 	var notes []string
 	if st.Recovered {
@@ -86,7 +99,7 @@ func printStatus(w io.Writer, st *device.Status) {
 		notes = append(notes, "unflushed writes")
 	}
 	fmt.Fprintf(w, "%s  %s -> %s  pid %d, up %s\n", st.ID, st.Path, st.BlockPath, st.PID, time.Since(st.Started).Round(time.Second))
-	fmt.Fprintf(w, "  size %s, %d/%d chunks in the cow file (%d%%)", util.FormatSize(st.Size), st.Written, st.Chunks, 100*st.Written/max(st.Chunks, 1))
+	fmt.Fprintf(w, "  size %s, %s", util.FormatSize(st.Size), describeOverlay(st.ReadOnly, st.COWFile, st.Written, st.Chunks))
 	if len(notes) > 0 {
 		fmt.Fprintf(w, ", %s", strings.Join(notes, ", "))
 	}

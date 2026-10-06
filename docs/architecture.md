@@ -554,7 +554,8 @@ segments:
 ```
 
 ```yaml
-# a read-only view of a live block device, 4 KiB sectors
+# a read-only view of a live block device, 4 KiB sectors; no cow file, bitmap or live
+# bitmap: the store reads the base straight through (cow.Options.COWFile empty)
 block-size: 4096
 read-only: true
 segments:

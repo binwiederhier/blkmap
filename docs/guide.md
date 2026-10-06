@@ -33,7 +33,7 @@ Write `/etc/blkmap/<id>.yml`:
 ```yaml
 size: 10G             # optional; defaults to the end of the last segment
 block-size: 512       # 512 (default) or 4096
-read-only: false
+read-only: false      # true: writes fail; without hydrate: there is no cow file at all
 cow:
   file: /var/lib/blkmap/disk1.cow     # default; the bitmap is <file>.bitmap unless "bitmap:" says otherwise
   chunk-size: 64K                     # bitmap granularity

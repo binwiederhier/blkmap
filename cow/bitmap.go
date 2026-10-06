@@ -68,6 +68,14 @@ func OpenBitmap(path string, size, chunkSize int64) (*Bitmap, error) {
 	return OpenLiveBitmap(path, "", size, chunkSize)
 }
 
+// memoryBitmap is a bitmap without files, every chunk unwritten: a store without an overlay
+// reads everything from its base.
+func memoryBitmap(size, chunkSize int64) *Bitmap {
+	chunks := (size + chunkSize - 1) / chunkSize
+	words := (chunks + bitmapWordBits - 1) / bitmapWordBits
+	return &Bitmap{words: make([]uint32, words), chunks: chunks}
+}
+
 // OpenLiveBitmap is OpenBitmap with a live file at livePath (see Bitmap). A live file left
 // by a crashed predecessor with the same geometry is adopted; its bits are the predecessor's
 // memory, set and cleared alike, since every change reaches the live map before the file.

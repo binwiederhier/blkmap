@@ -114,6 +114,12 @@ func ValidID(id string) bool {
 }
 
 // checkAlignment rejects sizes and offsets the kernel could not address in whole blocks.
+// HasOverlay reports whether the device keeps a COW file: a read-only device that does not
+// hydrate stores nothing and has none.
+func (c *Config) HasOverlay() bool {
+	return !c.ReadOnly || c.Hydrate != nil
+}
+
 func (c *Config) checkAlignment() error {
 	bs := int64(c.BlockSize)
 	if c.Size%bs != 0 {

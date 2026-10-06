@@ -132,3 +132,13 @@ func TestValidateShowsMap(t *testing.T) {
 	require.NoError(t, app.Run([]string{"blkmap", "validate", path}))
 	assert.Regexp(t, `file `+img+` \(map: 2 extents, 192K data of 1M\)`, stdout.String())
 }
+
+func TestValidateReadOnlyWithoutCOW(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ro.yml")
+	require.NoError(t, os.WriteFile(path, []byte("read-only: true\nsegments:\n  - type: zero\n    size: 1M\n"), 0600))
+	app, stdout, _ := newTestApp()
+	require.NoError(t, app.Run([]string{"blkmap", "validate", path}))
+	assert.Contains(t, stdout.String(), "COW:     none (read-only, no hydration)")
+	assert.NotContains(t, stdout.String(), "ro.cow")
+}

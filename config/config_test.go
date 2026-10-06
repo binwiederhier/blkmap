@@ -369,3 +369,9 @@ func TestParseRecord(t *testing.T) {
 		assert.Error(t, err, bad)
 	}
 }
+
+func TestHasOverlay(t *testing.T) {
+	assert.True(t, (&Config{}).HasOverlay())
+	assert.False(t, (&Config{ReadOnly: true}).HasOverlay(), "read-only without hydration stores nothing")
+	assert.True(t, (&Config{ReadOnly: true, Hydrate: &Hydrate{Rest: true}}).HasOverlay(), "hydration copies the base into the COW file")
+}

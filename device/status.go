@@ -44,6 +44,8 @@ type Status struct {
 	PID            int                `json:"pid"`
 	Started        time.Time          `json:"started"`
 	Recovered      bool               `json:"recovered"` // this server re-attached to a running device
+	ReadOnly       bool               `json:"read_only"`
+	COWFile        string             `json:"cow_file,omitempty"` // empty: no overlay (read-only, no hydration)
 	Size           int64              `json:"size"`
 	ChunkSize      int64              `json:"chunk_size"`
 	Chunks         int64              `json:"chunks"`

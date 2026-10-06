@@ -2740,3 +2740,28 @@ func TestReclaimSelectionDoesNotRescanEmptySets(t *testing.T) {
 		assert.Less(t, s.scans, int64(words+64), "settled: words scanned for 64 candidates at word %d", at)
 	}
 }
+
+func TestStoreWithoutOverlay(t *testing.T) {
+	// No COW file: a read-only device reads its base through the store and keeps no state
+	dir := t.TempDir()
+	t.Chdir(dir)
+	base := &mem{data: pattern(testSize)}
+	s, err := OpenWith(base, &Options{ChunkSize: testChunk})
+	require.NoError(t, err)
+	assert.False(t, s.Overlay())
+	assert.Equal(t, pattern(testSize), readAll(t, s))
+	_, err = s.WriteAt([]byte{1}, 0)
+	assert.ErrorIs(t, err, ErrNoOverlay)
+	assert.ErrorIs(t, s.Discard(0, testChunk), ErrNoOverlay)
+	assert.ErrorIs(t, s.WriteZeroes(0, testChunk), ErrNoOverlay)
+	assert.Zero(t, s.Written())
+	assert.False(t, s.Dirty())
+	assert.NoError(t, s.Flush())
+	assert.True(t, s.Durable(0, testSize), "nothing to lose: the base is the content")
+	s.EnableReclaim() // nothing to reclaim; must not need files
+	assert.Zero(t, s.Reclaim(context.Background(), 10))
+	require.NoError(t, s.Close())
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "no file of any kind")
+}
