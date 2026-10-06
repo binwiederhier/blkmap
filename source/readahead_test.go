@@ -23,8 +23,7 @@ func TestReadAhead(t *testing.T) {
 	// Sequential continuation triggers read-ahead of the next blocks
 	_, err = r.ReadAt(p, 4196)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-	assert.GreaterOrEqual(t, len(inner.recorded()), 1+readAheadBlocks)
+	require.Eventually(t, func() bool { return len(inner.recorded()) >= 1+readAheadBlocks }, 5*time.Second, 5*time.Millisecond)
 	// The partial tail block and EOF semantics
 	tail := make([]byte, 200)
 	n, err := r.ReadAt(tail, 16*cacheBlockSize)
@@ -32,8 +31,14 @@ func TestReadAhead(t *testing.T) {
 	assert.ErrorIs(t, err, io.EOF)
 	assert.Equal(t, inner.data[16*cacheBlockSize:], tail[:100])
 	// Direct reads bypass the cache
-	time.Sleep(50 * time.Millisecond) // let the read-ahead settle before counting
+	// Let the read-ahead settle before counting: no new fetch for a while
 	before := len(inner.recorded())
+	for settled := 0; settled < 10; settled++ {
+		time.Sleep(5 * time.Millisecond)
+		if n := len(inner.recorded()); n != before {
+			before, settled = n, 0
+		}
+	}
 	_, err = ReadDirect(r, p, 100)
 	require.NoError(t, err)
 	assert.Equal(t, inner.data[100:4196], p)
