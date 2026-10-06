@@ -35,6 +35,10 @@ const (
 	// gone (older kernels check every 5 seconds).
 	recoverWait = 20 * time.Second
 	recoverPoll = 100 * time.Millisecond
+	// releaseWait bounds each half of Release: the queues finishing their requests, and
+	// the kernel taking the device over (a request stuck in a hung source must not block a
+	// handoff forever; the exit that follows ends it).
+	releaseWait = 30 * time.Second
 )
 
 const (
@@ -45,6 +49,9 @@ const (
 var (
 	// ErrReowned means the device id now belongs to another server, so nothing was deleted.
 	ErrReowned = errors.New("ublk device id reused by another server")
+	// ErrRecoveryBusy is returned by Recover when the kernel has not released the old
+	// server's device within recoverWait; trying again later may succeed.
+	ErrRecoveryBusy = errors.New("the old server's device is not released yet")
 )
 
 // Backend is the storage a device is served from. Reads must fill the whole buffer and
@@ -191,6 +198,9 @@ func Recover(id uint32, p *Params) (*Device, error) {
 			break
 		}
 		if !errors.Is(err, syscall.EBUSY) || time.Now().After(deadline) {
+			if errors.Is(err, syscall.EBUSY) {
+				return nil, fmt.Errorf("ublk device %d: start recovery: %w (%w)", id, ErrRecoveryBusy, err)
+			}
 			return nil, fmt.Errorf("ublk device %d: start recovery: %w", id, err)
 		}
 		time.Sleep(recoverPoll)
@@ -256,6 +266,37 @@ func (d *Device) Stop() error {
 	}
 	defer ctl.close()
 	return d.stop(ctl)
+}
+
+// Release hands the device back to the kernel for a successor, without STOP_DEV: the queues
+// finish and commit the requests they hold, their rings and the char device are closed, and
+// Release waits until the kernel holds new I/O for the next server (the device is quiesced).
+// A successor's Recover then starts at once, instead of depending on how soon the kernel
+// notices a dying process. Requires Params.Recovery; the process must not serve the device
+// any more afterwards.
+func (d *Device) Release() error {
+	done := make(chan error, 1)
+	go func() { done <- d.stop(nil) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+	case <-time.After(releaseWait):
+		return fmt.Errorf("ublk device %d: queues still busy after %s", d.ID, releaseWait)
+	}
+	for deadline := time.Now().Add(releaseWait); ; time.Sleep(recoverPoll) {
+		info, err := GetInfo(d.ID)
+		if err != nil {
+			return err
+		}
+		if info.Quiesced {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("ublk device %d: not quiesced %s after its release", d.ID, releaseWait)
+		}
+	}
 }
 
 // Done is closed when a queue loop died while the device was live. Such a device answers

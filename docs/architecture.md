@@ -194,9 +194,15 @@ doc  /dev/blkmap/doc -> /dev/ublkb0  pid 324131, up 2s
   size 1280M, 20480/20480 chunks in the cow file (100%), re-attached after a restart, unflushed writes
 ```
 
-`systemctl reload` is the same path: `Detach` hands the device over without flushing or
-waiting, the process re-executes the installed binary, and that binary re-attaches; package
-upgrades use it. If a server cannot come back, systemd gives up after 10 attempts in 60 s
+`systemctl reload` is the same path: `Detach` hands the device over without flushing, the
+process re-executes the installed binary, and that binary re-attaches; package upgrades use
+it. Before the exec `Detach` releases the device itself (`ublk.Device.Release`): the queues
+finish and commit what they hold, close their rings and the char device, and the kernel
+quiesces the device, so the successor does not depend on how soon the kernel notices the
+exec. A successor whose recovery the kernel refuses as busy keeps trying (logging each
+attempt) until it is stopped; it never deletes such a device, because its openers (a VM)
+wait for it and `DEL_DEV` would block on the requests the old server held (seen once in the
+Windows soak, 2026-10-06). Only a device whose config no longer matches is replaced. If a server cannot come back, systemd gives up after 10 attempts in 60 s
 and `blkmap-reap@<id>` runs `blkmap reap <id>`, which stops the waiting device so its I/O
 fails instead of hanging.
 

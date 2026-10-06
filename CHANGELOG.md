@@ -3,6 +3,20 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## v0.4.4 (2026-10-06)
+
+- **A reload can no longer hang a VM's disk.** In the 24 h Windows soak, a reload under SQL
+  Server load found the kernel still treating the old server as alive 20 s after the exec;
+  the new server then deleted the device (DEL_DEV blocked forever on the 21 writes the old
+  server held) and created a replacement nobody used, while QEMU kept the old one. Now
+  `Detach` releases the device before the exec (`ublk.Device.Release`: the queues finish
+  and commit what they hold, close their rings and char device, and wait for the kernel to
+  quiesce the device), and a successor whose recovery is refused as busy keeps retrying
+  instead of deleting the device (`ublk.ErrRecoveryBusy`). Only a device whose config no
+  longer matches is replaced.
+- Windows soak: the verify after a disruption is bounded (2 h), so a hang fails the check
+  instead of stopping the soak.
+
 ## v0.4.3 (2026-10-06)
 
 Fixes for the remaining findings (05-10) of the 2026-10-05 external review.

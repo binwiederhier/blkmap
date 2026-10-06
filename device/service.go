@@ -56,6 +56,11 @@ var (
 	// than mistaken for a predecessor to recover
 	served   = map[string]bool{}
 	servedMu sync.Mutex
+	// recoverDevice and deleteDevice reach the kernel for a predecessor; tests replace them
+	recoverDevice = ublk.Recover
+	deleteDevice  = ublk.Delete
+	// recoverRetry is the pause between recovery attempts the kernel refused as busy
+	recoverRetry = time.Second
 )
 
 // Options describes a device to serve from an arbitrary read-only base. This is the library
@@ -267,7 +272,7 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 	// The recording starts before the kernel device, so it includes the partition scan
 	rec := startRecording(o, b)
 	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, NumQueues: queuesFor(o.Base)}
-	dev, err := pred.recover(o.ID, params)
+	dev, err := pred.recover(ctx, o.ID, params)
 	recovered := dev != nil
 	if dev == nil && err == nil {
 		dev, err = ublk.Create(params)
@@ -487,20 +492,34 @@ func takeOver(o *Options, statePath string) (*predecessor, error) {
 
 // recover re-attaches to the predecessor; it returns nil without one. A predecessor that
 // cannot be taken over (the config changed) is deleted so its waiting I/O fails instead of
-// hanging, and the caller creates a fresh device.
-func (p *predecessor) recover(id string, params *ublk.Params) (*ublk.Device, error) {
+// hanging, and the caller creates a fresh device. One the kernel has not released yet is
+// retried until ctx ends: its openers (a VM) wait for it, a replacement would be useless to
+// them, and deleting it blocks forever on the requests the old server held. Given up, it is
+// left for the next server.
+func (p *predecessor) recover(ctx context.Context, id string, params *ublk.Params) (*ublk.Device, error) {
 	if !p.valid {
 		return nil, nil
 	}
-	dev, err := ublk.Recover(p.id, params)
-	if err == nil {
-		p.valid = false // the device is ours now: nothing left to drop
-		log.Printf("%s: re-attached to ublk device %d; I/O resumes", id, p.id)
-		return dev, nil
+	for attempt := 1; ; attempt++ {
+		dev, err := recoverDevice(p.id, params)
+		if err == nil {
+			p.valid = false // the device is ours now: nothing left to drop
+			log.Printf("%s: re-attached to ublk device %d; I/O resumes", id, p.id)
+			return dev, nil
+		}
+		if !errors.Is(err, ublk.ErrRecoveryBusy) {
+			log.Printf("%s: cannot re-attach to ublk device %d: %s; replacing it", id, p.id, err.Error())
+			p.drop(id)
+			return nil, nil
+		}
+		log.Printf("%s: ublk device %d is not released by its old server yet (attempt %d); waiting", id, p.id, attempt)
+		select {
+		case <-ctx.Done():
+			p.valid = false // never delete it: the next server tries again
+			return nil, fmt.Errorf("ublk device %d not released by its old server: %w", p.id, ctx.Err())
+		case <-time.After(recoverRetry):
+		}
 	}
-	log.Printf("%s: cannot re-attach to ublk device %d: %s; replacing it", id, p.id, err.Error())
-	p.drop(id)
-	return nil, nil
 }
 
 // drop deletes the predecessor, failing its waiting I/O, when it will not be recovered.
@@ -509,7 +528,7 @@ func (p *predecessor) drop(id string) {
 		return
 	}
 	p.valid = false
-	if err := ublk.Delete(p.id); err != nil && !errors.Is(err, syscall.ENODEV) {
+	if err := deleteDevice(p.id); err != nil && !errors.Is(err, syscall.ENODEV) {
 		log.Printf("%s: cannot delete ublk device %d: %s", id, p.id, err.Error())
 	}
 }
@@ -541,17 +560,22 @@ func (d *Device) Written() int64 {
 
 // Detach hands the device to a successor process; the caller must exit or re-execute at
 // once (with ExitDetached under systemd). The kernel device keeps waiting I/O until the next
-// Serve of the same ID re-attaches. Nothing is flushed and nothing is waited for: the COW
-// file's page cache and the live bitmap outlive the process, so every write served so far
-// is the successor's, and a flush could take minutes under load while the guest waits for
-// the successor. Background work is told to stop; the exit ends whatever is in flight.
+// Serve of the same ID re-attaches. Nothing is flushed: the COW file's page cache and the
+// live bitmap outlive the process, so every write served so far is the successor's, and a
+// flush could take minutes under load while the guest waits for the successor. Background
+// work is told to stop, and the device is released to the kernel (requests in flight are
+// finished first, see ublk.Device.Release), so the successor need not wait for the kernel
+// to notice this process is gone; a kernel that never noticed once hung a VM's disk.
 // Requires Options.Recovery.
 func (d *Device) Detach() error {
 	unmarkServed(d.id)
 	if d.stop != nil {
 		d.stop()
 	}
-	return nil
+	if d.ublk == nil { // not served yet
+		return nil
+	}
+	return d.ublk.Release()
 }
 
 // Status returns a snapshot of the device's state and counters.

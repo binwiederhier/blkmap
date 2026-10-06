@@ -69,8 +69,12 @@ check() {
     $ssh "/srv/win/bin/win-vm.sh kill $v; sleep 3; MEM=${GUEST_MEM:-4096} CPUS=3 /srv/win/bin/win-vm.sh $v $s /dev/blkmap/win-$v"
     sql_ready $v || { fail "$v after $why: SQL Server did not come back, not even after a power cycle"; return; }
   fi
-  if out=$("$sqlsoak" verify -addr "$host:$((11433 + s))" -acked "${acks[$v]:--1}" 2>&1); then
+  # Bounded: a disk that hangs must fail the check and let the soak go on (2026-10-06: a
+  # wedged handoff left verify waiting forever and stopped the whole soak)
+  if out=$(timeout 2h "$sqlsoak" verify -addr "$host:$((11433 + s))" -acked "${acks[$v]:--1}" 2>&1); then
     log "PASS $v after $why: $out"
+  elif [ $? = 124 ]; then
+    fail "$v after $why: verify did not finish in 2 h (the guest's disk hangs?) $out"
   else
     fail "$v after $why: $out"
   fi

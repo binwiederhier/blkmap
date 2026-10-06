@@ -793,3 +793,57 @@ func TestQueuesForSourceKind(t *testing.T) {
 	assert.Equal(t, 1, queuesFor(source.NewCache(local, remote)))
 	assert.Equal(t, 1, queuesFor(source.NewReadAhead(local)), "a read-ahead wrapper marks a remote source")
 }
+
+// fakePredecessorKernel replaces the kernel calls a predecessor makes; recover answers with
+// results in turn (the last one repeats) and deletes are counted.
+func fakePredecessorKernel(t *testing.T, results ...error) (deletes *atomic.Int32) {
+	deletes = &atomic.Int32{}
+	calls := 0
+	oldRecover, oldDelete, oldRetry := recoverDevice, deleteDevice, recoverRetry
+	recoverDevice = func(id uint32, _ *ublk.Params) (*ublk.Device, error) {
+		err := results[min(calls, len(results)-1)]
+		calls++
+		if err != nil {
+			return nil, err
+		}
+		return &ublk.Device{ID: id}, nil
+	}
+	deleteDevice = func(uint32) error { deletes.Add(1); return nil }
+	recoverRetry = time.Millisecond
+	t.Cleanup(func() { recoverDevice, deleteDevice, recoverRetry = oldRecover, oldDelete, oldRetry })
+	return deletes
+}
+
+func TestPredecessorKeepsTryingWhileTheKernelIsBusy(t *testing.T) {
+	// The kernel has not released the old server yet: retry, never delete a device whose
+	// opener (a VM) waits for it
+	busy := fmt.Errorf("start recovery: %w", ublk.ErrRecoveryBusy)
+	deletes := fakePredecessorKernel(t, busy, busy, busy, nil)
+	p := &predecessor{id: 3, valid: true}
+	dev, err := p.recover(context.Background(), "t", &ublk.Params{})
+	require.NoError(t, err)
+	require.NotNil(t, dev)
+	assert.EqualValues(t, 3, dev.ID)
+	assert.Zero(t, deletes.Load())
+}
+
+func TestPredecessorBusyUntilCancelledIsLeftForASuccessor(t *testing.T) {
+	deletes := fakePredecessorKernel(t, fmt.Errorf("start recovery: %w", ublk.ErrRecoveryBusy))
+	p := &predecessor{id: 3, valid: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	dev, err := p.recover(ctx, "t", &ublk.Params{})
+	assert.Error(t, err)
+	assert.Nil(t, dev)
+	p.drop("t") // what a failed start does with its predecessor
+	assert.Zero(t, deletes.Load(), "a device still waiting for recovery is never deleted")
+}
+
+func TestPredecessorWithAnotherConfigIsReplaced(t *testing.T) {
+	deletes := fakePredecessorKernel(t, errors.New("ublk device 3: size differs"))
+	p := &predecessor{id: 3, valid: true}
+	dev, err := p.recover(context.Background(), "t", &ublk.Params{})
+	require.NoError(t, err)
+	assert.Nil(t, dev, "the caller creates a fresh device")
+	assert.EqualValues(t, 1, deletes.Load())
+}

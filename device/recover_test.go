@@ -245,3 +245,29 @@ func TestServeReexecHandoff(t *testing.T) {
 	fmt.Sscanf(blockPath, "/dev/ublkb%d", &id)
 	ublk.Delete(id)
 }
+
+func TestDetachReleasesTheDevice(t *testing.T) {
+	// The handoff must not depend on how fast the kernel notices an exec: Detach releases
+	// the device itself, and the kernel holds its I/O for the successor
+	requireUblk(t)
+	dir := t.TempDir()
+	d, err := Serve(context.Background(), recoverOptions(t, dir, recoverSize))
+	require.NoError(t, err)
+	id := d.ublk.ID
+	f, err := os.OpenFile(d.BlockPath, os.O_RDWR|syscall.O_DIRECT, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	written := writeUnflushed(t, f, 0, 'd')
+	require.NoError(t, d.Detach())
+	info, err := ublk.GetInfo(id)
+	require.NoError(t, err)
+	assert.True(t, info.Quiesced, "the kernel holds I/O for a successor once Detach returns")
+	require.NoError(t, d.Abandon())
+	// A successor (here in the same process, as after an exec) takes it over
+	d, err = Serve(context.Background(), recoverOptions(t, dir, recoverSize))
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	assert.Equal(t, written, readBlock(t, f, 0))
+	require.NoError(t, f.Close())
+	require.NoError(t, d.Close())
+}

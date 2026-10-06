@@ -83,8 +83,8 @@ systemctl stop blkmap@disk1     # tear the device down (unmount first)
 blkmap reap disk1               # fail the I/O of a device whose server will not come back
 ```
 
-A reload makes everything durable and re-executes the installed binary in the same process,
-which re-attaches; package upgrades reload every running device, so the new binary takes
+A reload hands the device to the installed binary, re-executed in the same process, which
+re-attaches (the acknowledged writes travel in the page cache and the live bitmap); package upgrades reload every running device, so the new binary takes
 over without an unmount. If a server cannot come back (its origin stays down, say), systemd gives up after
 10 attempts in a minute and `blkmap-reap@<id>` stops the waiting device, so its I/O fails
 instead of hanging. A restart whose config no longer matches the device (another size, block
