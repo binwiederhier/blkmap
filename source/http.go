@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,7 +50,7 @@ type HTTP struct {
 // whole body) and learns the size from Content-Range, so HEAD is never needed.
 func NewHTTP(client *http.Client, url string, offset, size int64) (*HTTP, error) {
 	ctx, abort := context.WithCancel(context.Background())
-	h := &HTTP{client: client, url: url, name: redact(url), resource: resource(url), offset: offset, ctx: ctx, abort: abort}
+	h := &HTTP{client: client, url: url, name: safeURL(url), resource: resource(url), offset: offset, ctx: ctx, abort: abort}
 	total, err := h.probe()
 	if err != nil {
 		abort()
@@ -122,12 +123,12 @@ func (h *HTTP) probe() (int64, error) {
 func (h *HTTP) get(start, end int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(h.ctx, http.MethodGet, h.url, nil)
 	if err != nil {
-		return nil, err
+		return nil, safeErr(err)
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: range %d-%d: %w", h.name, start, end, err)
+		return nil, fmt.Errorf("%s: range %d-%d: %w", h.name, start, end, safeErr(err))
 	}
 	return resp, nil
 }
@@ -221,7 +222,8 @@ func parseContentRange(cr string) (start, end, total int64, err error) {
 	return start, end, total, nil
 }
 
-// redact hides the password of a URL with credentials.
+// safeURL names a URL for errors and logs: scheme, host and path, never credentials, query
+// or fragment, since a signed URL carries its access in the query.
 // resource names what a URL points at for identity purposes: scheme, host and path, without
 // credentials, query or fragment, so a signed URL or a rotated token stays the same resource.
 func resource(raw string) string {
@@ -232,10 +234,20 @@ func resource(raw string) string {
 	return u.Scheme + "://" + strings.ToLower(u.Host) + u.EscapedPath()
 }
 
-func redact(raw string) string {
+func safeURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return raw
+		return "(unparsable URL)"
 	}
-	return u.Redacted()
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}).String()
+}
+
+// safeErr strips credentials from the URL an *url.Error (what http.Client returns) carries;
+// the error is freshly returned to us, so rewriting it in place keeps the wrap chain.
+func safeErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL = safeURL(ue.URL)
+	}
+	return err
 }

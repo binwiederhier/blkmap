@@ -3,6 +3,32 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## v0.4.3 (2026-10-06)
+
+Fixes for the remaining findings (05-10) of the 2026-10-05 external review.
+
+- **Oversized maps are refused** (finding 05): a map fetched over HTTP was cut at 64 MiB
+  without notice, and the truncated prefix was accepted; extents after the cut read as zeros
+  (and hydration could record them). A map over the limit is now an error.
+- **A COW failure outlives its process** (finding 06): a failed COW fsync now removes the
+  live bitmap at once, not at Close, so a server that dies right after the failure leaves no
+  live bits for its successor to adopt; the successor starts from the last committed bitmap.
+- **Status polling no longer leaks sockets** (finding 07): each `device.QueryStatus` left its
+  connection idling in a transport nobody closed; a long-running poller grew by two
+  descriptors per query.
+- **Cheap reclaim selection** (finding 08): with nothing freshly written, each second-look
+  candidate cost two scans of every bitmap word (about 7 ms per chunk on an 8 TiB device).
+  An empty recent set is now skipped by count, and the due set is scanned from a cursor.
+- **Slow writes switch a queue to workers** (finding 09): only reads fed the parallel dispatch
+  decision, so a write-only stream of partial writes over a slow source stayed serialized.
+  Reads and writes now both count.
+- **No credentials in errors** (finding 10): map and HTTP errors carried the full URL, with
+  `user:password` and query tokens (signed URLs); they now name scheme, host and path only.
+- Test harness: the mirror crash replay compares writes by order (a resync copy lands after
+  a newer write), the fs crash replay accepts states the recording had fully hydrated, and
+  status/journal checks no longer pipe into `grep -q` under pipefail. Results:
+  docs/test-results/2026-10-06.md.
+
 ## v0.4.2 (2026-10-05)
 
 - **HTTP identity names the resource** (2026-10-05 external review, finding 03): two URLs can

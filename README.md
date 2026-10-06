@@ -69,11 +69,11 @@ replace the server without disturbing the device.
 ## Performance
 
 Requests from the kernel are served by one thread per ublk queue. While the backend answers
-in microseconds (a local file) that thread serves reads itself, because a handoff would cost
-more than the work; once the smoothed read service time passes 250 us (a network source) it
-hands reads to a worker pool, one backend call per queue slot, so up to the full queue depth
-of reads runs concurrently against the source. Writes, flushes and discards always run
-inline: they target the local COW file, where parallel read-modify-writes only contend. The
+in microseconds (a local file) that thread serves requests itself, because a handoff would
+cost more than the work; once the smoothed service time of reads and writes passes 250 us (a
+network source, or partial writes that copy their chunk from it) it hands reads and writes to
+a worker pool, one backend call per queue slot, so up to the full queue depth runs
+concurrently against the source. Flushes and discards always run inline. The
 store coalesces consecutive chunks in the same state, so a 1 MiB request over unwritten
 chunks is one base read, not sixteen, and hydration copies in 1 MiB runs. Each device gets a
 4 MiB kernel read-ahead window, and the HTTP source (and `source.NewReadAhead` for others)

@@ -216,11 +216,12 @@ Every tag starts with `FETCH_REQ`; a completion names the tag, the thread serves
 `COMMIT_AND_FETCH_REQ` returns the result and re-arms the tag. `-ENODEV` on a fetch means the
 kernel is aborting the queue.
 
-**Dispatch.** A queue serves requests inline on its own thread while the smoothed read
-service time is low; above 250 us it switches to parallel mode and hands reads and writes to
+**Dispatch.** A queue serves requests inline on its own thread while the smoothed service
+time of reads and writes is low (a first partial write reads its chunk from the base, so a
+slow source makes writes slow too); above 250 us it switches to parallel mode and hands reads and writes to
 depth worker goroutines (one backend call per tag), which post finished tags on an eventfd
-read through the same ring. It returns to inline only after 1,024 consecutive fast reads, so
-cache hits cannot flip it back and stall everything behind the next slow read. Flushes,
+read through the same ring. It returns to inline only after 1,024 consecutive fast data requests,
+so cache hits cannot flip it back and stall everything behind the next slow one. Flushes,
 discards and zeroing always run inline.
 
 **Safety.** A data request outside the device is refused with `EIO` before the backend sees

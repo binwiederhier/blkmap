@@ -433,6 +433,15 @@ func (b *Bitmap) CloseDropLive() error {
 	return errors.Join(b.releaseLive(true), b.f.Close())
 }
 
+// unlinkLive removes the live file while keeping its mapping: a successor started after a
+// crash must not adopt bits that no longer describe the cow file (see Store.fail). The
+// mapping stays valid for this process until releaseLive.
+func (b *Bitmap) unlinkLive() {
+	if b.live != nil {
+		os.Remove(b.livePath)
+	}
+}
+
 // releaseLive unmaps and closes the live file, removing it if remove is set.
 func (b *Bitmap) releaseLive(remove bool) error {
 	if b.live == nil {
@@ -443,7 +452,9 @@ func (b *Bitmap) releaseLive(remove bool) error {
 	b.words = words
 	errs := []error{unix.Munmap(b.liveMap), b.live.Close()}
 	if remove {
-		errs = append(errs, os.Remove(b.livePath))
+		if err := os.Remove(b.livePath); err != nil && !errors.Is(err, os.ErrNotExist) { // gone already after a failure
+			errs = append(errs, err)
+		}
 	}
 	b.live, b.liveMap = nil, nil
 	return errors.Join(errs...)

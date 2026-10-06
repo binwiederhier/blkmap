@@ -357,7 +357,8 @@ func TestHTTPRedactsCredentials(t *testing.T) {
 	_, err := NewHTTP(srv.Client(), url, 0, 0)
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "secret")
-	assert.Contains(t, err.Error(), "user:xxxxx@")
+	assert.NotContains(t, err.Error(), "user")
+	assert.Contains(t, err.Error(), strings.TrimPrefix(srv.URL, "http://"))
 }
 
 func TestHTTPDetectsOriginChange(t *testing.T) {
@@ -414,5 +415,22 @@ func TestHTTPVersionChange(t *testing.T) {
 			_, err = h.ReadAt(make([]byte, 512), 4<<20)
 			assert.Error(t, err, "blocks of a changed object were accepted")
 		})
+	}
+}
+
+// Finding 10 for the HTTP source itself: its errors name the resource without the password
+// or the query string (signed URLs carry their capability there).
+func TestHTTPErrorsHideCredentials(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	for name, u := range map[string]string{
+		"status":    strings.Replace(srv.URL, "http://", "http://alice:example-password@", 1) + "/img?token=example-token",
+		"transport": "http://alice:example-password@127.0.0.1:1/img?token=example-token",
+	} {
+		_, err := NewHTTP(srv.Client(), u, 0, 0)
+		require.Error(t, err, name)
+		assert.NotContains(t, err.Error(), "example-password", name)
+		assert.NotContains(t, err.Error(), "example-token", name)
 	}
 }

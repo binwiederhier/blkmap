@@ -113,8 +113,11 @@ check_fs() {
   systemctl stop blkmap@$chk; config $chk $w/chk/d.cow 0
   { systemctl start blkmap@$chk && wait_dev $chk; } || { echo "blkmap did not restart with hydration"; return; }
   config $chk $w/chk/d.cow
-  for _ in $(seq 1 300); do blkmap status $chk 2>/dev/null | grep -q 'hydration done' && break; sleep 0.1; done
-  blkmap status $chk 2>/dev/null | grep -q 'hydration done' || out="hydration did not finish; "
+  # Done, or a state the recording had fully hydrated already (a detached start runs no hydrator)
+  # A here-string, not a pipe: grep -q stopping early fails the pipe under pipefail (SIGPIPE)
+  hydrated() { grep -qE 'hydration done|chunks in the cow file \(100%\)' <<< "$(blkmap status $chk 2>/dev/null)"; }
+  for _ in $(seq 1 300); do hydrated && break; sleep 0.1; done
+  hydrated || out="hydration did not finish ($(blkmap status $chk 2>&1 | grep -iE 'hydrat|chunks|error' | tr '\n' ' ')); "
   [ "$(devsum)" = "$before" ] || out="${out}hydration changed what the device reads; "
   mount /dev/blkmap/$chk $w/g 2>/dev/null || { echo "${out}the guest filesystem does not mount"; return; }
   # The state of every file whose last change was made durable by mark ACK or earlier

@@ -278,7 +278,9 @@ func ListenStatus(path string, status func() *Status) (io.Closer, error) {
 // QueryStatus asks the server of device id for its status.
 func QueryStatus(runDir, id string) (*Status, error) {
 	path := filepath.Join(runDir, id+statusSocketExt)
-	client := &http.Client{Timeout: statusTimeout, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+	// One query per transport: without DisableKeepAlives the socket would idle in a pool
+	// nobody closes, leaking a socket pair per query in a process that polls
+	client := &http.Client{Timeout: statusTimeout, Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", path)
 	}}}

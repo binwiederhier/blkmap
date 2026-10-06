@@ -459,7 +459,7 @@ YML
   dd if=/dev/zero of=/dev/blkmap/sc-rec bs=4k count=1 seek=1280 oflag=direct status=none
   for i in $(seq 1 15); do logged sc-rec "$s" 'recording to .* ended' && break; sleep 1; done
   logged sc-rec "$s" 'recording to .* ended (max-duration reached)' || { bad record_then_prefetch "recording did not end at max-duration"; unit stop sc-rec; return; }
-  blkmap status sc-rec | grep -q 'recording done' || { bad record_then_prefetch "status does not show the finished recording"; unit stop sc-rec; return; }
+  grep -q 'recording done' <<< "$(blkmap status sc-rec)" || { bad record_then_prefetch "status does not show the finished recording"; unit stop sc-rec; return; }
   unit stop sc-rec
   blkmap recording compact /var/lib/blkmap/sc-rec.rec > $dir/sc-rec.prefetch || { bad record_then_prefetch "compaction failed"; return; }
   blkmap recording stats /var/lib/blkmap/sc-rec.rec | sed 's/^/    /'

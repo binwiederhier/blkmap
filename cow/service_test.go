@@ -2686,3 +2686,57 @@ func TestStoreRefusesAnotherResourceWithTheSameValidator(t *testing.T) {
 	require.NoError(t, err, "the original resource still opens")
 	require.NoError(t, s.Close())
 }
+
+// From the 2026-10-05 external review (finding 06): the live bitmap went only at Close or
+// Abandon, so a process that died between a failed COW sync and that cleanup left it behind,
+// and the successor adopted bits whose data the failed sync may have lost. It goes at once.
+func TestFailedCOWSyncDropsTheLiveBitmapAtOnce(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	o := &Options{COWFile: filepath.Join(dir, "d.cow"), Bitmap: filepath.Join(dir, "d.bitmap"), LiveBitmap: filepath.Join(dir, "d.live"), ChunkSize: testChunk}
+	s, err := OpenWith(&mem{data: pattern(testSize)}, o)
+	require.NoError(t, err)
+	_, err = s.WriteAt(bytes.Repeat([]byte{0x42}, testChunk), 0)
+	require.NoError(t, err)
+	s.syncCOW = func() error { return syscall.EIO }
+	require.ErrorIs(t, s.Flush(), ErrCOWFailed)
+	_, err = os.Stat(o.LiveBitmap)
+	assert.True(t, os.IsNotExist(err), "the live bitmap goes with the failure, not with a later cleanup")
+	s.abandon() // the process dies before Close or Abandon
+	s, err = OpenWith(&mem{data: pattern(testSize)}, o)
+	require.NoError(t, err)
+	defer s.Close()
+	assert.EqualValues(t, 0, s.Written(), "the successor must not adopt the failed generation's bits")
+	assert.Equal(t, pattern(testSize), readAll(t, s))
+}
+
+func TestReclaimSelectionDoesNotRescanEmptySets(t *testing.T) {
+	// A few second-pass candidates on a large device must not cost a scan of every bitmap word
+	// per candidate (the recent set being empty, and the due set from its start)
+	const words = 1 << 19 // 1 TiB of 64 KiB chunks
+	for _, at := range []int{0, words - 2} {
+		s := &Store{recent: make([]uint32, words), again: make([]uint32, words), due: make([]uint32, words)}
+		for chunk := range 64 {
+			require.True(t, s.record(s.again, int64(at)*bitmapWordBits+int64(chunk)))
+			s.againCount++
+		}
+		s.settle = time.Hour
+		_, _, ok := s.nextRecent() // refills due, which then settles
+		require.False(t, ok)
+		for range 10 {
+			_, _, ok = s.nextRecent()
+			require.False(t, ok)
+		}
+		assert.Less(t, s.scans, int64(16), "settling: words scanned")
+		s.scans, s.dueAt = 0, time.Now().Add(-2*time.Hour)
+		for chunk := range 64 {
+			got, second, ok := s.nextRecent()
+			require.True(t, ok)
+			require.True(t, second)
+			require.Equal(t, int64(at)*bitmapWordBits+int64(chunk), got)
+		}
+		_, _, ok = s.nextRecent()
+		require.False(t, ok)
+		assert.Less(t, s.scans, int64(words+64), "settled: words scanned for 64 candidates at word %d", at)
+	}
+}

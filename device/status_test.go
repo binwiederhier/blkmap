@@ -135,3 +135,24 @@ func captureLog(t *testing.T) *bytes.Buffer {
 	t.Cleanup(func() { log.SetOutput(prev) })
 	return &out
 }
+
+func TestQueryStatusReleasesConnections(t *testing.T) {
+	// Polling from a long-running process must not keep one socket pair per query alive
+	dir := t.TempDir()
+	server, err := ListenStatus(filepath.Join(dir, "poll"+statusSocketExt), func() *Status { return &Status{ID: "poll"} })
+	require.NoError(t, err)
+	t.Cleanup(func() { server.Close() })
+	fds := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		require.NoError(t, err)
+		return len(entries)
+	}
+	before := fds()
+	const polls = 40
+	for range polls {
+		_, err := QueryStatus(dir, "poll")
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool { return fds()-before < 4 }, 2*time.Second, 20*time.Millisecond,
+		"descriptors grew by %d over %d polls", fds()-before, polls)
+}

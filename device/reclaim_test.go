@@ -30,7 +30,8 @@ func TestSweeperReclaimsWhenIdle(t *testing.T) {
 		w.run(ctx)
 		close(done)
 	}()
-	require.Eventually(t, func() bool { return s.Written() == 1 }, 2*time.Second, 5*time.Millisecond, "the identical chunk is dropped, the different one kept")
+	// Reclaim counts what it examined when it returns, after the drop is visible
+	require.Eventually(t, func() bool { return s.Written() == 1 && s.ReclaimStats().Examined == 2 }, 2*time.Second, 5*time.Millisecond, "the identical chunk is dropped, the different one kept")
 	rs := s.ReclaimStats()
 	assert.Equal(t, int64(2), rs.Examined)
 	assert.Equal(t, int64(1), rs.Chunks)

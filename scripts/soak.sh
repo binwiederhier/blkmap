@@ -22,4 +22,4 @@ while sleep $(( minutes < 30 ? 60 : 600 )); do
   echo "--- $(date -u +%H:%M)"; echo "$out"
   grep -qE 'SOAK (OK|FAIL)' <<<"$out" && break
 done
-$ssh 'grep -E "SOAK (OK|FAIL)" /var/tmp/blkmap-soak/soak.log' | grep -q 'SOAK OK'
+grep -q 'SOAK OK' <<< "$($ssh 'grep -E "SOAK (OK|FAIL)" /var/tmp/blkmap-soak/soak.log')"

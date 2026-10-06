@@ -25,11 +25,11 @@ const (
 	userDataWake = ^uint64(0)
 	// Reads are served inline on the queue thread while the backend answers fast (a local
 	// file: a few microseconds, where a worker handoff would cost more than the work), and
-	// handed to workers once the smoothed read service time passes parallelAbove (a network
-	// source: milliseconds, where only concurrency fills the pipe). The queue returns to
-	// inline only after inlineAfter consecutive reads under fastRead: a mean would flip
-	// back on a run of cache hits and then stall every request behind the next slow read.
-	// Writes follow reads (a first partial write reads its chunk from the base); flushes
+	// handed to workers once the smoothed service time of reads and writes passes
+	// parallelAbove (a network source: milliseconds, where only concurrency fills the pipe;
+	// a first partial write reads its chunk from the base). The queue returns to inline only
+	// after inlineAfter consecutive data requests under fastRead: a mean would flip back on
+	// a run of cache hits and then stall every request behind the next slow one. Flushes
 	// and discards always run inline.
 	parallelAbove = 250 * time.Microsecond
 	fastRead      = 100 * time.Microsecond
@@ -69,7 +69,7 @@ type queue struct {
 	compMu    sync.Mutex  // Protects completed
 	service   int64       // smoothed backend read service time in nanoseconds (queue thread only)
 	fastRun   int         // consecutive reads under fastRead (queue thread only)
-	parallel  bool        // whether reads currently go to the workers (queue thread only)
+	parallel  bool        // whether data requests currently go to the workers (queue thread only)
 	shown     atomic.Bool // parallel, for Stats
 }
 
@@ -169,11 +169,7 @@ func (q *queue) run(ready chan<- error) {
 				q.work <- uint16(userData) // never blocks: at most depth tags are outstanding
 			default:
 				tag := uint16(userData)
-				start := time.Now()
-				res := q.serve(tag)
-				if q.op(tag) == opRead {
-					q.observe(time.Since(start))
-				}
+				res := q.serveInline(tag)
 				if err := q.prepare(cmdCommitAndFetchReq, tag, res); err != nil {
 					q.err = err
 				}
@@ -210,9 +206,7 @@ func (q *queue) commitCompleted() int {
 	q.compMu.Lock()
 	defer q.compMu.Unlock()
 	for _, tag := range q.completed {
-		if q.op(tag) == opRead {
-			q.observe(time.Duration(q.durations[tag]))
-		}
+		q.served(tag, time.Duration(q.durations[tag]))
 		if err := q.prepare(cmdCommitAndFetchReq, tag, q.results[tag]); err != nil {
 			q.err = err
 		}
@@ -220,6 +214,22 @@ func (q *queue) commitCompleted() int {
 	n := len(q.completed)
 	q.completed = q.completed[:0]
 	return n
+}
+
+// serveInline serves tag on the queue thread and feeds its service time to the dispatch mode.
+func (q *queue) serveInline(tag uint16) int32 {
+	start := time.Now()
+	res := q.serve(tag)
+	q.served(tag, time.Since(start))
+	return res
+}
+
+// served feeds the service time of a finished data request to the dispatch mode: a write
+// that copies its chunk from a slow base must switch the queue to workers as a read does.
+func (q *queue) served(tag uint16, d time.Duration) {
+	if isData(q.op(tag)) {
+		q.observe(d)
+	}
 }
 
 // observe folds one backend service time into the estimate and picks the dispatch mode.

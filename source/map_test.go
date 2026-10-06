@@ -211,3 +211,65 @@ func TestMapCovers(t *testing.T) {
 	assert.True(t, w.Present(100, 100))
 	assert.False(t, w.Present(200, 10))
 }
+
+// From the 2026-10-05 external review (finding 05): a map over the size limit was cut at the
+// limit and the valid prefix accepted as the whole map, so the extents past it read as
+// zeros. A map ending exactly at the limit is fine; one byte more is rejected.
+func TestLoadMapRejectsAnOversizedMap(t *testing.T) {
+	t.Parallel()
+	body := func(extra string) []byte {
+		head := []byte("0 512\n")
+		pad := maxMapBytes - len(head)
+		var b bytes.Buffer
+		b.Write(head)
+		for pad > 0 {
+			n := min(pad, 4096)
+			b.WriteString("#" + strings.Repeat("x", n-2) + "\n")
+			pad -= n
+		}
+		b.WriteString(extra)
+		return b.Bytes()
+	}
+	exact, over := body(""), body("4096 512\n")
+	require.Len(t, exact, maxMapBytes)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/over" {
+			w.Write(over)
+			return
+		}
+		w.Write(exact)
+	}))
+	t.Cleanup(srv.Close)
+	m, err := LoadMap(srv.URL + "/exact")
+	require.NoError(t, err, "a map of exactly the limit")
+	assert.True(t, m.Covers(0, 512))
+	_, err = LoadMap(srv.URL + "/over")
+	assert.Error(t, err, "a map over the limit must not be accepted truncated")
+}
+
+// From the 2026-10-05 external review (finding 10): errors carried the URL's password and
+// query tokens. Neither a status error, a parse error nor a transport error may.
+func TestLoadMapErrorsHideCredentials(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bad" {
+			w.Write([]byte("not a map\n"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	secret := func(base, path string) string {
+		return strings.Replace(base, "http://", "http://alice:example-password@", 1) + path + "?token=example-token"
+	}
+	for name, u := range map[string]string{
+		"status":    secret(srv.URL, "/map"),
+		"parse":     secret(srv.URL, "/bad"),
+		"transport": secret("http://127.0.0.1:1", "/map"),
+	} {
+		_, err := LoadMap(u)
+		require.Error(t, err, name)
+		assert.NotContains(t, err.Error(), "example-password", name)
+		assert.NotContains(t, err.Error(), "example-token", name)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestObserveLatchesParallelMode(t *testing.T) {
@@ -72,4 +73,28 @@ func TestDeviceStats(t *testing.T) {
 	}
 	d := &Device{queues: []*queue{slow, fast}}
 	assert.Equal(t, Stats{Queues: 2, Parallel: 1}, d.Stats())
+}
+
+// slowWrites is a backend whose writes wait for a slow base read, as a first partial write to
+// a network-backed store does.
+type slowWrites struct{ *mem }
+
+func (b slowWrites) WriteAt(p []byte, off int64) (int, error) {
+	time.Sleep(time.Millisecond)
+	return b.mem.WriteAt(p, off)
+}
+
+func TestSlowWritesActivateParallelMode(t *testing.T) {
+	q := fakeQueue(slowWrites{newMem(1 << 20)}, 1)
+	for range 2 { // from the start, and again after fast requests returned the queue to inline
+		for range 20 {
+			q.setDesc(0, opWrite, 8, 8)
+			require.Equal(t, int32(8*sectorSize), q.serveInline(0))
+		}
+		assert.True(t, q.parallel, "slow writes alone switch to the workers")
+		for range inlineAfter {
+			q.served(0, 5*time.Microsecond)
+		}
+		require.False(t, q.parallel)
+	}
 }

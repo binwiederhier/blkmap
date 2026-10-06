@@ -232,27 +232,7 @@ func verify(dir, base, journalPath string, upto int) error {
 	if err != nil {
 		return err
 	}
-	want := [2]map[int]int{{}, {}}
-	touched := map[int]bool{}
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Fields(line)
-		switch {
-		case len(f) == 4 && f[0] == "W":
-			slot, _ := strconv.Atoi(f[2])
-			touched[slot] = true
-		case len(f) == 5 && f[0] == "A":
-			k, _ := strconv.Atoi(f[1])
-			if k > upto {
-				continue
-			}
-			dev, _ := strconv.Atoi(f[2])
-			slot, _ := strconv.Atoi(f[3])
-			seq, _ := strconv.Atoi(f[4])
-			if old, ok := want[dev][slot]; !ok || seq > old {
-				want[dev][slot] = seq
-			}
-		}
-	}
+	j := parseJournal(string(data), upto)
 	b0, err := source.OpenFile(base, 0, 0)
 	if err != nil {
 		return err
@@ -279,13 +259,12 @@ func verify(dir, base, journalPath string, upto int) error {
 				return fmt.Errorf("read m%d slot %d: %w", dev, slot, err)
 			}
 			seq, recSlot, ok := decode(got)
-			w, acked := want[dev][slot]
 			switch {
 			case ok && recSlot != slot:
 				problems = append(problems, fmt.Sprintf("m%d slot %d holds slot %d's record", dev, slot, recSlot))
-			case acked && (!ok || seq < w):
-				problems = append(problems, fmt.Sprintf("m%d slot %d: acknowledged seq %d lost (valid %v, seq %d)", dev, slot, w, ok, seq))
-			case !touched[slot] && string(got) != string(baseData[slot*recordSize:(slot+1)*recordSize]):
+			case j.lost(dev, slot, seq, ok):
+				problems = append(problems, fmt.Sprintf("m%d slot %d: acknowledged seq %d lost (valid %v, seq %d)", dev, slot, j.wantSeq[dev][slot], ok, seq))
+			case !j.touched[slot] && string(got) != string(baseData[slot*recordSize:(slot+1)*recordSize]):
 				problems = append(problems, fmt.Sprintf("m%d slot %d: never written, no longer reads as the base", dev, slot))
 			}
 		}
@@ -293,7 +272,7 @@ func verify(dir, base, journalPath string, upto int) error {
 	if len(problems) > 0 {
 		return fmt.Errorf("%d problems:\n  %s", len(problems), strings.Join(problems[:min(10, len(problems))], "\n  "))
 	}
-	fmt.Printf("verified up to flush %d: %d and %d acknowledged slots\n", upto, len(want[0]), len(want[1]))
+	fmt.Printf("verified up to flush %d: %d and %d acknowledged slots\n", upto, len(j.want[0]), len(j.want[1]))
 	return nil
 }
 
@@ -331,4 +310,61 @@ func aligned() []byte {
 	b := make([]byte, 2*recordSize)
 	off := recordSize - int(uintptr(unsafe.Pointer(&b[0]))%recordSize)
 	return b[off : off+recordSize]
+}
+
+// journal is what a crash state must hold: per plex and slot, the last acknowledged write or
+// one issued after it. Order, not seq, decides: a resync copy carries an older seq than a
+// write it lands after.
+type journal struct {
+	want    [2]map[int]int    // slot -> journal position of the write the slot must hold, or a later one
+	wantSeq [2]map[int]int    // slot -> that write's seq, for messages
+	order   [2]map[[2]int]int // {slot, seq} -> journal position of its write to the plex
+	touched map[int]bool      // slots any plex was written
+}
+
+// parseJournal reads the writes and the acknowledgements of flushes up to upto.
+func parseJournal(data string, upto int) *journal {
+	j := &journal{want: [2]map[int]int{{}, {}}, wantSeq: [2]map[int]int{{}, {}}, order: [2]map[[2]int]int{{}, {}}, touched: map[int]bool{}}
+	for pos, line := range strings.Split(data, "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 4 && f[0] == "W":
+			dev, _ := strconv.Atoi(f[1])
+			slot, _ := strconv.Atoi(f[2])
+			seq, _ := strconv.Atoi(f[3])
+			j.order[dev][[2]int{slot, seq}] = pos
+			j.touched[slot] = true
+		case len(f) == 5 && f[0] == "A":
+			k, _ := strconv.Atoi(f[1])
+			if k > upto {
+				continue
+			}
+			dev, _ := strconv.Atoi(f[2])
+			slot, _ := strconv.Atoi(f[3])
+			seq, _ := strconv.Atoi(f[4])
+			if at := j.order[dev][[2]int{slot, seq}]; at >= j.want[dev][slot] {
+				j.want[dev][slot], j.wantSeq[dev][slot] = at, seq
+			}
+		}
+	}
+	return j
+}
+
+// lost reports whether a plex slot reading record seq (valid: ok) lost an acknowledged write.
+// A record the plex never got itself is its sibling's, read through its base (m1 over m0).
+func (j *journal) lost(dev, slot, seq int, ok bool) bool {
+	w, acked := j.want[dev][slot]
+	if !acked {
+		return false
+	}
+	if !ok {
+		return true
+	}
+	at, own := j.order[dev][[2]int{slot, seq}]
+	if !own {
+		if at, own = j.order[1-dev][[2]int{slot, seq}]; !own {
+			return true
+		}
+	}
+	return at < w
 }

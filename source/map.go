@@ -18,6 +18,10 @@ const (
 	maxMapBytes = 64 << 20
 )
 
+var (
+	errMapTooLarge = fmt.Errorf("map larger than %d bytes", maxMapBytes)
+)
+
 // Map is the data layout of a source: sorted, merged data extents; everything else reads as
 // zeros. It is how a source that cannot tell holes itself (an HTTP image, a custom source
 // fed by something that knows) gets them, so hydration never transfers zeros.
@@ -60,19 +64,23 @@ func ParseMap(r io.Reader) (*Map, error) {
 // LoadMap reads a map from a file path or an http(s) URL.
 func LoadMap(pathOrURL string) (*Map, error) {
 	var r io.ReadCloser
+	name := pathOrURL
 	if strings.HasPrefix(pathOrURL, mapURLPrefixHTTP) || strings.HasPrefix(pathOrURL, mapURLPrefixHTTPS) {
+		name = safeURL(pathOrURL) // never credentials or tokens in an error
 		resp, err := (&http.Client{Timeout: httpTimeout}).Get(pathOrURL)
 		if err != nil {
-			return nil, err
+			return nil, safeErr(err)
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			return nil, fmt.Errorf("%s: got %d %s", pathOrURL, resp.StatusCode, http.StatusText(resp.StatusCode))
+			return nil, fmt.Errorf("%s: got %d %s", name, resp.StatusCode, http.StatusText(resp.StatusCode))
 		}
+		// A body over the limit is an error, not an early end: a truncated map would drop
+		// extents, which then read as zeros
 		r = struct {
 			io.Reader
 			io.Closer
-		}{io.LimitReader(resp.Body, maxMapBytes), resp.Body}
+		}{&mapLimit{r: resp.Body, left: maxMapBytes}, resp.Body}
 	} else {
 		f, err := os.Open(pathOrURL)
 		if err != nil {
@@ -83,9 +91,30 @@ func LoadMap(pathOrURL string) (*Map, error) {
 	defer r.Close()
 	m, err := ParseMap(r)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", pathOrURL, err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	return m, nil
+}
+
+// mapLimit reads at most left bytes and fails, rather than ending, on any byte beyond them.
+type mapLimit struct {
+	r    io.Reader
+	left int64
+}
+
+func (l *mapLimit) Read(p []byte) (int, error) {
+	if l.left < 0 {
+		return 0, errMapTooLarge
+	}
+	if int64(len(p)) > l.left+1 {
+		p = p[:l.left+1] // one byte past the limit tells a larger body from one that fits
+	}
+	n, err := l.r.Read(p)
+	l.left -= int64(n)
+	if l.left < 0 {
+		return n + int(l.left), errMapTooLarge
+	}
+	return n, err
 }
 
 // Data returns the data extents within [off, off+length), clipped, ascending.

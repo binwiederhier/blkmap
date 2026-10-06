@@ -116,8 +116,11 @@ type Store struct {
 	// all three; Reclaim alone touches all but recent (see Reclaim).
 	recent, again, due   []uint32
 	recentCount          atomic.Int64
+	freshCount           atomic.Int64 // recent alone, so an empty one is skipped without a scan
 	againCount, dueCount int
 	recentNext           int64 // the chunk Reclaim scans from next
+	dueNext              int   // the due word Reclaim scans from next; due only shrinks until refilled
+	scans                int64 // set words visited by the selection, for tests
 	dueAt                time.Time
 	settle               time.Duration // reclaimSettle, shorter in tests
 	reclaimOn            atomic.Bool   // EnableReclaim was called; the sets exist
@@ -461,6 +464,9 @@ func (s *Store) Fail(err error) error {
 // fail stops the store for good and returns why.
 func (s *Store) fail(err error) error {
 	s.failOnce.Do(func() {
+		// First of all: a process that dies before its owner's cleanup must not leave a live
+		// bitmap whose bits the failed sync may have made untrue
+		s.bitmap.unlinkLive()
 		s.failErr = fmt.Errorf("%w: %w", ErrCOWFailed, err)
 		s.broken.Store(true)
 		close(s.failed)
@@ -610,8 +616,8 @@ func (s *Store) writeChunk(chunk int64, p []byte, off int64) error {
 // recordWrite notes for Reclaim that chunk's overlay content changed, or that a write repeated
 // it. Callers hold the chunk lock. One atomic or, so the write path stays allocation-free.
 func (s *Store) recordWrite(chunk int64) {
-	if s.reclaimOn.Load() {
-		s.record(s.recent, chunk)
+	if s.reclaimOn.Load() && s.record(s.recent, chunk) {
+		s.freshCount.Add(1)
 	}
 }
 
@@ -792,8 +798,12 @@ func (s *Store) Reclaim(ctx context.Context, budget int) int {
 // caller holds reclaimMu.
 func (s *Store) nextRecent() (chunk int64, second, ok bool) {
 	words := int64(len(s.recent))
+	if s.freshCount.Load() <= 0 {
+		words = -1 // nothing recorded; a bit set this instant is counted and taken next call
+	}
 	for n := int64(0); n <= words; n++ {
 		w := (s.recentNext/bitmapWordBits + n) % words
+		s.scans++
 		word := atomic.LoadUint32(&s.recent[w])
 		if n == 0 {
 			word &= ^uint32(0) << (s.recentNext % bitmapWordBits) // only chunks at or after the position
@@ -804,6 +814,7 @@ func (s *Store) nextRecent() (chunk int64, second, ok bool) {
 		bit := bits.TrailingZeros32(word)
 		atomic.AndUint32(&s.recent[w], ^(uint32(1) << bit))
 		s.recentCount.Add(-1)
+		s.freshCount.Add(-1)
 		chunk = w*bitmapWordBits + int64(bit)
 		s.recentNext = (chunk + 1) % (words * bitmapWordBits)
 		return chunk, false, true
@@ -868,12 +879,15 @@ func (s *Store) nextDue() (int64, bool) {
 			return 0, false
 		}
 		s.due, s.again, s.dueCount, s.againCount, s.dueAt = s.again, s.due, s.againCount, 0, time.Now()
+		s.dueNext = 0
 	}
 	if time.Since(s.dueAt) < s.settle {
 		return 0, false
 	}
-	for w := range s.due {
+	for w := s.dueNext; w < len(s.due); w++ {
+		s.scans++
 		if word := s.due[w]; word != 0 {
+			s.dueNext = w
 			bit := bits.TrailingZeros32(word)
 			s.due[w] &^= uint32(1) << bit
 			s.dueCount--
