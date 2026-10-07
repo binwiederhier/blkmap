@@ -256,9 +256,9 @@ sequenceDiagram
   Q-->>K: COMMIT n bytes
   end
   K->>Q: write tag (first write to a chunk)
-  Q->>S: WriteAt via backend; chunk lock
+  Q->>S: WriteAt via backend, chunk lock
   S->>R: copy-up: read the whole chunk
-  S->>F: write chunk; set bit (live map first)
+  S->>F: write chunk, set bit (live map first)
   Q-->>K: COMMIT n bytes
   K->>Q: flush
   S->>F: fdatasync data, then bitmap pages
