@@ -67,9 +67,12 @@ var (
 	// than mistaken for a predecessor to recover
 	served   = map[string]bool{}
 	servedMu sync.Mutex
-	// recoverDevice and deleteDevice reach the kernel for a predecessor; tests replace them
+	// recoverDevice and deleteDevice reach the kernel for a predecessor; tests replace them.
+	// A predecessor is deleted without waiting for its openers: a process may still hold
+	// its dead block device (a VM whose disk went away with the old server), and the wait,
+	// bounded by the control timeout, would be paid per device of a group
 	recoverDevice = ublk.Recover
-	deleteDevice  = ublk.Delete
+	deleteDevice  = ublk.DeleteAsync
 	// recoverRetry is the pause between recovery attempts the kernel refused as busy
 	recoverRetry = time.Second
 )
@@ -548,10 +551,10 @@ func takeOver(o *Options, statePath string) (*predecessor, error) {
 	case o.Recovery && (info.Quiesced || info.Live):
 		return &predecessor{id: id, valid: true}, nil
 	}
-	if err := ublk.Delete(id); err != nil && !errors.Is(err, syscall.ENODEV) {
+	if err := deleteDevice(id); err != nil && !errors.Is(err, syscall.ENODEV) {
 		log.Printf("%s: cannot delete stale ublk device %d: %s", o.ID, id, err.Error())
 	} else {
-		log.Printf("%s: deleted stale ublk device %d left by a previous server", o.ID, id)
+		log.Printf("%s: deleting stale ublk device %d left by a previous server", o.ID, id)
 	}
 	return &predecessor{}, nil
 }

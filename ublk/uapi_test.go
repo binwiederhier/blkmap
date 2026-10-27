@@ -17,6 +17,8 @@ func TestIoctlEncoding(t *testing.T) {
 	assert.Equal(t, uint32(0xc0107521), ioctl(cmdCommitAndFetchReq, uint32(unsafe.Sizeof(ioCmd{}))))
 	// The kernel matches UBLK_U_CMD_GET_FEATURES = _IOR('u', 0x13, ...) exactly
 	assert.Equal(t, uint32(0x80207513), ctrlIoctl(cmdGetFeatures))
+	// UBLK_U_CMD_DEL_DEV_ASYNC = _IOR('u', 0x14, ...)
+	assert.Equal(t, uint32(0x80207514), ctrlIoctl(cmdDelDevAsync))
 	assert.Equal(t, uint32(0xc0207504), ctrlIoctl(cmdAddDev))
 }
 

@@ -627,3 +627,13 @@ func TestDescriptorsCloseOnExec(t *testing.T) {
 func unsafePointer(b []byte) unsafe.Pointer {
 	return unsafe.Pointer(unsafe.SliceData(b))
 }
+
+// A kernel without DEL_DEV_ASYNC answers ENOTSUPP (not EOPNOTSUPP), older ones EINVAL;
+// both mean "fall back to the waiting delete", a real failure does not.
+func TestUnsupportedControlCommand(t *testing.T) {
+	assert.True(t, unsupported(fmt.Errorf("ublk control: %w", errNotSupp)))
+	assert.True(t, unsupported(syscall.EOPNOTSUPP))
+	assert.True(t, unsupported(syscall.EINVAL))
+	assert.False(t, unsupported(syscall.EBUSY))
+	assert.False(t, unsupported(syscall.ENODEV))
+}

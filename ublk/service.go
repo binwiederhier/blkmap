@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/bits"
 	"os"
 	"runtime"
@@ -53,6 +54,9 @@ var (
 	// any more (its commit was refused). STOP_DEV would wait for it forever, so the device is
 	// left to the process exit, which makes the kernel fail or requeue it.
 	ErrRequestLost = errors.New("a request of the device can never complete")
+	// errNotSupp is the kernel's ENOTSUPP (not EOPNOTSUPP), its answer to a control command
+	// it does not know.
+	errNotSupp = syscall.Errno(524)
 	// ErrRecoveryBusy is returned by Recover when the kernel has not released the old
 	// server's device within recoverWait; trying again later may succeed.
 	ErrRecoveryBusy = errors.New("the old server's device is not released yet")
@@ -586,6 +590,42 @@ func Delete(id uint32) error {
 		return err
 	}
 	return ctl.deleteDevice(id)
+}
+
+// DeleteAsync is Delete without the wait for the device's openers, for a dead predecessor
+// whose block device a process may still hold open (a VM whose disk died with the old
+// server): DEL_DEV waits for the last opener, run gives up after controlTimeout, and a
+// server that takes over several devices would spend that per device. Kernels since 6.11
+// delete asynchronously; the id stays taken until the last opener closes, which the
+// successor's own id handling already allows for. Older kernels get the waiting command on
+// a goroutine, which finishes when the opener does.
+func DeleteAsync(id uint32) error {
+	ctl, err := openControl()
+	if err != nil {
+		return err
+	}
+	defer ctl.close()
+	if err := ctl.stopDevice(id); err != nil && !errors.Is(err, syscall.ENODEV) {
+		return err
+	}
+	err = ctl.deleteDeviceAsync(id)
+	if err == nil || errors.Is(err, syscall.ENODEV) {
+		return nil
+	}
+	if !unsupported(err) {
+		return err
+	}
+	go func() {
+		if err := Delete(id); err != nil && !errors.Is(err, syscall.ENODEV) {
+			log.Printf("ublk device %d: delete (waiting for its openers): %s", id, err.Error())
+		}
+	}()
+	return nil
+}
+
+// unsupported reports whether the kernel answered a control command it does not know.
+func unsupported(err error) bool {
+	return errors.Is(err, errNotSupp) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL)
 }
 
 // openCloexec opens path read-write, closed on exec.

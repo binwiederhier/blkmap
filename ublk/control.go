@@ -147,6 +147,14 @@ func (c *control) deleteDevice(id uint32) error {
 	return c.run(cmdDelDev)
 }
 
+// deleteDeviceAsync is deleteDevice without the wait for the device's openers: the id
+// stays taken until the last of them closes. Kernels before 6.11 refuse the command (6.9
+// and 6.10 define it but never dispatch it, and answer ENOTSUPP).
+func (c *control) deleteDeviceAsync(id uint32) error {
+	c.cmd = ctrlCmd{DevID: id, QueueID: queueIDControl}
+	return c.run(cmdDelDevAsync)
+}
+
 // run submits c.cmd as command nr and waits for its completion. The control ring carries
 // one command at a time; a completion with another sequence number is a stale one from a
 // command that timed out and is skipped. After a timeout the control is poisoned, since

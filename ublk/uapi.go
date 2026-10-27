@@ -25,6 +25,7 @@ const (
 	cmdStartUserRecovery = 0x10
 	cmdEndUserRecovery   = 0x11
 	cmdGetFeatures       = 0x13
+	cmdDelDevAsync       = 0x14 // DEL_DEV that does not wait for the openers (dispatched since 6.11)
 	// I/O commands (nr of _IOWR('u', nr, 16)) on /dev/ublkcN
 	cmdFetchReq          = 0x20
 	cmdCommitAndFetchReq = 0x21
@@ -220,10 +221,10 @@ var (
 )
 
 // ctrlIoctl encodes control command nr. The kernel decodes most by number alone but
-// matches GET_FEATURES, a newer command, on its exact _IOR encoding.
+// matches GET_FEATURES and DEL_DEV_ASYNC, newer commands, on their exact _IOR encoding.
 func ctrlIoctl(nr uint32) uint32 {
 	op := ioctl(nr, uint32(unsafe.Sizeof(ctrlCmd{})))
-	if nr == cmdGetFeatures {
+	if nr == cmdGetFeatures || nr == cmdDelDevAsync {
 		op = op&^(ioctlDirRW<<ioctlDirShift) | ioctlDirR<<ioctlDirShift
 	}
 	return op
