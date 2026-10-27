@@ -90,6 +90,21 @@ over without an unmount. If a server cannot come back (its origin stays down, sa
 instead of hanging. A restart whose config no longer matches the device (another size, block
 size or read-only setting) replaces it with a fresh one; the old one's I/O fails.
 
+Pausing I/O while the server is down is a choice. With `recovery-fail-io: true` (kernel
+6.13+) the device still outlives its server and keeps its node, but I/O fails (EREMOTEIO) until
+the restarted server re-attaches, so no process ever waits in uninterruptible sleep for it; a
+VM's disk is best combined with the hypervisor's "stop on error" policy, which pauses the
+guest until the device is back.
+
+A server that is alive but stuck is worse than a dead one: the kernel fails the requests of a
+dead server, but never times out those of a privileged device, so a request stuck in a source
+would keep its reader in uninterruptible sleep for good. A request with the source for longer
+than the stall limit (60 s) fails the device, and the server exits for a fresh one, which
+gets the request reissued (a server without recovery fails it instead). It never stops such a
+device itself: STOP_DEV waits for the stuck request, and a server killed meanwhile could never
+exit. `blkmap@.service` also arms systemd's watchdog, which the server feeds only while every
+request completes in time, so a server too wedged to hand its device over is killed.
+
 ### Changed sources
 
 The COW file only makes sense over the content it was written over. blkmap records a
@@ -717,11 +732,18 @@ each other (the disks of a software RAID restored from a backup that kept only t
   copy of the base, for a device that was a scratch view of files. Writing back into the base
   itself changes its identity: discard the COW file and bitmap afterwards.
 
-`Group.Close` ends every device's I/O before it closes any store. Watch `Group.Done` like
+`Group.Close` ends every device's I/O before it closes any store; `Group.Halt` does only the
+first half, so a `Writeback` between the two copies a final overlay. Watch `Group.Done` like
 `Device.Done`: it closes when any device fails. After a store failure (`errors.Is(g.Err(),
 cow.ErrCOWFailed)`: a sync of a COW file failed and its unflushed writes may be gone) call
 `Group.Abandon` and exit; with `Recovery` set, the next `ServeGroup` re-attaches to the same
-kernel devices and serves the last flushed state.
+kernel devices and serves the last flushed state. A process that serves a group under
+systemd should feed the watchdog with `util.Watchdog(ctx, g.Healthy)`.
+
+Memory: every ublk queue holds `QueueDepth` request buffers of 1 MiB that the kernel copies
+through, so a device costs `Queues × QueueDepth` MiB once busy; the defaults (CPUs up to
+four, 64 deep) come to 256 MiB on a four-CPU host. `Options.Queues` and `Options.QueueDepth`
+size it for the source: one or two queues of 32 serve a local file well.
 
 ### A block device without the overlay
 

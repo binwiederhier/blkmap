@@ -3,6 +3,42 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
+## Unreleased
+
+- **A wedged source can no longer hang its openers for good.** The kernel never times out
+  the requests of a privileged ublk device, so a request stuck in a source kept every reader
+  in uninterruptible sleep until the server exited. Now a request with the source for longer
+  than `device.Options.StallLimit` (60 s by default) fails the device (`Done` fires with
+  `device.ErrStalled`) and `blkmap serve` hands it to a fresh server, which gets the request
+  reissued; without recovery the exit fails it. `Close` no longer issues STOP_DEV for a
+  device with a request that will not drain: STOP_DEV waits for it, and a server killed
+  meanwhile could never exit, wedging the device until a reboot. `blkmap serve` feeds
+  systemd's watchdog (`WatchdogSec=60` in `blkmap@.service`) only while the device is
+  healthy, so a server too wedged to hand it over is killed.
+- **A stopping device hands no new request to its base.** `cow.Store.Abort` now fails every
+  later base read at once (`cow.ErrAborted`), also for a source that ignores `Abort`: a read
+  arriving while `Close` drains would otherwise reach a hung source, be young enough for
+  STOP_DEV, and wedge it. `Close` waits up to 5 s for the requests in flight after the abort
+  and leaves the device to the process exit if one is still there.
+  `Device.Healthy`, `Group.Healthy`, `ublk.Device.OldestInflight` and `util.Watchdog` are new.
+- **A commit the kernel refused fails the device** (`ublk.ErrRequestLost`) instead of
+  silently leaving the request behind that tag uncompleted (its opener would have slept until
+  the server exited); it is handed over like a stalled one. A refused fetch still costs only
+  the tag.
+- **A dead predecessor is deleted without waiting for its openers.** A process that still
+  held the old server's block device (a VM whose disk died with it) made `takeOver` wait for
+  the control timeout, once per device of a group, longer than a start timeout. Kernels since
+  6.11 delete asynchronously (`DEL_DEV_ASYNC`); older ones wait on a goroutine.
+- **Queue count and depth are configurable** (`queues`, `queue-depth`; `device.Options.Queues`
+  and `QueueDepth`). The kernel copies every request through the per-tag buffers, so the
+  defaults cost up to 256 MiB per device on a four-CPU host; a local source does with less.
+- **`Device.Halt` and `Group.Halt`** end I/O without closing the stores, so a `Writeback`
+  after them copies a final overlay.
+- **Recovery that fails I/O** (`recovery-fail-io`, `device.Options.RecoveryFailIO`; kernel
+  6.13+): the device survives its server, keeps its node, and fails I/O (EREMOTEIO) while no
+  server is attached instead of holding it, so nothing waits in uninterruptible sleep for the
+  restart; the next server re-attaches and serves again, acknowledged writes preserved.
+
 ## v0.4.5 (2026-10-06)
 
 - **A read-only device without hydration has no COW file.** Nothing is ever stored on such
