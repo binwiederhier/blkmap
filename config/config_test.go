@@ -375,3 +375,15 @@ func TestHasOverlay(t *testing.T) {
 	assert.False(t, (&Config{ReadOnly: true}).HasOverlay(), "read-only without hydration stores nothing")
 	assert.True(t, (&Config{ReadOnly: true, Hydrate: &Hydrate{Rest: true}}).HasOverlay(), "hydration copies the base into the COW file")
 }
+
+func TestParseQueues(t *testing.T) {
+	c, err := Parse("q", []byte("queues: 2\nqueue-depth: 32\nsegments:\n  - type: zero\n    size: 1M\n"))
+	require.NoError(t, err)
+	assert.Equal(t, 2, c.Queues)
+	assert.Equal(t, 32, c.QueueDepth)
+	c, err = Parse("q", []byte("segments:\n  - type: zero\n    size: 1M\n"))
+	require.NoError(t, err)
+	assert.Zero(t, c.Queues, "unset keeps the transport's defaults")
+	_, err = Parse("q", []byte("queues: -1\nsegments:\n  - type: zero\n    size: 1M\n"))
+	require.Error(t, err)
+}

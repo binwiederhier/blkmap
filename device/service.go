@@ -116,6 +116,15 @@ type Options struct {
 	// with Recovery: the owner exits, or Abandons and exits. 0 is DefaultStallLimit, a
 	// negative value turns the check off. Checked every few seconds, so the reaction lags.
 	StallLimit time.Duration
+	// Queues is the number of ublk queues, each a thread with its own ring; QueueDepth how
+	// many requests each keeps in flight. Every queue holds QueueDepth request buffers of the
+	// maximum request size (1 MiB), which the kernel copies through, so a device costs
+	// Queues × QueueDepth MiB of memory once busy: the defaults (one queue for a source that
+	// reads the network, else CPUs up to four; 64 deep) come to 256 MiB on a four-CPU host.
+	// A local source rarely needs more than one or two queues of 32. A recovered device must
+	// match the depth it was created with. 0 keeps the defaults.
+	Queues     int
+	QueueDepth int
 }
 
 // Device is a running blkmap block device.
@@ -193,19 +202,21 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 		identity = source.Identity(base)
 	}
 	return Serve(ctx, &Options{
-		ID:        c.ID,
-		Base:      base,
-		COWFile:   cowFile,
-		Bitmap:    bitmap,
-		ChunkSize: c.COW.ChunkSize,
-		BlockSize: c.BlockSize,
-		ReadOnly:  c.ReadOnly,
-		DevDir:    devDir,
-		RunDir:    runDir,
-		Hydrate:   hydrate,
-		Record:    recordFromConfig(c.Record),
-		Identity:  identity,
-		Recovery:  true, // the systemd unit restarts the server
+		ID:         c.ID,
+		Base:       base,
+		COWFile:    cowFile,
+		Bitmap:     bitmap,
+		ChunkSize:  c.COW.ChunkSize,
+		BlockSize:  c.BlockSize,
+		ReadOnly:   c.ReadOnly,
+		DevDir:     devDir,
+		RunDir:     runDir,
+		Hydrate:    hydrate,
+		Record:     recordFromConfig(c.Record),
+		Identity:   identity,
+		Recovery:   true, // the systemd unit restarts the server
+		Queues:     c.Queues,
+		QueueDepth: c.QueueDepth,
 	})
 }
 
@@ -310,7 +321,11 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 	b := &backend{store: store, id: o.ID}
 	// The recording starts before the kernel device, so it includes the partition scan
 	rec := startRecording(o, b)
-	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, NumQueues: queuesFor(o.Base)}
+	queues := o.Queues
+	if queues == 0 {
+		queues = queuesFor(o.Base)
+	}
+	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, NumQueues: queues, QueueDepth: o.QueueDepth}
 	dev, err := pred.recover(ctx, o.ID, params)
 	recovered := dev != nil
 	if dev == nil && err == nil {
