@@ -94,15 +94,25 @@ func ServeGroup(ctx context.Context, opts []*Options) (*Group, error) {
 	return g, nil
 }
 
-// Close shuts the devices down: first every device's I/O ends (a derived base reads a
-// sibling's store, so no store may close while any device still serves), then the devices
-// close in reverse order of creation.
-func (g *Group) Close() error {
+// Halt ends every device's I/O without closing anything: background work stops, requests
+// in flight finish, the kernel devices stop and nothing is accepted any more, while the
+// stores stay open. A caller that writes the overlays back into a writable copy of the base
+// (Device.Writeback) halts first, so the copy is final, then closes. Idempotent; Close
+// halts too.
+func (g *Group) Halt() error {
 	g.closeOnce.Do(func() { close(g.closing) })
 	var errs []error
 	for _, id := range g.order {
 		errs = append(errs, g.Devices[id].halt())
 	}
+	return errors.Join(errs...)
+}
+
+// Close shuts the devices down: first every device's I/O ends (a derived base reads a
+// sibling's store, so no store may close while any device still serves), then the devices
+// close in reverse order of creation.
+func (g *Group) Close() error {
+	errs := []error{g.Halt()}
 	for i := len(g.order) - 1; i >= 0; i-- {
 		if d := g.Devices[g.order[i]]; d != nil {
 			errs = append(errs, d.Close())

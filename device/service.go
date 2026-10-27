@@ -812,6 +812,14 @@ func (d *Device) stopBackground() {
 	d.bg.Wait()
 }
 
+// Halt ends the device's I/O without closing anything: background work stops, reads blocked
+// in the source are aborted, and STOP_DEV drains what is in flight; the store stays open, so
+// Writeback afterwards copies a final overlay. Idempotent; Close halts too. A request that
+// does not drain is reported (ErrStalled) instead of stopped, see Close.
+func (d *Device) Halt() error {
+	return d.halt()
+}
+
 // halt ends the device's I/O without closing anything: background work stops, reads blocked in
 // the source are aborted, and STOP_DEV drains what is in flight. A group halts every device
 // before it closes any store, since a device's requests may land in a sibling's store.
