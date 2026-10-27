@@ -46,12 +46,23 @@ const (
 	// liveBitmapExt names the live bitmap in RunDir (<id>.bitmap, see cow.Bitmap).
 	liveBitmapExt   = ".bitmap"
 	ublkBlockPrefix = "/dev/ublkb"
+	// DefaultStallLimit is how long a request may be with the backend before the device is
+	// failed (see Options.StallLimit); generous next to any source, including a cold remote.
+	DefaultStallLimit = 60 * time.Second
+	// abortGrace is how long halt waits, after aborting the source, for the requests in
+	// flight to drain before it concludes one is stuck and leaves STOP_DEV alone
+	abortGrace = 5 * time.Second
+	// drainPoll is how often halt looks at the requests in flight meanwhile
+	drainPoll = 10 * time.Millisecond
 )
 
 var (
 	// ErrNoRecovery means a device cannot be handed to a successor: its kernel lacks ublk
 	// user recovery, or it was served without Options.Recovery.
 	ErrNoRecovery = errors.New("device served without recovery")
+	// ErrStalled means a request was with the backend for longer than Options.StallLimit,
+	// so the device was failed (see Device.Done).
+	ErrStalled = errors.New("request stalled")
 	// served holds the IDs this process serves, so a second Serve of one is refused rather
 	// than mistaken for a predecessor to recover
 	served   = map[string]bool{}
@@ -94,6 +105,14 @@ type Options struct {
 	// to be useful, see cow.Store.Reclaim. It contradicts Hydrate, which copies the base into
 	// the COW file: Serve refuses both.
 	Reclaim bool
+	// StallLimit bounds how long one request may be with the base before the device is
+	// failed (Done fires with ErrStalled). The kernel never times out the requests of a
+	// privileged ublk device, so a base that hangs would otherwise keep every opener in
+	// uninterruptible sleep for good. Close leaves such a device to the process exit (STOP_DEV
+	// would wait for the request), which fails its requests, or requeues them for a successor
+	// with Recovery: the owner exits, or Abandons and exits. 0 is DefaultStallLimit, a
+	// negative value turns the check off. Checked every few seconds, so the reaction lags.
+	StallLimit time.Duration
 }
 
 // Device is a running blkmap block device.
@@ -118,7 +137,8 @@ type Device struct {
 	failed    chan struct{} // closed when the kernel device or the store fails
 	status    io.Closer     // the status socket; nil if it could not be opened
 	readOnly  bool
-	cowFile   string // empty without an overlay
+	cowFile   string        // empty without an overlay
+	stall     time.Duration // Options.StallLimit after defaults; <= 0 is off
 }
 
 // Start opens the sources and COW store for c and serves them as a block device, publishing
@@ -300,7 +320,7 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 		return nil, fmt.Errorf("ublk: %w", err)
 	}
 	d := &Device{Path: filepath.Join(o.DevDir, o.ID), BlockPath: dev.BlockPath, statePath: statePath, store: store, ublk: dev,
-		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered, recovery: o.Recovery, readOnly: o.ReadOnly, cowFile: o.COWFile, failed: make(chan struct{})}
+		id: o.ID, base: o.Base, backend: b, recorder: rec, started: time.Now(), recovered: recovered, recovery: o.Recovery, readOnly: o.ReadOnly, cowFile: o.COWFile, stall: o.StallLimit, failed: make(chan struct{})}
 	if err := os.WriteFile(filepath.Join("/sys/block", filepath.Base(dev.BlockPath), "queue", "read_ahead_kb"), []byte(strconv.Itoa(readAheadKB)), 0); err != nil {
 		log.Printf("%s: cannot set read-ahead: %s", o.ID, err.Error())
 	}
@@ -421,6 +441,9 @@ func (o *Options) defaults() {
 	if o.RunDir == "" {
 		o.RunDir = RunDir
 	}
+	if o.StallLimit == 0 {
+		o.StallLimit = DefaultStallLimit
+	}
 }
 
 // Writeback commits the device's overlay into dst, see cow.Store.Writeback. It is for a
@@ -431,6 +454,7 @@ func (d *Device) Writeback(dst io.WriterAt) (int64, error) {
 
 // flushLoop makes completed writes durable every flushInterval, for guests that never
 // flush themselves; the bitmap is only ever written after the COW data (see cow.Store.Flush).
+// The same tick checks for a stalled request.
 func (d *Device) flushLoop(ctx context.Context) {
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
@@ -439,6 +463,7 @@ func (d *Device) flushLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			d.checkStall()
 			if d.store.Dirty() {
 				if err := d.store.Flush(); err != nil {
 					log.Printf("%s: periodic flush failed: %s", filepath.Base(d.Path), err.Error())
@@ -446,6 +471,31 @@ func (d *Device) flushLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// checkStall fails the device when a request has been with the base for longer than the
+// stall limit (see Options.StallLimit): Done fires and the owner exits, which makes the
+// kernel fail or requeue the stuck request, instead of keeping its opener in uninterruptible
+// sleep for as long as this process lives.
+func (d *Device) checkStall() {
+	if d.stall <= 0 {
+		return
+	}
+	if age := d.ublk.OldestInflight(); age > d.stall {
+		log.Printf("%s: a request has been with the source for %s (limit %s); failing the device", filepath.Base(d.Path), age.Round(time.Second), d.stall)
+		d.ublk.Fail(fmt.Errorf("%w: a request has been with the source for %s", ErrStalled, age.Round(time.Second)))
+	}
+}
+
+// Healthy reports whether the device still serves: it has not failed and no request has
+// been with the base for longer than the stall limit. A watchdog heartbeat asks it (see
+// util.Watchdog); a device that is not healthy should be handed over or closed, and a process
+// that cannot even do that is better killed, since only its death frees a wedged device.
+func (d *Device) Healthy() bool {
+	if d.Err() != nil {
+		return false
+	}
+	return d.stall <= 0 || d.ublk.OldestInflight() <= d.stall
 }
 
 // hydrateFromConfig turns the config block into a plan, reading the prefetch list.
@@ -682,7 +732,9 @@ func (d *Device) Abandon() error {
 // wait for them for as long as the source hangs), STOP_DEV drains in-flight I/O (the store
 // must still be open for that), the store flushes the COW file and then the bitmap and
 // closes, and only then DEL_DEV, which can wait for openers of the block device. A kill
-// during that wait finds everything already on disk.
+// during that wait finds everything already on disk. A request that does not drain once the
+// source is aborted (ErrStalled, ublk.ErrRequestLost) leaves the kernel device, its symlink
+// and state file alone: the store closes and the caller exits, which fails or requeues it.
 func (d *Device) Close() error {
 	if d.closed.Swap(true) {
 		return nil
@@ -696,6 +748,11 @@ func (d *Device) Close() error {
 	}
 	t0 := time.Now()
 	haltErr := d.halt()
+	if errors.Is(haltErr, ErrStalled) || errors.Is(haltErr, ublk.ErrRequestLost) {
+		// The kernel device stays, and with it the symlink and the state file: the process
+		// exit fails its I/O, or a successor recovers it
+		return errors.Join(haltErr, d.store.Close())
+	}
 	t1 := time.Now()
 	errs := []error{haltErr, d.store.Close()}
 	t2 := time.Now()
@@ -743,7 +800,29 @@ func (d *Device) stopBackground() {
 // Idempotent.
 func (d *Device) halt() error {
 	d.stopBackground()
+	// STOP_DEV waits in del_gendisk for every request in flight. One that never completes
+	// keeps it there, and a process killed meanwhile can never exit (its exit waits for the
+	// STOP_DEV), so the openers stay in uninterruptible sleep until a reboot. Without
+	// STOP_DEV, the process exit makes the kernel fail the requests, or hold them for a
+	// successor with recovery: such a device is left to the exit.
+	if err := d.Err(); errors.Is(err, ublk.ErrRequestLost) {
+		return err
+	}
+	if age := d.drain(); age >= abortGrace {
+		return fmt.Errorf("%w: a request (%s old) did not drain after the source was aborted; leaving the kernel device to the process exit", ErrStalled, age.Round(time.Second))
+	}
 	return d.ublk.Stop()
+}
+
+// drain waits up to abortGrace for the requests in flight to finish and returns the age of
+// the oldest one left, 0 when none is.
+func (d *Device) drain() time.Duration {
+	for deadline := time.Now().Add(abortGrace); ; time.Sleep(drainPoll) {
+		age := d.ublk.OldestInflight()
+		if age == 0 || time.Now().After(deadline) {
+			return age
+		}
+	}
 }
 
 // mountPoint returns where the block device is mounted, or "" if it is not.

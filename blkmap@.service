@@ -28,6 +28,11 @@ RestartForceExitStatus=75
 # Stopping tears down the kernel device; give in-flight I/O time to drain
 TimeoutStopSec=30
 KillSignal=SIGTERM
+# The server feeds the watchdog while every request completes within its stall limit (60 s).
+# A stalled request makes it hand the device to a successor itself; the watchdog kills a
+# server too wedged to do even that: the kernel requeues (or fails) the requests of a dead
+# server, never those of a stuck one
+WatchdogSec=60
 # Root is needed for /dev/ublk-control, but nothing else: no setuid, no home directories,
 # and the OOM killer should pick anything else first (I/O pauses until the restart)
 NoNewPrivileges=yes

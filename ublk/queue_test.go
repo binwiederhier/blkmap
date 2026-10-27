@@ -1,6 +1,7 @@
 package ublk
 
 import (
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -47,6 +48,44 @@ func fakeQueue(backend Backend, depth int) *queue {
 func (q *queue) setDesc(tag uint16, op uint32, startSector uint64, nrSectors uint32) {
 	d := (*ioDesc)(unsafe.Pointer(&q.descs[int(tag)*int(unsafe.Sizeof(ioDesc{}))]))
 	d.OpFlags, d.StartSector, d.NrSectors = op, startSector, nrSectors
+}
+
+func TestOldestInflight(t *testing.T) {
+	q := fakeQueue(newMem(1<<20), 4)
+	q.started, q.lastCmd = make([]int64, 4), make([]uint32, 4)
+	now := time.Now()
+	assert.Zero(t, q.oldestInflight(now.UnixNano()), "nothing dispatched")
+	q.dispatch(1)
+	q.dispatch(3)
+	q.started[3] = now.Add(-3 * time.Second).UnixNano()
+	assert.InDelta(t, 3*time.Second, q.oldestInflight(now.UnixNano()), float64(100*time.Millisecond))
+	q.finish(3)
+	assert.Less(t, q.oldestInflight(now.Add(time.Second).UnixNano()), 2*time.Second, "the younger one remains")
+	q.finish(1)
+	assert.Zero(t, q.oldestInflight(now.UnixNano()))
+}
+
+// A refused fetch only costs the tag; a refused commit leaves a request nobody can complete
+// and fails the device, except when the kernel is cancelling the queue itself.
+func TestCommandFailedFailsTheDeviceOnALostCommit(t *testing.T) {
+	q := fakeQueue(newMem(1<<20), 4)
+	q.lastCmd = make([]uint32, 4)
+	q.dev.failed = make(chan struct{})
+	q.lastCmd[0] = cmdFetchReq
+	q.commandFailed(0, syscall.EINVAL)
+	assert.NoError(t, q.dev.Err(), "a refused fetch has no request behind it")
+	q.lastCmd[1] = cmdCommitAndFetchReq
+	q.commandFailed(1, syscall.EIO)
+	assert.NoError(t, q.dev.Err(), "EIO: the kernel is cancelling the queue and fails the request itself")
+	q.commandFailed(1, syscall.EINVAL)
+	require.Error(t, q.dev.Err())
+	assert.ErrorIs(t, q.dev.Err(), syscall.EINVAL)
+	assert.ErrorIs(t, q.dev.Err(), ErrRequestLost, "the owner must know not to STOP_DEV it")
+	select {
+	case <-q.dev.Done():
+	default:
+		t.Fatal("Done is not closed")
+	}
 }
 
 func TestServeRejectsRequestsOutsideTheDevice(t *testing.T) {

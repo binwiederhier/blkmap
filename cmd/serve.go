@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/urfave/cli/v2"
 
 	"heckel.io/blkmap/cow"
 	"heckel.io/blkmap/device"
+	"heckel.io/blkmap/ublk"
 	"heckel.io/blkmap/util"
 )
 
@@ -37,10 +39,22 @@ func execServe(c *cli.Context) error {
 	defer stop()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
+	// Fed from the start, so a re-executed server keeps feeding it while it re-attaches; once
+	// serving, only while the device is healthy, and through the stop as well: a server too
+	// wedged to hand its device over is killed, and the kernel fails or requeues its requests
+	var served atomic.Pointer[device.Device]
+	healthy := func() bool {
+		d := served.Load()
+		return d == nil || d.Healthy()
+	}
+	watchdogCtx, stopWatchdog := context.WithCancel(context.Background())
+	defer stopWatchdog()
+	go util.Watchdog(watchdogCtx, healthy)
 	d, err := device.Start(ctx, conf, device.DevDir)
 	if err != nil {
 		return err
 	}
+	served.Store(d)
 	log.Printf("serving %s (%s): %s, %d segments, %s",
 		d.Path, d.BlockPath, util.FormatSize(d.Size()), len(conf.Segments), describeOverlay(conf.ReadOnly, d.COWFile(), d.Written(), d.Chunks()))
 	if _, err := util.SdNotify(util.NotifyReady); err != nil {
@@ -62,9 +76,11 @@ func execServe(c *cli.Context) error {
 		log.Printf("stopping %s", d.Path)
 	case <-d.Done():
 		failure = d.Err()
-		if errors.Is(failure, cow.ErrCOWFailed) {
-			// Writes the guest saw complete may be lost with the COW file's page cache: hand
-			// the device to a fresh server, which serves the last durable state
+		// Writes the guest saw complete may be lost with the COW file's page cache, or a
+		// request is stuck for good (STOP_DEV would wait for it forever): hand the device to
+		// a fresh server, which serves the last durable state and gets the stuck requests
+		// reissued. Without recovery, Close leaves a stuck device to the exit, which fails them.
+		if errors.Is(failure, cow.ErrCOWFailed) || errors.Is(failure, device.ErrStalled) || errors.Is(failure, ublk.ErrRequestLost) {
 			log.Printf("%s failed: %s; restarting from the last flushed state", d.Path, failure.Error())
 			if err := d.Abandon(); errors.Is(err, device.ErrNoRecovery) {
 				break

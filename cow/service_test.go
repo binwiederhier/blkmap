@@ -2765,3 +2765,42 @@ func TestStoreWithoutOverlay(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries, "no file of any kind")
 }
+
+// blocking is a base whose reads block until release closes, ignoring Abort.
+type blocking struct {
+	size    int64
+	release chan struct{}
+}
+
+func (b *blocking) ReadAt(p []byte, off int64) (int, error) {
+	<-b.release
+	return len(p), nil
+}
+
+func (b *blocking) Size() int64 {
+	return b.size
+}
+
+func (b *blocking) Close() error {
+	return nil
+}
+
+// After Abort no read reaches the base, even one that ignores Abort: a stopping device must
+// not hand a new request to a source that hangs.
+func TestAbortFailsBaseReadsOfABaseThatIgnoresIt(t *testing.T) {
+	base := &blocking{size: testSize, release: make(chan struct{})}
+	defer close(base.release)
+	s := newTestStore(t, t.TempDir(), base)
+	s.Abort()
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ReadAt(make([]byte, 4096), 0)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, ErrAborted)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a read after Abort reached the base")
+	}
+}

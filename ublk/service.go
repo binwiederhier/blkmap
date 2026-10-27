@@ -49,6 +49,10 @@ const (
 var (
 	// ErrReowned means the device id now belongs to another server, so nothing was deleted.
 	ErrReowned = errors.New("ublk device id reused by another server")
+	// ErrRequestLost means the kernel holds a request of the device that nothing can complete
+	// any more (its commit was refused). STOP_DEV would wait for it forever, so the device is
+	// left to the process exit, which makes the kernel fail or requeue it.
+	ErrRequestLost = errors.New("a request of the device can never complete")
 	// ErrRecoveryBusy is returned by Recover when the kernel has not released the old
 	// server's device within recoverWait; trying again later may succeed.
 	ErrRecoveryBusy = errors.New("the old server's device is not released yet")
@@ -305,6 +309,31 @@ func (d *Device) Done() <-chan struct{} {
 	return d.failed
 }
 
+// OldestInflight returns how long the oldest request still being served by the backend has
+// been there, or 0 when none is. The kernel never times out the requests of a privileged
+// ublk device, so a backend call that never returns keeps its opener in uninterruptible
+// sleep until this process exits; an owner polls this to notice and Fail the device.
+func (d *Device) OldestInflight() time.Duration {
+	now := time.Now().UnixNano()
+	var oldest time.Duration
+	for _, q := range d.queues {
+		oldest = max(oldest, q.oldestInflight(now))
+	}
+	return oldest
+}
+
+// Fail marks the device failed for an owner that found it wedged (see OldestInflight): Done
+// fires and Err returns err. Do not Stop a device with a stuck request: STOP_DEV waits for it,
+// and a process killed meanwhile never exits. The process exit is what makes the kernel fail
+// (or, with Recovery, requeue for a successor) the requests. Idempotent, and a no-op after the
+// device was stopped.
+func (d *Device) Fail(err error) {
+	if d.stopping.Load() {
+		return
+	}
+	d.fail(err)
+}
+
 // Err returns why the device failed, or nil.
 func (d *Device) Err() error {
 	select {
@@ -353,7 +382,6 @@ func (d *Device) stop(ctl *control) error {
 		q.join()
 		errs = append(errs, q.err, q.close())
 	}
-	d.queues = nil
 	if d.charFd >= 0 {
 		errs = append(errs, syscall.Close(d.charFd))
 		d.charFd = -1

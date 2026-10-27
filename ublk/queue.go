@@ -65,6 +65,8 @@ type queue struct {
 	workers   sync.WaitGroup
 	results   []int32     // per tag, written by the worker before posting the tag
 	durations []int64     // per tag, nanoseconds the backend call took
+	started   []int64     // per tag, unix nanoseconds since its request was handed to the backend; 0 while idle (atomic: OldestInflight reads it)
+	lastCmd   []uint32    // per tag, the command last prepared for it (queue thread only)
 	completed []uint16    // tags whose backend call finished, waiting for COMMIT
 	compMu    sync.Mutex  // Protects completed
 	service   int64       // smoothed backend read service time in nanoseconds (queue thread only)
@@ -80,7 +82,7 @@ func newQueue(d *Device, id uint16) (*queue, error) {
 	}
 	depth := d.params.QueueDepth
 	q := &queue{id: id, dev: d, fd: fd, efd: -1, cmds: make([]ioCmd, depth), done: make(chan struct{}),
-		work: make(chan uint16, depth), results: make([]int32, depth), durations: make([]int64, depth), completed: make([]uint16, 0, depth)}
+		work: make(chan uint16, depth), results: make([]int32, depth), durations: make([]int64, depth), started: make([]int64, depth), lastCmd: make([]uint32, depth), completed: make([]uint16, 0, depth)}
 	if q.ring, err = newRing(uint32(depth+1), fd); err != nil { // +1 for the eventfd read
 		q.close()
 		return nil, err
@@ -161,15 +163,16 @@ func (q *queue) run(ready chan<- error) {
 			case res == resultAbort: // the kernel is aborting the queue (device stopping)
 				aborted = true
 			case res < 0:
-				// A failed FETCH/COMMIT for one tag: that tag is dead, the others keep
-				// serving. Exiting here instead would wedge every request on this queue.
-				log.Printf("ublk queue %d tag %d: command failed: %s", q.id, userData, syscall.Errno(-res).Error())
+				q.commandFailed(uint16(userData), syscall.Errno(-res))
 			case q.parallel && isData(q.op(uint16(userData))):
 				busy++
+				q.dispatch(uint16(userData))
 				q.work <- uint16(userData) // never blocks: at most depth tags are outstanding
 			default:
 				tag := uint16(userData)
+				q.dispatch(tag)
 				res := q.serveInline(tag)
+				q.finish(tag)
 				if err := q.prepare(cmdCommitAndFetchReq, tag, res); err != nil {
 					q.err = err
 				}
@@ -207,6 +210,7 @@ func (q *queue) commitCompleted() int {
 	defer q.compMu.Unlock()
 	for _, tag := range q.completed {
 		q.served(tag, time.Duration(q.durations[tag]))
+		q.finish(tag)
 		if err := q.prepare(cmdCommitAndFetchReq, tag, q.results[tag]); err != nil {
 			q.err = err
 		}
@@ -214,6 +218,49 @@ func (q *queue) commitCompleted() int {
 	n := len(q.completed)
 	q.completed = q.completed[:0]
 	return n
+}
+
+// commandFailed handles a FETCH or COMMIT_AND_FETCH the kernel refused for one tag. A refused
+// fetch costs the tag and nothing else: the others keep serving, where exiting the loop would
+// wedge every request on the queue. A refused commit is worse: the request behind the tag stays
+// owned by this server, nothing will ever complete it, and its opener sleeps uninterruptibly
+// until this process exits (the kernel never times out a privileged device's requests). That
+// fails the device with ErrRequestLost: STOP_DEV would wait for the request forever, so the
+// owner leaves the device to the process exit, which fails or requeues it. EIO and ENODEV mean
+// the kernel is cancelling the queue itself and will fail the request on its own; they cost
+// the tag only.
+func (q *queue) commandFailed(tag uint16, errno syscall.Errno) {
+	if q.lastCmd[tag] != cmdCommitAndFetchReq || errno == syscall.EIO || errno == syscall.ENODEV {
+		log.Printf("ublk queue %d tag %d: command failed: %s; the tag is out of service", q.id, tag, errno.Error())
+		return
+	}
+	log.Printf("ublk queue %d tag %d: commit failed: %s; its request can never complete, failing the device", q.id, tag, errno.Error())
+	q.dev.fail(fmt.Errorf("queue %d tag %d: commit failed: %w (%w)", q.id, tag, ErrRequestLost, errno))
+}
+
+// dispatch notes that tag's request is now with the backend, for OldestInflight.
+func (q *queue) dispatch(tag uint16) {
+	atomic.StoreInt64(&q.started[tag], time.Now().UnixNano())
+}
+
+// finish notes that tag's backend call returned.
+func (q *queue) finish(tag uint16) {
+	atomic.StoreInt64(&q.started[tag], 0)
+}
+
+// oldestInflight returns how long the oldest request still with the backend has been there,
+// or 0 when none is. Any goroutine may call it.
+func (q *queue) oldestInflight(now int64) time.Duration {
+	var oldest int64
+	for tag := range q.started {
+		if since := atomic.LoadInt64(&q.started[tag]); since != 0 && (oldest == 0 || since < oldest) {
+			oldest = since
+		}
+	}
+	if oldest == 0 {
+		return 0
+	}
+	return time.Duration(now - oldest)
 }
 
 // serveInline serves tag on the queue thread and feeds its service time to the dispatch mode.
@@ -329,6 +376,7 @@ func (q *queue) prepare(nr uint32, tag uint16, res int32) error {
 	c.Tag = tag
 	c.Result = res
 	c.Addr = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(q.buf(tag)))))
+	q.lastCmd[tag] = nr
 	return q.ring.prepare(ioctl(nr, uint32(unsafe.Sizeof(*c))), uint64(tag), unsafe.Pointer(c), unsafe.Sizeof(*c))
 }
 

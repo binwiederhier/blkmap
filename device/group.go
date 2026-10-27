@@ -118,6 +118,16 @@ func (g *Group) Done() <-chan struct{} {
 	return g.failed
 }
 
+// Healthy reports whether every device of the group is (see Device.Healthy).
+func (g *Group) Healthy() bool {
+	for _, id := range g.order {
+		if !g.Devices[id].Healthy() {
+			return false
+		}
+	}
+	return true
+}
+
 // Err returns the first device failure, or nil.
 func (g *Group) Err() error {
 	for _, id := range g.order {

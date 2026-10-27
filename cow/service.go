@@ -33,6 +33,8 @@ const (
 )
 
 var (
+	// ErrAborted is returned for base reads after Store.Abort.
+	ErrAborted    = errors.New("base reads aborted")
 	errOutOfRange = errors.New("range beyond device end")
 	// ErrNoOverlay is what a store without a COW file (see Options.COWFile) answers to
 	// anything that would change the device.
@@ -81,6 +83,7 @@ type Store struct {
 	chunkSize   int64
 	size        int64
 	dirty       atomic.Bool  // something changed since the last Flush
+	aborted     atomic.Bool  // Abort was called: base reads fail at once
 	nopwrite    atomic.Bool  // drop writes whose bytes equal what the device already reads there
 	bufs        sync.Pool    // chunk-sized scratch buffers for read-modify-write
 	runBufs     sync.Pool    // MaxRunBytes buffers for hydration runs
@@ -248,6 +251,9 @@ func (s *Store) SourceStats() SourceStats {
 
 // readBase reads from the base source, counting the read.
 func (s *Store) readBase(p []byte, off int64) (int, error) {
+	if s.aborted.Load() {
+		return 0, ErrAborted
+	}
 	start := time.Now()
 	n, err := s.base.ReadAt(p, off)
 	s.countBase(n, err, start)
@@ -256,6 +262,9 @@ func (s *Store) readBase(p []byte, off int64) (int, error) {
 
 // readBaseDirect is readBase bypassing cache tiers (source.ReadDirect).
 func (s *Store) readBaseDirect(p []byte, off int64) (int, error) {
+	if s.aborted.Load() {
+		return 0, ErrAborted
+	}
 	start := time.Now()
 	n, err := source.ReadDirect(s.base, p, off)
 	s.countBase(n, err, start)
@@ -385,9 +394,11 @@ func (s *Store) Size() int64 {
 	return s.size
 }
 
-// Abort makes blocked and future base reads fail at once, if the base supports it, so a
-// stopping device never waits on a hung source.
+// Abort makes future base reads fail at once (ErrAborted), and blocked ones too if the base
+// supports it, so a stopping device never hands a new request to a hung source, even one that
+// ignores Abort.
 func (s *Store) Abort() {
+	s.aborted.Store(true)
 	source.Abort(s.base)
 }
 
@@ -1052,6 +1063,9 @@ func (s *Store) baseIsZero(start, length int64) bool {
 	scratch := s.bufs.Get().(*[]byte)
 	defer s.bufs.Put(scratch)
 	buf := (*scratch)[:length]
+	if s.aborted.Load() {
+		return false
+	}
 	if _, err := s.base.ReadAt(buf, start); err != nil && !errors.Is(err, io.EOF) {
 		return false
 	}

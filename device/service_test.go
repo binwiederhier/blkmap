@@ -674,6 +674,155 @@ func TestCloseAbortsHungBase(t *testing.T) {
 	assert.Error(t, <-readDone)
 }
 
+// stuck is a base whose reads in the middle half block until the test releases them,
+// ignoring Abort: a deadlocked custom source, or a file source on a hung filesystem.
+type stuck struct {
+	hung
+}
+
+func (s *stuck) Abort() {
+	// Ignored on purpose: that is what makes it stuck
+}
+
+// A request stuck in a source that ignores Abort fails the device, and Close must then leave
+// the kernel device alone: STOP_DEV would wait in del_gendisk for that request, and a process
+// that dies while it waits can never exit, wedging its openers until a reboot.
+func TestCloseLeavesAStalledDeviceToTheProcessExit(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	base := &stuck{hung{size: 8 << 20, release: make(chan struct{})}}
+	d, err := Serve(context.Background(), &Options{ID: "t-stall", Base: base, COWFile: filepath.Join(dir, "c.cow"),
+		DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run"), StallLimit: time.Second})
+	require.NoError(t, err)
+	// The reader is another process: a reader thread of this one stuck in D would keep it from
+	// ever exiting if the test fails
+	reader := exec.Command("dd", "if="+d.BlockPath, "of=/dev/null", "bs=4k", "count=1", "skip=1024", "iflag=direct")
+	require.NoError(t, reader.Start())
+	readDone := make(chan error, 1)
+	go func() { readDone <- reader.Wait() }()
+	select {
+	case <-d.Done():
+	case <-time.After(3 * flushInterval):
+		base.once.Do(func() { close(base.release) })
+		t.Fatal("the stalled request did not fail the device")
+	}
+	require.ErrorIs(t, d.Err(), ErrStalled)
+	assert.False(t, d.Healthy())
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	select {
+	case err := <-closed:
+		assert.ErrorIs(t, err, ErrStalled)
+	case <-time.After(abortGrace + 10*time.Second):
+		base.once.Do(func() { close(base.release) }) // lets STOP_DEV finish, so the kernel survives the failure
+		t.Fatal("Close issued STOP_DEV behind the stuck request")
+	}
+	_, err = os.Stat(d.BlockPath)
+	assert.NoError(t, err, "the kernel device is left for the process exit")
+	// The source answers again: the read completes and the device can be stopped
+	base.once.Do(func() { close(base.release) })
+	assert.Error(t, <-readDone)
+	require.NoError(t, d.ublk.Close())
+}
+
+// gated is a base that answers zeros, except that a read overlapping slowOff blocks until
+// slow closes and one overlapping lateOff until late closes, both ignoring Abort.
+type gated struct {
+	size       int64
+	slow, late chan struct{}
+}
+
+const (
+	slowOff = 32 << 20
+	lateOff = 48 << 20
+)
+
+func (g *gated) ReadAt(p []byte, off int64) (int, error) {
+	overlaps := func(at int64) bool {
+		return off <= at && at < off+int64(len(p))
+	}
+	switch {
+	case overlaps(slowOff):
+		<-g.slow
+	case overlaps(lateOff):
+		<-g.late
+	default:
+		clear(p)
+		return len(p), nil
+	}
+	return 0, errors.New("released")
+}
+
+func (g *gated) Size() int64 {
+	return g.size
+}
+
+func (g *gated) Close() error {
+	return nil
+}
+
+// A stop (systemctl stop, not a detected stall) while a slow request drains: a request that
+// arrives meanwhile must not reach a source that hangs and ignores Abort, or it is young
+// enough at the end of the drain for STOP_DEV, which then waits for it forever.
+func TestCloseHandsNoNewRequestToAHungSource(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	base := &gated{size: 64 << 20, slow: make(chan struct{}), late: make(chan struct{})}
+	var releaseLate sync.Once
+	defer releaseLate.Do(func() { close(base.late) })
+	d, err := Serve(context.Background(), &Options{ID: "t-gate", Base: base, COWFile: filepath.Join(dir, "c.cow"),
+		DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run")})
+	require.NoError(t, err)
+	exec.Command("udevadm", "settle").Run() // udev's probe reads first, so only ours reach the gates
+	// The readers are other processes: a reader thread of this one stuck in D would keep it
+	// from ever exiting if the test fails
+	read := func(off int64) <-chan error {
+		done := make(chan error, 1)
+		cmd := exec.Command("dd", "if="+d.BlockPath, "of=/dev/null", "bs=4k", "count=1", fmt.Sprintf("skip=%d", off/4096), "iflag=direct")
+		require.NoError(t, cmd.Start())
+		go func() { done <- cmd.Wait() }()
+		return done
+	}
+	slow := read(slowOff)
+	time.Sleep(300 * time.Millisecond)
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	time.Sleep(time.Second)
+	late := read(lateOff) // arrives while Close drains the slow one
+	time.Sleep(time.Second)
+	close(base.slow) // the slow one finishes within the grace
+	select {
+	case err := <-closed:
+		assert.NoError(t, err, "nothing was stuck: the device stops normally")
+	case <-time.After(abortGrace + 15*time.Second):
+		releaseLate.Do(func() { close(base.late) }) // lets STOP_DEV finish, so the kernel survives the failure
+		t.Fatal("Close issued STOP_DEV behind the late request")
+	}
+	assert.Error(t, <-slow)
+	assert.Error(t, <-late)
+}
+
+// A device holding a request whose commit the kernel refused is left alone by Close as well.
+func TestCloseLeavesADeviceWithALostRequestToTheProcessExit(t *testing.T) {
+	requireUblk(t)
+	dir := t.TempDir()
+	d, err := Serve(context.Background(), &Options{ID: "t-lost", Base: source.NewZero(1 << 20), COWFile: filepath.Join(dir, "c.cow"),
+		DevDir: filepath.Join(dir, "dev"), RunDir: filepath.Join(dir, "run")})
+	require.NoError(t, err)
+	d.ublk.Fail(fmt.Errorf("queue 0 tag 3: commit failed: %w", ublk.ErrRequestLost))
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
+	select {
+	case err := <-closed:
+		assert.ErrorIs(t, err, ublk.ErrRequestLost)
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close hung")
+	}
+	_, err = os.Stat(d.BlockPath)
+	assert.NoError(t, err, "the kernel device is left for the process exit")
+	require.NoError(t, d.ublk.Close())
+}
+
 func TestStartRefusesChangedSource(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "img")
