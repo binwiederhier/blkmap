@@ -43,6 +43,8 @@ type Config struct {
 	// Queues and QueueDepth size the ublk transport (see device.Options); 0 keeps the defaults.
 	Queues     int
 	QueueDepth int
+	// RecoveryFailIO fails I/O while the server is down instead of holding it (see device.Options).
+	RecoveryFailIO bool
 }
 
 // Hydrate configures background copying of the base into the COW file.
@@ -101,15 +103,16 @@ type Segment struct {
 
 // rawConfig mirrors the YAML file; sizes are strings so they can carry K/M/G suffixes.
 type rawConfig struct {
-	Size       string        `yaml:"size"`
-	BlockSize  int           `yaml:"block-size"`
-	ReadOnly   bool          `yaml:"read-only"`
-	Queues     int           `yaml:"queues"`
-	QueueDepth int           `yaml:"queue-depth"`
-	COW        *rawCOW       `yaml:"cow"`
-	Segments   []*rawSegment `yaml:"segments"`
-	Hydrate    *rawHydrate   `yaml:"hydrate"`
-	Record     *rawRecord    `yaml:"record"`
+	Size           string        `yaml:"size"`
+	BlockSize      int           `yaml:"block-size"`
+	ReadOnly       bool          `yaml:"read-only"`
+	Queues         int           `yaml:"queues"`
+	QueueDepth     int           `yaml:"queue-depth"`
+	RecoveryFailIO bool          `yaml:"recovery-fail-io"`
+	COW            *rawCOW       `yaml:"cow"`
+	Segments       []*rawSegment `yaml:"segments"`
+	Hydrate        *rawHydrate   `yaml:"hydrate"`
+	Record         *rawRecord    `yaml:"record"`
 }
 
 type rawRecord struct {

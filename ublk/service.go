@@ -45,6 +45,8 @@ const (
 const (
 	// FeatureRecovery is what Recovery needs from the kernel (see Features).
 	FeatureRecovery = featUserRecovery | featUserRecoveryReissue
+	// FeatureRecoveryFailIO is what Recovery with RecoveryFailIO needs (kernel 6.13+).
+	FeatureRecoveryFailIO = featUserRecovery | featUserRecoveryFailIO
 )
 
 var (
@@ -93,6 +95,11 @@ type Params struct {
 	// Recovery keeps the device alive when the server dies: I/O waits (requests in flight
 	// are reissued) until a new server calls Recover. Without it, I/O fails with EIO.
 	Recovery bool
+	// RecoveryFailIO, with Recovery, fails I/O (EREMOTEIO) while no server is attached instead
+	// of holding it (requests in flight at the server's death fail too), so no process ever
+	// waits in uninterruptible sleep for a successor; the device keeps its node and serves
+	// again once one calls Recover. Kernel 6.13+.
+	RecoveryFailIO bool
 }
 
 // Device is a live ublk block device.
@@ -131,7 +138,8 @@ func (d *Device) Stats() Stats {
 // Info is the kernel's view of a device.
 type Info struct {
 	Live      bool // serving I/O; false once the server died or stopped it
-	Quiesced  bool // recoverable and waiting for a new server (see Recover)
+	Quiesced  bool // recoverable and waiting for a new server (see Recover), holding or failing I/O
+	FailingIO bool // Quiesced, and failing I/O meanwhile (Params.RecoveryFailIO)
 	ServerPID int
 }
 
@@ -459,6 +467,9 @@ func (p *Params) validate() error {
 	if p.NumQueues < 1 || p.NumQueues > maxQueues {
 		return fmt.Errorf("ublk: number of queues must be 1..%d, got %d", maxQueues, p.NumQueues)
 	}
+	if p.RecoveryFailIO && !p.Recovery {
+		return errors.New("ublk: RecoveryFailIO needs Recovery")
+	}
 	return nil
 }
 
@@ -539,6 +550,8 @@ func checkRecoverable(info *devInfo, kp *params, p *Params) error {
 		return fmt.Errorf("block size %d, want %d", 1<<kp.Basic.LogicalBSShift, p.BlockSize)
 	case kp.Basic.Attrs&attrReadOnly != want.Basic.Attrs&attrReadOnly:
 		return errors.New("read-only setting differs")
+	case (info.Flags&featUserRecoveryFailIO != 0) != p.RecoveryFailIO:
+		return errors.New("fail-io recovery setting differs")
 	}
 	return nil
 }
@@ -546,7 +559,10 @@ func checkRecoverable(info *devInfo, kp *params, p *Params) error {
 // deviceFlags returns the feature flags ADD_DEV asks for.
 func deviceFlags(p *Params) uint64 {
 	flags := uint64(featURingCmdCompInTask)
-	if p.Recovery {
+	switch {
+	case p.Recovery && p.RecoveryFailIO:
+		flags |= featUserRecovery | featUserRecoveryFailIO // the kernel allows no reissue with fail-io
+	case p.Recovery:
 		flags |= featUserRecovery | featUserRecoveryReissue
 	}
 	return flags
@@ -563,7 +579,7 @@ func GetInfo(id uint32) (*Info, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Info{Live: info.State == stateLive, Quiesced: info.State == stateQuiesced, ServerPID: int(info.UblksrvPID)}, nil
+	return &Info{Live: info.State == stateLive, Quiesced: info.State == stateQuiesced || info.State == stateFailIO, FailingIO: info.State == stateFailIO, ServerPID: int(info.UblksrvPID)}, nil
 }
 
 // Stop stops device id (STOP_DEV) without deleting it: its block device goes away and

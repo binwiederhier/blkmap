@@ -40,6 +40,7 @@ const (
 	featURingCmdCompInTask  = 1 << 1
 	featUserRecovery        = 1 << 3 // the device outlives its server, I/O waits for a new one
 	featUserRecoveryReissue = 1 << 4 // requests in flight at the server's death are reissued
+	featUserRecoveryFailIO  = 1 << 9 // with featUserRecovery: I/O fails instead of waiting while no server is attached (6.13+)
 	// Request ops in ioDesc.OpFlags bits 0..7
 	opRead        = 0
 	opWrite       = 1
@@ -56,7 +57,8 @@ const (
 
 	queueIDControl   = 0xffff // ctrlCmd.QueueID for device-level commands
 	stateLive        = 1      // devInfo.State while the device serves I/O
-	stateQuiesced    = 2      // a recoverable device whose server died
+	stateQuiesced    = 2      // a recoverable device whose server died, holding I/O
+	stateFailIO      = 3      // a recoverable device whose server died, failing I/O
 	devIDAuto        = ^uint32(0)
 	maxQueueDepth    = 4096
 	maxQueues        = 4096    // UBLK_MAX_NR_QUEUES

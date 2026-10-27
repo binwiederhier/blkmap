@@ -637,3 +637,18 @@ func TestUnsupportedControlCommand(t *testing.T) {
 	assert.False(t, unsupported(syscall.EBUSY))
 	assert.False(t, unsupported(syscall.ENODEV))
 }
+
+// Fail-io recovery asks the kernel for recovery without reissue, is refused without
+// Recovery, and a successor must agree with the device on it.
+func TestRecoveryFailIOFlags(t *testing.T) {
+	p := &Params{Backend: newMem(1 << 20), Recovery: true, RecoveryFailIO: true}
+	p.defaults()
+	require.NoError(t, p.validate())
+	assert.Equal(t, uint64(featURingCmdCompInTask|featUserRecovery|featUserRecoveryFailIO), deviceFlags(p))
+	assert.Equal(t, uint64(featURingCmdCompInTask|featUserRecovery|featUserRecoveryReissue), deviceFlags(&Params{Recovery: true}))
+	assert.Error(t, (&Params{Backend: newMem(1 << 20), RecoveryFailIO: true, BlockSize: 512, MaxIOSize: 1 << 20, QueueDepth: 1, NumQueues: 1}).validate())
+	info := &devInfo{Flags: featUserRecovery | featUserRecoveryReissue, QueueDepth: uint16(p.QueueDepth), MaxIOBufBytes: uint32(p.MaxIOSize)}
+	assert.ErrorContains(t, checkRecoverable(info, buildParams(p), p), "fail-io")
+	info.Flags = featUserRecovery | featUserRecoveryFailIO
+	assert.NoError(t, checkRecoverable(info, buildParams(p), p))
+}

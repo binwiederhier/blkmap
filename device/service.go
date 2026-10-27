@@ -100,6 +100,13 @@ type Options struct {
 	// off), I/O waits and the next Serve of the same ID re-attaches. Only for processes a
 	// supervisor restarts; without one, I/O to a crashed device would hang.
 	Recovery bool
+	// RecoveryFailIO, with Recovery, has the kernel fail I/O (EREMOTEIO) instead of holding it
+	// while no server is attached, so no process waits in uninterruptible sleep for the
+	// restart; the device keeps its node and serves again once the next Serve re-attaches,
+	// with the live bitmap preserving the writes acknowledged before the crash. A VM whose
+	// disk reports errors is paused by its hypervisor with werror=stop and resumed after the
+	// restart. Needs kernel 6.13; on an older one I/O waits as without it.
+	RecoveryFailIO bool
 	// NopWrite drops writes whose bytes equal what the device already reads
 	// there (see cow.Store.SetNopWrite).
 	NopWrite bool
@@ -202,21 +209,22 @@ func startWithHydrate(ctx context.Context, c *config.Config, devDir, runDir stri
 		identity = source.Identity(base)
 	}
 	return Serve(ctx, &Options{
-		ID:         c.ID,
-		Base:       base,
-		COWFile:    cowFile,
-		Bitmap:     bitmap,
-		ChunkSize:  c.COW.ChunkSize,
-		BlockSize:  c.BlockSize,
-		ReadOnly:   c.ReadOnly,
-		DevDir:     devDir,
-		RunDir:     runDir,
-		Hydrate:    hydrate,
-		Record:     recordFromConfig(c.Record),
-		Identity:   identity,
-		Recovery:   true, // the systemd unit restarts the server
-		Queues:     c.Queues,
-		QueueDepth: c.QueueDepth,
+		ID:             c.ID,
+		Base:           base,
+		COWFile:        cowFile,
+		Bitmap:         bitmap,
+		ChunkSize:      c.COW.ChunkSize,
+		BlockSize:      c.BlockSize,
+		ReadOnly:       c.ReadOnly,
+		DevDir:         devDir,
+		RunDir:         runDir,
+		Hydrate:        hydrate,
+		Record:         recordFromConfig(c.Record),
+		Identity:       identity,
+		Recovery:       true, // the systemd unit restarts the server
+		RecoveryFailIO: c.RecoveryFailIO,
+		Queues:         c.Queues,
+		QueueDepth:     c.QueueDepth,
 	})
 }
 
@@ -267,9 +275,16 @@ func openStore(o *Options) (*cow.Store, *predecessor, error) {
 		o.Base.Close()
 		return nil, nil, fmt.Errorf("%s is already served by this process", o.ID)
 	}
-	if o.Recovery && !recoverySupported() {
-		log.Printf("%s: the kernel lacks ublk user recovery; a crash fails I/O instead of pausing it", o.ID)
-		o.Recovery = false
+	if o.Recovery {
+		features := kernelFeatures()
+		if o.RecoveryFailIO && features&ublk.FeatureRecoveryFailIO != ublk.FeatureRecoveryFailIO {
+			log.Printf("%s: the kernel lacks ublk recovery that fails I/O (6.13+); I/O waits for a successor instead", o.ID)
+			o.RecoveryFailIO = false
+		}
+		if features&ublk.FeatureRecovery != ublk.FeatureRecovery {
+			log.Printf("%s: the kernel lacks ublk user recovery; a crash fails I/O instead of pausing it", o.ID)
+			o.Recovery, o.RecoveryFailIO = false, false
+		}
 	}
 	statePath := filepath.Join(o.RunDir, o.ID)
 	pred, err := takeOver(o, statePath)
@@ -325,7 +340,7 @@ func serveStore(ctx context.Context, o *Options, store *cow.Store, pred *predece
 	if queues == 0 {
 		queues = queuesFor(o.Base)
 	}
-	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, NumQueues: queues, QueueDepth: o.QueueDepth}
+	params := &ublk.Params{Backend: b, BlockSize: o.BlockSize, ReadOnly: o.ReadOnly, Recovery: o.Recovery, RecoveryFailIO: o.RecoveryFailIO, NumQueues: queues, QueueDepth: o.QueueDepth}
 	dev, err := pred.recover(ctx, o.ID, params)
 	recovered := dev != nil
 	if dev == nil && err == nil {
@@ -617,10 +632,18 @@ func (p *predecessor) drop(id string) {
 	}
 }
 
+// kernelFeatures returns the kernel's ublk feature flags, none when it cannot say.
+func kernelFeatures() uint64 {
+	features, err := ublk.Features()
+	if err != nil {
+		return 0
+	}
+	return features
+}
+
 // recoverySupported reports whether the kernel can keep a device across a server's death.
 func recoverySupported() bool {
-	features, err := ublk.Features()
-	return err == nil && features&ublk.FeatureRecovery == ublk.FeatureRecovery
+	return kernelFeatures()&ublk.FeatureRecovery == ublk.FeatureRecovery
 }
 
 func processAlive(pid int) bool {

@@ -70,11 +70,12 @@ func Parse(id string, content []byte) (*Config, error) {
 		return nil, fmt.Errorf("%w: yaml: %w", errConfig, err)
 	}
 	c := &Config{
-		ID:         id,
-		BlockSize:  DefaultBlockSize,
-		ReadOnly:   raw.ReadOnly,
-		Queues:     raw.Queues,
-		QueueDepth: raw.QueueDepth,
+		ID:             id,
+		BlockSize:      DefaultBlockSize,
+		ReadOnly:       raw.ReadOnly,
+		Queues:         raw.Queues,
+		QueueDepth:     raw.QueueDepth,
+		RecoveryFailIO: raw.RecoveryFailIO,
 	}
 	if c.Queues < 0 || c.QueueDepth < 0 {
 		return nil, fmt.Errorf("%w: queues and queue-depth must not be negative", errConfig)
