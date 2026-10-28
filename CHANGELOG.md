@@ -3,7 +3,7 @@
 All notable changes to blkmap. Versions follow semantic versioning once 1.0 is tagged;
 releases are cut with `make release` from a `vX.Y.Z` tag.
 
-## Unreleased
+## v0.5.0 (2026-10-28)
 
 - **A wedged source can no longer hang its openers for good.** The kernel never times out
   the requests of a privileged ublk device, so a request stuck in a source kept every reader
