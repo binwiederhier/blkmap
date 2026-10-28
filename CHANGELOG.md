@@ -25,6 +25,14 @@ releases are cut with `make release` from a `vX.Y.Z` tag.
   silently leaving the request behind that tag uncompleted (its opener would have slept until
   the server exited); it is handed over like a stalled one. A refused fetch still costs only
   the tag.
+- **Closing a device whose queue loop died no longer wedges it.** On 7.0 kernels a request
+  the dying loop took just before it ended stays owned by the server until its char device is
+  released, and `Close` issued STOP_DEV first, which waited for that request forever (the
+  server then could not exit either). A failed device now ends its loops and releases its
+  char device before STOP_DEV, so the kernel fails the request first. 6.8 fails such requests
+  when the queue's commands are cancelled and was not affected. `TestQueueDeathFailsDevice`
+  now makes the dead loop take a request and, on 7.0+, fails if none was lost, so it cannot
+  pass by timing again (it had passed on 7.0.0-38 and failed 1 in 4 runs on 7.0.0-30).
 - **A dead predecessor is deleted without waiting for its openers.** A process that still
   held the old server's block device (a VM whose disk died with it) made `takeOver` wait for
   the control timeout, once per device of a group, longer than a start timeout. Kernels since

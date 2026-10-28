@@ -152,6 +152,16 @@ Shutdown (`SIGTERM`) runs in the one order that cannot lose data: stop backgroun
 store (COW data `fdatasync`, then bitmap pages); `DEL_DEV`, which waits for anyone holding
 the block device open, so unmount first; remove symlink and state file if still ours.
 
+`STOP_DEV` is only safe when every request can drain. It waits in `del_gendisk` for each one,
+and a server killed meanwhile cannot exit (its io-wq worker is the one waiting), which wedges
+the device and its readers until a reboot. So a device with a request that will never
+complete is never stopped first: a stalled source or a refused commit leaves the device to the
+process exit, and a dead queue loop (whose last requests 7.0 kernels hold for the server until
+its char device closes) has its loops ended and char device released before `STOP_DEV`.
+Root tests guard each path: `TestQueueDeathFailsDevice` (ublk),
+`TestCloseLeavesAStalledDeviceToTheProcessExit`, `TestCloseHandsNoNewRequestToAHungSource` and
+`TestCloseLeavesADeviceWithALostRequestToTheProcessExit` (device).
+
 **Crash.** The device is created with the ublk user-recovery flags, so when the server dies
 the device stays and I/O pauses. systemd restarts the unit (`Restart=on-failure`,
 `RestartMode=direct`); the new process finds the state file, sees the recorded pid is dead

@@ -377,17 +377,19 @@ func (d *Device) teardown(ctl *control) error {
 
 // stop issues STOP_DEV, which drains in-flight requests (the still-running loops serve
 // them) and then aborts the outstanding fetches so the loops exit; then it releases every
-// char device fd, which DEL_DEV later needs closed.
+// char device fd, which DEL_DEV later needs closed. A failed device may hold requests that
+// nothing will ever complete (a dead loop took them, or their commit was refused), and
+// STOP_DEV would wait for them forever: its loops are ended and its char device released
+// first, which makes the kernel fail or requeue them, and STOP_DEV comes after.
 func (d *Device) stop(ctl *control) error {
 	if d.stopped {
 		return nil
 	}
 	d.stopped = true
 	var errs []error
-	if ctl != nil {
-		if err := ctl.stopDevice(d.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
-			errs = append(errs, err)
-		}
+	failed := d.Err() != nil
+	if ctl != nil && !failed {
+		errs = append(errs, stopDevice(ctl, d.ID))
 	}
 	d.stopping.Store(true)
 	for _, q := range d.queues {
@@ -398,7 +400,18 @@ func (d *Device) stop(ctl *control) error {
 		errs = append(errs, syscall.Close(d.charFd))
 		d.charFd = -1
 	}
+	if ctl != nil && failed {
+		errs = append(errs, stopDevice(ctl, d.ID))
+	}
 	return errors.Join(errs...)
+}
+
+// stopDevice issues STOP_DEV; a device that is gone already is not an error.
+func stopDevice(ctl *control, id uint32) error {
+	if err := ctl.stopDevice(id); err != nil && !errors.Is(err, syscall.ENODEV) {
+		return err
+	}
+	return nil
 }
 
 func (d *Device) delete(ctl *control) error {

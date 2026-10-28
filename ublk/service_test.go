@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -258,14 +260,9 @@ func TestQueueDeathFailsDevice(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, unix.Dup3(null, d.queues[1].ring.fd, unix.O_CLOEXEC))
 	unix.Close(null)
-	select {
-	case <-d.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("a dead queue loop did not fail the device")
-	}
-	require.Error(t, d.Err())
-	assert.Contains(t, d.Err().Error(), "queue 1")
-	// Reads from every CPU: those mapped to the dead queue must fail, not hang forever
+	// Reads from every CPU, at once: the dead queue's loop is still parked in its last wait, so
+	// it takes the ones mapped to it and dies before it can commit them. The kernel then holds
+	// them as owned by the server, which only releasing the char device fails
 	results := make(chan error, runtime.NumCPU())
 	for cpu := range runtime.NumCPU() {
 		go func() {
@@ -280,6 +277,26 @@ func TestQueueDeathFailsDevice(t *testing.T) {
 			results <- err
 		}()
 	}
+	select {
+	case <-d.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("a dead queue loop did not fail the device")
+	}
+	require.Error(t, d.Err())
+	assert.Contains(t, d.Err().Error(), "queue 1")
+	// Since 7.0 the kernel fails a request a dead loop took only once the char device is
+	// released; before, cancelling the queue's commands at thread exit failed it. Unless one
+	// is still pending here, this test no longer covers STOP_DEV waiting for it forever
+	time.Sleep(500 * time.Millisecond)
+	if pending := runtime.NumCPU() - len(results); kernelMajor(t) >= 7 {
+		require.Positive(t, pending, "no request was lost to the dead queue")
+	} else {
+		t.Logf("%d requests lost to the dead queue", pending)
+	}
+	// The owner must still be able to tear the device down, and that must end every read:
+	// STOP_DEV first would wait for the lost ones forever
+	closed := make(chan error, 1)
+	go func() { closed <- d.Close() }()
 	for range runtime.NumCPU() {
 		select {
 		case <-results:
@@ -287,10 +304,7 @@ func TestQueueDeathFailsDevice(t *testing.T) {
 			t.Fatal("a read on the dead queue hangs")
 		}
 	}
-	// The owner must still be able to tear the device down
 	require.NoError(t, f.Close())
-	closed := make(chan error, 1)
-	go func() { closed <- d.Close() }()
 	select {
 	case <-closed:
 	case <-time.After(30 * time.Second):
@@ -298,6 +312,18 @@ func TestQueueDeathFailsDevice(t *testing.T) {
 	}
 	_, err = os.Stat(d.BlockPath)
 	assert.True(t, os.IsNotExist(err))
+}
+
+// kernelMajor returns the running kernel's major version.
+func kernelMajor(t *testing.T) int {
+	t.Helper()
+	var uts unix.Utsname
+	require.NoError(t, unix.Uname(&uts))
+	major, _, ok := strings.Cut(unix.ByteSliceToString(uts.Release[:]), ".")
+	require.True(t, ok)
+	n, err := strconv.Atoi(major)
+	require.NoError(t, err)
+	return n
 }
 
 func TestDeviceConcurrent(t *testing.T) {
