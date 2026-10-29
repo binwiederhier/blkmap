@@ -19,10 +19,10 @@ import (
 const (
 	// bitmapHeaderSize keeps the bit area page-aligned.
 	bitmapHeaderSize = 4096
-	bitmapMagic      = "BLKMAPBM"
+	bitmapMagic      = "BLKMAPBM2586"
 	bitmapVersion    = 1
-	// Header layout: magic[8] version[4] pad[4] size[8] chunk[8] identity-len[4] identity[...]
-	bitmapOffVersion  = 8
+	// Header layout: magic[12] version[4] size[8] chunk[8] identity-len[4] identity[...]
+	bitmapOffVersion  = 12
 	bitmapOffSize     = 16
 	bitmapOffChunk    = 24
 	bitmapOffIdentity = 32

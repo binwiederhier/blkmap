@@ -1,6 +1,7 @@
 package cow
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"sync"
@@ -223,4 +224,45 @@ func TestSnapshotConcurrentSet(t *testing.T) {
 		b.Snapshot()
 	}
 	wg.Wait()
+}
+
+func TestBitmapHeaderFormat(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bits")
+	b, err := OpenBitmap(path, 1<<30, 64<<10)
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
+	header := make([]byte, 32)
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+	_, err = f.ReadAt(header, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "BLKMAPBM2586", string(header[:12]))
+	assert.Equal(t, uint32(1), binary.LittleEndian.Uint32(header[12:]))
+	assert.Equal(t, uint64(1<<30), binary.LittleEndian.Uint64(header[16:]))
+	assert.Equal(t, uint64(64<<10), binary.LittleEndian.Uint64(header[24:]))
+}
+
+func TestBitmapRejectsUnknownVersions(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bits")
+	b, err := OpenBitmap(path, testSize, testChunk)
+	require.NoError(t, err)
+	require.NoError(t, b.Close())
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+	for _, header := range [][]byte{
+		append([]byte("BLKMAPBM2586"), 3, 0, 0, 0),         // a future version
+		append([]byte("BLKMAPBM"), 2, 0, 0, 0, 0, 0, 0, 0), // the old magic with a version it never had
+		[]byte("BLKMAPBX2586\x02\x00\x00\x00"),
+	} {
+		_, err = f.WriteAt(header, 0)
+		require.NoError(t, err)
+		_, err = OpenBitmap(path, testSize, testChunk)
+		assert.Error(t, err, "%q", header)
+		_, err = Inspect(path)
+		assert.Error(t, err, "%q", header)
+	}
 }

@@ -307,8 +307,8 @@ through the normal write path. Both are advertised with a 1 GiB maximum.
 
 ## The COW store
 
-**Bitmap file format.** A 4 KiB header (`BLKMAPBM` at 0, version at 8, device size at 16,
-chunk size at 24, length-prefixed source identity at 32) followed by the bit area in
+**Bitmap file format.** A 4 KiB header (`BLKMAPBM2586` at 0, version 1 at 12, device size
+at 16, chunk size at 24, length-prefixed source identity at 32) followed by the bit area in
 little-endian 32-bit words, padded to 4 KiB pages. The header pins the geometry ("chunk size
 mismatch", "device size mismatch"). The file is preallocated at creation so a full COW
 filesystem cannot stop the bitmap from recording what did make it in. Words are updated with
